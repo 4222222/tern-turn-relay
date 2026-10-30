@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+- Fix false daemon-identity rejection during in-place Tern upgrades: pin the process incarnation and socket, validate executable path/role/ownership, and migrate legacy executable-inode records only after stable identity checks pass.
+- Classify gateway control failures with sanitized reasons instead of collapsing heartbeat, EOF and protocol errors into one message.
+- Recover verified transient control failures with bounded backoff and fresh gateway authentication; discard all old-generation flows and session keys before forwarding resumes.
+- Recheck original daemon and gateway identity on reconnect, preserve independent SSH TCP sessions, and cancel pending recovery on Stop.
+- Surface gateway recovery progress and failure classification in connection details; keep unknown and security failures fail-closed.
+
 ## 0.2.1
 
 - Refresh TURN allocations at half-life with monotonic expiry checks and bounded transient retries; never forward using an expired allocation.

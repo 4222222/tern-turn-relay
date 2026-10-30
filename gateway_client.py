@@ -25,6 +25,34 @@ MAX_LINE = 65536
 MAX_SOURCE = 512 * 1024
 MODULES = ('remote_gateway.py', 'gateway_protocol.py')
 
+RECOVERABLE_REASONS = frozenset({
+    'control_eof', 'heartbeat_timeout', 'send_timeout', 'frontend_exit',
+    'state_lock_busy', 'connectivity_uncertain',
+})
+_FAILURE_MESSAGES = {
+    'unknown': 'Dedicated gateway failed an unspecified control check.',
+    'protocol_error': 'Dedicated gateway returned an invalid control response.',
+    'identity_mismatch': 'Gateway identity, existing daemon or public endpoint verification failed.',
+    'security_error': 'Dedicated gateway failed a security check.',
+    'authorization_denied': 'Dedicated gateway authorization was denied.',
+    'control_eof': 'Dedicated gateway control channel closed.',
+    'heartbeat_timeout': 'Dedicated gateway control heartbeat expired.',
+    'send_timeout': 'Dedicated gateway control send timed out.',
+    'frontend_exit': 'Dedicated gateway owned frontend exited.',
+    'state_lock_busy': 'Dedicated gateway state is still controlled by an SSH session.',
+    'connectivity_uncertain': 'Dedicated gateway startup connectivity could not be established.',
+}
+FAILURE_REASONS = frozenset(_FAILURE_MESSAGES)
+
+
+class GatewayControlError(RelayError):
+    """Allowlisted cause only; never include SSH, provider or peer error text."""
+
+    def __init__(self, reason='unknown'):
+        self.reason = reason if isinstance(reason, str) and reason in FAILURE_REASONS else 'unknown'
+        self.recoverable = self.reason in RECOVERABLE_REASONS
+        super().__init__(_FAILURE_MESSAGES[self.reason])
+
 # This fixed program is public code, not configuration or key material. The
 # package and destination arrive through authenticated SSH stdin. Directory-fd
 # operations prevent symlink traversal while preserving unrelated remote files.
@@ -129,7 +157,7 @@ def install():
 try:
     result = install()
 except Exception:
-    result = {'ok': False, 'error': 'Private gateway package installation failed.'}
+    result = {'ok': False, 'reason': 'security_error', 'error': 'Private gateway package installation failed.'}
 print(json.dumps(result, separators=(',', ':')), flush=True)
 sys.exit(0 if result['ok'] else 1)
 '''
@@ -221,17 +249,36 @@ async def _bounded(awaitable, timeout):
 
 
 async def _send(process, value):
-    process.stdin.write(json.dumps(value, separators=(',', ':'), allow_nan=False).encode() + b'\n')
-    await _bounded(process.stdin.drain(), 5)
+    try:
+        process.stdin.write(json.dumps(value, separators=(',', ':'), allow_nan=False).encode() + b'\n')
+        await _bounded(process.stdin.drain(), 5)
+    except asyncio.TimeoutError:
+        raise GatewayControlError('send_timeout') from None
+    except (BrokenPipeError, ConnectionResetError):
+        raise GatewayControlError('control_eof') from None
 
 
 async def _receive(process):
-    line = await process.stdout.readline()
-    if not line or len(line) > MAX_LINE or not line.endswith(b'\n'):
-        raise RelayError('Gateway control channel closed or returned an invalid response.')
-    value = json.loads(line)
-    if not isinstance(value, dict) or value.get('ok') is not True:
-        raise RelayError('Remote gateway rejected the control request.')
+    try:
+        line = await process.stdout.readline()
+    except (BrokenPipeError, ConnectionResetError):
+        raise GatewayControlError('control_eof') from None
+    except ValueError:
+        raise GatewayControlError('protocol_error') from None
+    if not line:
+        raise GatewayControlError('control_eof')
+    if len(line) > MAX_LINE or not line.endswith(b'\n'):
+        raise GatewayControlError('protocol_error')
+    try:
+        value = json.loads(line)
+    except (ValueError, UnicodeError):
+        raise GatewayControlError('protocol_error') from None
+    if not isinstance(value, dict):
+        raise GatewayControlError('protocol_error')
+    if value.get('ok') is False:
+        raise GatewayControlError(value.get('reason'))
+    if value.get('ok') is not True:
+        raise GatewayControlError('protocol_error')
     return value
 
 
@@ -289,9 +336,9 @@ async def _deploy(config):
         process.stdin.close()
         result = await _receive(process)
         if set(result) != {'ok', 'digest'} or result['digest'] != package['digest']:
-            raise RelayError('Gateway package acknowledgement does not match the local release.')
+            raise GatewayControlError('identity_mismatch')
         if await process.wait() != 0:
-            raise RelayError('Private gateway package installation failed.')
+            raise GatewayControlError('security_error')
     finally:
         await _reap(process)
     return package['state_dir'] + '/releases/' + package['digest'] + '/remote_gateway.py'
@@ -329,7 +376,7 @@ def _descriptor(config, value, serving):
                      and value['native_frontend_pid'] > 0
                      and value['native_frontend_pid'] != value['daemon_pid'])
     if not valid:
-        raise RelayError('Gateway identity, existing daemon or public endpoint verification failed.')
+        raise GatewayControlError('identity_mismatch')
     # Only this explicitly validated allowlist can become public status.
     return {name: list(value[name]) if isinstance(value[name], list) else value[name]
             for name in fields}
@@ -377,9 +424,12 @@ class GatewayControl:
         self.key = None
         self.descriptor = None
         self.failure = None
+        self.failure_reason = 'unknown'
+        self.failure_recoverable = False
         self._process = None
         self._supervisor = None
         self._shutdown = None
+        self._cleanup = None
         self._closing = False
         self._opened = False
 
@@ -394,7 +444,7 @@ class GatewayControl:
             'session_key': base64.b64encode(self.key).decode('ascii')})
         descriptor = _descriptor(self.config, await _receive(self._process), serving=True)
         if self._process.returncode is not None:
-            raise RelayError('Gateway control channel exited before readiness.')
+            raise GatewayControlError('control_eof')
         self.peer = descriptor['host'], descriptor['port']
         self.fingerprint = descriptor['fingerprint']
         self.descriptor = descriptor
@@ -403,7 +453,7 @@ class GatewayControl:
 
     async def open(self):
         if self._opened or self._closing:
-            raise RelayError('Gateway control instances can only be opened once.')
+            raise GatewayControlError('protocol_error')
         self._opened = True
         self.failure = asyncio.get_running_loop().create_future()
         try:
@@ -413,11 +463,15 @@ class GatewayControl:
             raise
         except Exception as exc:
             await self.close()
-            if isinstance(exc, RelayError):
+            if isinstance(exc, GatewayControlError):
+                if exc.reason == 'control_eof':
+                    raise GatewayControlError('connectivity_uncertain') from None
                 raise
             if isinstance(exc, asyncio.TimeoutError):
-                raise RelayError('Dedicated gateway startup timed out; no direct fallback was attempted.') from None
-            raise RelayError('Dedicated gateway startup failed; check strict SSH access and the existing remote daemon.') from None
+                raise GatewayControlError('connectivity_uncertain') from None
+            if isinstance(exc, RelayError):
+                raise GatewayControlError('security_error') from None
+            raise GatewayControlError('unknown') from None
 
     async def _heartbeat(self):
         while not self._closing:
@@ -428,23 +482,38 @@ class GatewayControl:
 
     async def _observe(self):
         while not self._closing:
-            value = await _bounded(_receive(self._process), HEARTBEAT_TIMEOUT)
+            try:
+                value = await _bounded(_receive(self._process), HEARTBEAT_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise GatewayControlError('heartbeat_timeout') from None
             if value != {'ok': True, 'op': 'pong'}:
-                raise RelayError('Gateway returned an invalid heartbeat response.')
+                raise GatewayControlError('protocol_error')
 
     async def _supervise(self):
         tasks = [asyncio.create_task(self._heartbeat()), asyncio.create_task(self._observe())]
         try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if not self._closing and not self.failure.done():
-                self.failure.set_result('Dedicated gateway control channel failed; the exclusive route is closed.')
+                causes = []
+                for task in tasks:
+                    if task in done:
+                        error = None if task.cancelled() else task.exception()
+                        causes.append(error if isinstance(error, GatewayControlError)
+                                      else GatewayControlError('unknown'))
+                # A simultaneous security/protocol failure always wins over a
+                # transient cause. Never infer recoverability from exception text.
+                cause = next((error for error in causes if not error.recoverable), causes[0])
+                self.failure_reason = cause.reason
+                self.failure_recoverable = cause.recoverable
+                self.failure.set_result(str(cause) + ' The exclusive route is closed.')
         finally:
             # Python 3.9 wait_for can consume a cancellation racing with a
             # completed drain/read. Explicit state prevents another iteration.
             self._closing = True
             try:
                 for task in tasks:
-                    task.cancel()
+                    if not task.done():
+                        task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 process, self._process = self._process, None
@@ -452,15 +521,29 @@ class GatewayControl:
                 await asyncio.shield(self._shutdown)
 
     async def close(self):
+        # One cleanup owner: concurrent close/cancellation must not interrupt a
+        # supervisor already cancelling its children or reaping its SSH process.
+        if self._cleanup is None:
+            self._cleanup = asyncio.create_task(self._close())
+        try:
+            await asyncio.shield(self._cleanup)
+        except asyncio.CancelledError:
+            await self._cleanup
+            raise
+
+    async def _close(self):
+        was_closing = self._closing
         self._closing = True
         if self._supervisor is not None:
             supervisor, self._supervisor = self._supervisor, None
-            supervisor.cancel()
+            if not was_closing and not supervisor.done():
+                supervisor.cancel()
             await asyncio.gather(supervisor, return_exceptions=True)
         if self._shutdown is not None:
             await asyncio.shield(self._shutdown)
         process, self._process = self._process, None
-        await _reap(process)
+        if process is not None:
+            await _reap(process)
         self.key = None
         if self.failure is not None and not self.failure.done():
             self.failure.cancel()

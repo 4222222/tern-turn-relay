@@ -30,6 +30,7 @@ TESTS = (
     'tests/test_distribution.py', 'tests/test_setup.py', 'tests/test_credentials.py',
     'tests/test_allocation_recovery.py',
     'tests/test_renewal.py', 'tests/test_flow_recovery.py',
+    'tests/test_gateway_errors.py', 'tests/test_gateway_recovery.py',
 )
 
 

@@ -61,6 +61,9 @@ class ClientBoundaries(unittest.TestCase):
             with self.subTest(field=field, value=value), self.assertRaises(RelayError) as caught:
                 client._descriptor(config(), response, serving=True)
             self.assertNotIn('secret-not-for-status', str(caught.exception))
+            self.assertIsInstance(caught.exception, client.GatewayControlError)
+            self.assertEqual(caught.exception.reason, 'identity_mismatch')
+            self.assertFalse(caught.exception.recoverable)
         self.assertEqual(client._descriptor(config(), descriptor(), True), descriptor())
         candidate = config()
         del candidate['gateway']['fingerprint']
@@ -151,6 +154,7 @@ class PackageInstallation(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertFalse(result['ok'])
         self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(result['reason'], 'security_error')
 
     def test_release_symlink_and_unsafe_permissions_fail_closed(self):
         self.assertEqual(self.install()[0], 0)
@@ -225,6 +229,8 @@ class ControlLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_ready_heartbeat_key_stdin_and_clean_close(self):
         process = Process(descriptor())
         gateway = client.GatewayControl(config(), Path('/unused'))
+        self.assertEqual(gateway.failure_reason, 'unknown')
+        self.assertFalse(gateway.failure_recoverable)
         with mock.patch.object(client, '_deploy', mock.AsyncMock(return_value='/private/helper.py')), \
                 mock.patch.object(client, '_spawn', mock.AsyncMock(return_value=process)) as spawn, \
                 mock.patch.object(client, 'HEARTBEAT_INTERVAL', 0.001):
@@ -252,6 +258,9 @@ class ControlLifecycle(unittest.IsolatedAsyncioTestCase):
             process.stdout.feed_eof()
             failure = await asyncio.wait_for(asyncio.shield(gateway.failure), 1)
             self.assertIn('exclusive route is closed', failure)
+            self.assertIsInstance(failure, str)
+            self.assertEqual(gateway.failure_reason, 'control_eof')
+            self.assertTrue(gateway.failure_recoverable)
             await gateway.close()
         self.assertTrue(process.closed)
         self.assertTrue(process.reaped)
@@ -263,8 +272,10 @@ class ControlLifecycle(unittest.IsolatedAsyncioTestCase):
         gateway = client.GatewayControl(config(), Path('/unused'))
         with mock.patch.object(client, '_deploy', mock.AsyncMock(return_value='/private/helper.py')), \
                 mock.patch.object(client, '_spawn', mock.AsyncMock(return_value=process)):
-            with self.assertRaises(RelayError):
+            with self.assertRaises(client.GatewayControlError) as caught:
                 await gateway.open()
+            self.assertEqual(caught.exception.reason, 'identity_mismatch')
+            self.assertFalse(caught.exception.recoverable)
         self.assertIsNone(gateway.peer)
         self.assertIsNone(gateway.key)
         self.assertTrue(process.reaped)
@@ -296,6 +307,9 @@ class ControlLifecycle(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RelayError) as caught:
                 await gateway.open()
         self.assertNotIn('private-key-must-not-leak', str(caught.exception))
+        self.assertIsInstance(caught.exception, client.GatewayControlError)
+        self.assertEqual(caught.exception.reason, 'unknown')
+        self.assertFalse(caught.exception.recoverable)
         self.assertTrue(process.reaped)
 
 

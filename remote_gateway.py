@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import shutil
 import signal
 import socket
 import stat
@@ -34,9 +33,29 @@ FLOW_IDLE = 60.0
 MAX_FLOWS = 16
 MAX_FLOW_IDENTITIES = 4096
 
+# Wire codes, not exception text, are consumed by gateway_client. Unknown or
+# missing codes are deliberately fatal for compatibility with older helpers.
+FAILURE_REASONS = frozenset({
+    'unknown', 'protocol_error', 'identity_mismatch', 'security_error',
+    'authorization_denied', 'control_eof', 'heartbeat_timeout', 'send_timeout',
+    'frontend_exit', 'state_lock_busy', 'connectivity_uncertain',
+})
+
 
 class GatewayError(Exception):
     """Only fixed, non-secret messages may cross the SSH control channel."""
+
+    def __init__(self, message, reason='unknown'):
+        super().__init__(message)
+        self.reason = reason if isinstance(reason, str) and reason in FAILURE_REASONS else 'unknown'
+
+
+def error_response(error):
+    reason = error.reason if isinstance(error, GatewayError) else 'unknown'
+    if not isinstance(reason, str) or reason not in FAILURE_REASONS:
+        reason = 'unknown'
+    return {'ok': False, 'reason': reason,
+            'error': 'Remote gateway failed its security or availability checks.'}
 
 
 class ControlStopped(Exception):
@@ -61,7 +80,7 @@ def check_ancestors(path):
         info = item.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
                 or info.st_mode & 0o022):
-            raise GatewayError('Filesystem ancestry is not trusted.')
+            raise GatewayError('Filesystem ancestry is not trusted.', 'security_error')
 
 
 def private_directory(path):
@@ -73,7 +92,7 @@ def private_directory(path):
     info = path.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o700):
-        raise GatewayError('Gateway directory must be owned and mode 0700.')
+        raise GatewayError('Gateway directory must be owned and mode 0700.', 'security_error')
     return path
 
 
@@ -84,7 +103,7 @@ def private_file(path, flags=os.O_RDONLY, create=False):
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
         os.close(fd)
-        raise GatewayError('Gateway file must be owned, private and regular.')
+        raise GatewayError('Gateway file must be owned, private and regular.', 'security_error')
     return fd
 
 
@@ -99,20 +118,64 @@ def check_native_tree(path):
             if (info.st_uid != os.getuid() or info.st_mode & 0o077
                     or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
                     or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
-                raise GatewayError('Native gateway state contains an unsafe entry.')
+                raise GatewayError('Native gateway state contains an unsafe entry.', 'security_error')
 
 
-def process_identity(pid):
+def process_identity(pid, daemon_socket):
     root = Path('/proc') / str(pid)
     text = (root / 'stat').read_text()
     fields = text[text.rfind(')') + 2:].split()
     if len(fields) < 20 or fields[0] == 'Z':
-        raise GatewayError('Original daemon is unavailable.')
-    executable = (root / 'exe').stat()
+        raise GatewayError('Original daemon is unavailable.', 'identity_mismatch')
+    # Tern may exec an upgraded binary in place. Its executable inode is not
+    # workspace identity, but its canonical path and trust checks remain pinned.
+    executable = root / 'exe'
+    fd = os.open(str(executable), os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        # Path and metadata must describe the same opened executable even if
+        # the daemon execs between these reads; never mix two /proc snapshots.
+        raw_path = os.readlink('/proc/self/fd/%d' % fd)
+        running = os.fstat(fd)
+    finally:
+        os.close(fd)
+    # Atomic replacement can unlink the mapped old binary before the daemon
+    # execs its upgrade. Normalize only the kernel's deleted-file suffix on an
+    # actually unlinked executable; its canonical path remains identity.
+    if raw_path.endswith(' (deleted)'):
+        if running.st_nlink != 0:
+            raise GatewayError('Original daemon executable path changed.', 'identity_mismatch')
+        raw_path = raw_path[:-len(' (deleted)')]
+    path = checked_path(raw_path)
+    if str(path) != raw_path or path.name != 'tern':
+        raise GatewayError('Original daemon executable path changed.', 'identity_mismatch')
+    check_ancestors(path.parent)
+    installed = path.lstat()
+    for info in (installed, running):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or info.st_mode & 0o022 or not info.st_mode & 0o111):
+            raise GatewayError('Original daemon executable is unsafe.', 'security_error')
+    # Both files must be independently trusted, but their inodes may differ
+    # during replacement-before-exec. Neither inode is a workspace binding.
+    if not os.access(str(path), os.X_OK):
+        raise GatewayError('Original daemon executable path changed.', 'identity_mismatch')
+    raw_command = (root / 'cmdline').read_bytes()
+    if not raw_command.endswith(b'\0') or len(raw_command) > 8192:
+        raise GatewayError('Original daemon arguments are invalid.', 'identity_mismatch')
+    command = raw_command[:-1].split(b'\0')
+    expected = os.fsencode(str(daemon_socket))
+    if (not command or command[0] not in (os.fsencode(str(path)), b'tern')
+            or command.count(b'daemon') != 1 or command.count(b'--socket') != 1
+            or not any(command[index:index + 2] == [b'--socket', expected]
+                       for index in range(len(command) - 1))):
+        raise GatewayError('Socket owner is not the expected existing daemon.', 'identity_mismatch')
+    try:
+        arguments = [item.decode('utf-8') for item in command]
+    except UnicodeError:
+        raise GatewayError('Original daemon arguments are invalid.', 'identity_mismatch') from None
     return {
         'pid': pid, 'start_time': fields[19],
-        'exe_device': executable.st_dev, 'exe_inode': executable.st_ino,
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'executable_path': str(path), 'daemon_argv': arguments,
     }
 
 
@@ -123,21 +186,15 @@ class DaemonPin:
         info = self.path.lstat()
         if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
                 or info.st_mode & 0o022):
-            raise GatewayError('Existing daemon socket is unsafe or unavailable.')
+            raise GatewayError('Existing daemon socket is unsafe or unavailable.', 'security_error')
         self.socket_identity = (info.st_dev, info.st_ino)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.settimeout(2.0)
             probe.connect(str(self.path))
             pid, uid, _ = struct.unpack('3i', probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if uid != os.getuid() or pid <= 1:
-            raise GatewayError('Existing daemon socket has an unexpected owner.')
-        self.identity = process_identity(pid)
-        command = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
-        expected = os.fsencode(str(self.path))
-        if (b'daemon' not in command or not any(
-                command[index:index + 2] == [b'--socket', expected]
-                for index in range(len(command) - 1))):
-            raise GatewayError('Socket owner is not the expected existing daemon.')
+            raise GatewayError('Existing daemon socket has an unexpected owner.', 'identity_mismatch')
+        self.identity = process_identity(pid, self.path)
         self.pid = pid
         self.check()
 
@@ -146,56 +203,84 @@ class DaemonPin:
             info = self.path.lstat()
             if ((info.st_dev, info.st_ino) != self.socket_identity
                     or not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o022 or process_identity(self.pid) != self.identity):
-                raise GatewayError('Original daemon identity changed.')
+                    or info.st_mode & 0o022 or process_identity(self.pid, self.path) != self.identity):
+                raise GatewayError('Original daemon identity changed.', 'identity_mismatch')
             if responsive:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                     probe.settimeout(1.0)
                     probe.connect(str(self.path))
                     pid, uid, _ = struct.unpack('3i', probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                     if pid != self.pid or uid != os.getuid():
-                        raise GatewayError('Original daemon identity changed.')
+                        raise GatewayError('Original daemon identity changed.', 'identity_mismatch')
         except OSError:
-            raise GatewayError('Original daemon is unavailable.') from None
+            raise GatewayError('Original daemon is unavailable.', 'identity_mismatch') from None
 
     def persist(self, directory):
-        value = dict(self.identity, daemon_socket=str(self.path),
+        # Called under control.lock. Recheck live executable, process and peer
+        # before accepting or migrating any on-disk binding.
+        self.check(responsive=True)
+        value = dict(self.identity, version=2, daemon_socket=str(self.path),
                      socket_device=self.socket_identity[0], socket_inode=self.socket_identity[1])
         path = directory / 'daemon-identity.json'
         try:
             fd = private_file(path)
         except FileNotFoundError:
-            fd, temporary = tempfile.mkstemp(prefix='.daemon-', dir=str(directory))
-            try:
-                with os.fdopen(fd, 'w') as stream:
-                    json.dump(value, stream, separators=(',', ':'))
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            pass
         else:
             with os.fdopen(fd, 'rb') as stream:
-                data = stream.read(8193)
-            if len(data) > 8192 or json.loads(data) != value:
-                raise GatewayError('Provisioned daemon identity no longer matches.')
+                raw = stream.read(8193)
+
+            def unique_fields(pairs):
+                result = {}
+                for name, item in pairs:
+                    if name in result:
+                        raise ValueError()
+                    result[name] = item
+                return result
+
+            try:
+                if len(raw) > 8192:
+                    raise ValueError()
+                saved = json.loads(raw, object_pairs_hook=unique_fields)
+                if not isinstance(saved, dict):
+                    raise ValueError()
+                if set(saved) == set(value):
+                    if (saved != value or any(type(saved[name]) is not type(value[name])
+                                              for name in value)):
+                        raise ValueError()
+                    return
+                # One-way legacy migration, never a second runtime identity
+                # model: exact old shape, all stable fields equal, inode only
+                # validated as legacy metadata and removed from the new record.
+                stable = {'pid', 'start_time', 'boot_id', 'daemon_socket',
+                          'socket_device', 'socket_inode'}
+                if set(saved) != stable | {'exe_device', 'exe_inode'}:
+                    raise ValueError()
+                if any(saved[name] != value[name] or type(saved[name]) is not type(value[name])
+                       for name in stable):
+                    raise ValueError()
+                if (type(saved['exe_device']) is not int or saved['exe_device'] < 0
+                        or type(saved['exe_inode']) is not int or saved['exe_inode'] <= 0):
+                    raise ValueError()
+            except (ValueError, UnicodeError):
+                raise GatewayError('Provisioned daemon identity no longer matches.', 'identity_mismatch') from None
+        self.check(responsive=True)
+        fd, temporary = tempfile.mkstemp(prefix='.daemon-', dir=str(directory))
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(value, stream, separators=(',', ':'))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def discover_tern(pin):
-    # Prefer the exact installed executable serving the pinned daemon, rather
-    # than another version that happens to appear first in SSH's PATH.
-    candidate = Path('/proc') / str(pin.pid) / 'exe'
-    resolved = Path(os.readlink(candidate))
-    if not resolved.is_absolute() or not resolved.is_file():
-        found = shutil.which('tern')
-        if not found:
-            raise GatewayError('Installed Tern executable is unavailable.')
-        resolved = Path(found).resolve(strict=True)
-    check_ancestors(resolved.parent)
-    info = resolved.stat()
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
-            or info.st_mode & 0o022 or not os.access(str(resolved), os.X_OK)):
-        raise GatewayError('Installed Tern executable is unsafe.')
-    return str(resolved)
+    # No PATH fallback: run only the checked executable of this pinned daemon.
+    pin.check()
+    return pin.identity['executable_path']
 
 
 def daemon_environment(pin):
@@ -278,14 +363,17 @@ class ControlInput:
             raise ControlStopped()
         self.buffer.extend(data)
         if len(self.buffer) > CONTROL_LIMIT:
-            raise GatewayError('SSH control input exceeded its limit.')
+            raise GatewayError('SSH control input exceeded its limit.', 'protocol_error')
         values = []
         while b'\n' in self.buffer:
             raw, _, remaining = self.buffer.partition(b'\n')
             self.buffer = bytearray(remaining)
-            value = json.loads(raw)
+            try:
+                value = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise GatewayError('SSH control input is invalid.', 'protocol_error') from None
             if not isinstance(value, dict):
-                raise GatewayError('SSH control input is invalid.')
+                raise GatewayError('SSH control input is invalid.', 'protocol_error')
             values.append(value)
         return values
 
@@ -299,7 +387,7 @@ class ControlInput:
                 values = self.receive()
                 if values:
                     if len(values) != 1 or self.buffer:
-                        raise GatewayError('Initial SSH control request is invalid.')
+                        raise GatewayError('Initial SSH control request is invalid.', 'protocol_error')
                     return values[0]
         raise GatewayError('Initial SSH control request timed out.')
 
@@ -444,7 +532,7 @@ def existing_authorized_keys():
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or info.st_mode & 0o022 or info.st_nlink != 1 or info.st_size == 0):
-            raise GatewayError('Existing account authorized_keys is unsafe or unavailable.')
+            raise GatewayError('Existing account authorized_keys is unsafe or unavailable.', 'security_error')
     finally:
         os.close(fd)
     return path
@@ -455,7 +543,7 @@ def check_startup_control(control):
         selector.register(control.fd, selectors.EVENT_READ)
         if selector.select(0):
             if control.receive():
-                raise GatewayError('Unexpected control message during startup.')
+                raise GatewayError('Unexpected control message during startup.', 'protocol_error')
 
 
 def serve(binary, native, authorized_keys, environment, pin, control, key, host, descriptor):
@@ -484,7 +572,7 @@ def serve(binary, native, authorized_keys, environment, pin, control, key, host,
                 check_startup_control(control)
                 pin.check()
                 if child.poll() is not None:
-                    raise GatewayError('Owned native frontend exited before readiness.')
+                    raise GatewayError('Owned native frontend exited before readiness.', 'frontend_exit')
                 if owned_loopback_listener(child, native_port):
                     break
                 if time.monotonic() >= deadline:
@@ -500,9 +588,9 @@ def serve(binary, native, authorized_keys, environment, pin, control, key, host,
             while True:
                 now = time.monotonic()
                 if child.poll() is not None:
-                    raise GatewayError('Owned native frontend exited.')
+                    raise GatewayError('Owned native frontend exited.', 'frontend_exit')
                 if now - last_heartbeat > HEARTBEAT_TIMEOUT:
-                    raise GatewayError('SSH control heartbeat expired.')
+                    raise GatewayError('SSH control heartbeat expired.', 'heartbeat_timeout')
                 if now - last_check >= 1:
                     pin.check(responsive=now - last_probe >= 5)
                     if now - last_probe >= 5:
@@ -517,7 +605,7 @@ def serve(binary, native, authorized_keys, environment, pin, control, key, host,
                             if message == {'op': 'stop'}:
                                 return
                             if message != {'op': 'ping'}:
-                                raise GatewayError('SSH control operation is invalid.')
+                                raise GatewayError('SSH control operation is invalid.', 'protocol_error')
                             last_heartbeat = time.monotonic()
                             emit({'ok': True, 'op': 'pong'})
                     elif event.data == 'public':
@@ -552,7 +640,7 @@ def main():
     request = control.initial()
     expected = {'daemon_socket', 'bind_host'} | ({'session_key'} if arguments.serve else set())
     if set(request) != expected:
-        raise GatewayError('Initial SSH control request has invalid fields.')
+        raise GatewayError('Initial SSH control request has invalid fields.', 'protocol_error')
     host = request['bind_host']
     if not isinstance(host, str):
         raise GatewayError('Public bind address must be a global IPv4 literal.')
@@ -577,7 +665,7 @@ def main():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise GatewayError('Gateway state is already controlled by another SSH session.') from None
+            raise GatewayError('Gateway state is already controlled by another SSH session.', 'state_lock_busy') from None
         native = private_directory(directory / 'native')
         pin.persist(directory)
         startup_control = control if arguments.serve else None
@@ -602,8 +690,7 @@ if __name__ == '__main__':
         pass
     except Exception as error:
         try:
-            emit({'ok': False, 'error': str(error) if isinstance(error, GatewayError)
-                  else 'Remote gateway failed its security or availability checks.'})
+            emit(error_response(error))
         except BrokenPipeError:
             pass
         sys.exit(1)

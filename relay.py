@@ -19,7 +19,7 @@ from relay_config import RelayError, atomic_json, load_config, lock_file, privat
 from relay_intent import clear_intent, load_resume_mode, save_intent
 from relay_transport import CredentialCache, Endpoint, TransientTurnError, load_aioice
 from relay_ssh import SshForwarder, resolve_ssh_destination
-from gateway_client import GatewayControl
+from gateway_client import GatewayControl, GatewayControlError, FAILURE_REASONS, RECOVERABLE_REASONS
 from gateway_protocol import ClientCodec
 
 MAX_FLOWS = 16
@@ -32,6 +32,7 @@ START_TIMEOUT = 90
 STOP_TIMEOUT = 12
 ALLOCATION_RETRY_DELAYS = (2, 5)
 ALLOCATION_RECOVERY_COOLDOWN = 30
+GATEWAY_RETRY_DELAYS = (2, 5, 15, 30, 30)
 
 
 def safe_error(exc, fallback='Relay operation failed; check configuration and local permissions.'):
@@ -238,6 +239,9 @@ class Flow:
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
+        except GatewayControlError as exc:
+            if not exc.recoverable:
+                self.service.fail(safe_error(exc))
         except Exception as exc:
             self.service.fail(safe_error(exc, 'TURN flow failed; disconnect and reconnect to recover.'))
         finally:
@@ -260,7 +264,13 @@ class LocalProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, address):
         service = self.service
-        if address[0] != '127.0.0.1' or service.stopping.is_set() or not service.gateway_available():
+        if address[0] != '127.0.0.1' or service.stopping.is_set():
+            return
+        # Native UDP demand keeps an unavailable route alive without retaining
+        # any payload or forwarding through the previous gateway generation.
+        service.no_clients_since = time.monotonic()
+        service.gateway_demand.set()
+        if not service.gateway_available():
             return
         if len(data) > MAX_PAYLOAD:
             service.fail('Oversized UDP payload rejected; no TURN packet was sent.')
@@ -294,6 +304,12 @@ class Service:
         self.gateway = GatewayControl(config, directory)
         self.gateway_ready = False
         self.gateway_watch = None
+        self.gateway_recovering = False
+        self.gateway_reconnects = 0
+        self.gateway_failure_reason = None
+        self.gateway_descriptor = None
+        self.gateway_demand = asyncio.Event()
+        self.ssh_destination = None
         self.local = None
         self.control = None
         self.control_tasks = set()
@@ -313,6 +329,9 @@ class Service:
     def snapshot(self):
         result = dict(self.status)
         result['flows'] = len(self.flows)
+        result['gateway_recovering'] = self.gateway_recovering
+        result['gateway_reconnects'] = self.gateway_reconnects
+        result['gateway_failure_reason'] = self.gateway_failure_reason
         result['ssh_connections'] = self.ssh.connections
         result['queued_packets'] = sum(flow.queue.qsize() for flow in self.flows.values())
         result['queued_bytes'] = sum(flow.pending_bytes for flow in self.flows.values())
@@ -385,10 +404,13 @@ class Service:
         await endpoint.close()
 
     def gateway_available(self):
-        return self.gateway_ready and not self.gateway.failure.done()
+        failure = getattr(self.gateway, 'failure', None)
+        return self.gateway_ready and failure is not None and not failure.done()
 
     def require_gateway(self):
         if not self.gateway_available():
+            if self.gateway_failure(self.gateway)[1]:
+                raise GatewayControlError(self.gateway_failure(self.gateway)[0])
             raise RelayError('Exclusive gateway is unavailable; no direct fallback was attempted.')
 
     def endpoint(self, receive, codec=None):
@@ -425,32 +447,194 @@ class Service:
                 await endpoint.close()
                 raise
 
-    async def watch_gateway(self):
-        await asyncio.shield(self.gateway.failure)
+    @staticmethod
+    def gateway_failure(gateway):
+        reason = getattr(gateway, 'failure_reason', 'unknown')
+        if not isinstance(reason, str) or reason not in FAILURE_REASONS:
+            reason = 'unknown'
+        recoverable = (getattr(gateway, 'failure_recoverable', False) is True
+                       and reason in RECOVERABLE_REASONS)
+        return reason, recoverable
+
+    async def retire_gateway(self):
+        # Disable the route before the first await. All old codecs/queues die
+        # with their flows; only TURN reallocation within a generation reuses one.
         self.gateway_ready = False
-        self.fail('Exclusive gateway control failed; UDP forwarding is disabled. No direct fallback was attempted.')
-        # Close only this route. The independent TCP SSH listener and existing
-        # SSH streams may remain available until explicit stop or idle expiry.
-        if self.startup and not self.startup.done():
-            self.startup.cancel()
-            await asyncio.gather(self.startup, return_exceptions=True)
-        if self.local:
-            self.local.close()
-            self.local = None
         flows = list(self.flows.values())
         for flow in flows:
-            if flow.endpoint:
-                flow.endpoint.fail('Exclusive gateway is unavailable; UDP forwarding is disabled.')
             flow.task.cancel()
-        if self.warm:
-            self.warm.fail('Exclusive gateway is unavailable; UDP forwarding is disabled.')
         await asyncio.gather(*(flow.task for flow in flows), return_exceptions=True)
         await asyncio.gather(*(flow.finish() for flow in flows), return_exceptions=True)
         if self.warm:
             warm, self.warm = self.warm, None
             await self.close_endpoint(warm)
         await self.gateway.close()
+
+    def verify_gateway_generation(self):
+        previous = self.gateway_descriptor
+        current = getattr(self.gateway, 'descriptor', None)
+        if (not isinstance(previous, dict) or not isinstance(current, dict)
+                or type(previous.get('daemon_pid')) is not int
+                or previous['daemon_pid'] <= 0
+                or type(current.get('daemon_pid')) is not int
+                or current['daemon_pid'] != previous['daemon_pid']
+                or current.get('fingerprint') != previous.get('fingerprint')
+                or current.get('fingerprint') != self.config['gateway']['fingerprint']
+                or current.get('daemon_socket') != previous.get('daemon_socket')
+                or current.get('daemon_socket') != self.config['gateway']['daemon_socket']):
+            raise GatewayControlError('identity_mismatch')
+
+    async def warm_recovered_gateway(self):
+        while True:
+            await self.wait_for_allocation()
+            entries, expires = await self.credentials.get()
+            self.require_gateway()
+            try:
+                self.warm = await self.open_endpoint(lambda data: None, entries, expires)
+                self.require_gateway()
+                return
+            except TransientTurnError as exc:
+                # The control identity remains valid. Do not respawn SSH or nest
+                # retry batches: another allocation batch requires new demand.
+                self.recovery_error = safe_error(exc)
+                self.defer_allocations()
+                self.gateway_demand.clear()
+                self.gateway_recovering = False
+                await self.gateway_demand.wait()
+                self.gateway_recovering = True
+
+    async def finish_gateway_recovery(self):
+        # Interrupted first startup may not have bound UDP yet. Bind it in
+        # demand-only mode before warmup can wait for a new native packet.
+        if self.stopping.is_set():
+            raise asyncio.CancelledError()
+        self.require_gateway()
+        if self.local is None:
+            self.local, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: LocalProtocol(self), local_addr=('127.0.0.1', self.config['listen_port']),
+                family=socket.AF_INET)
+        # Race the entire warmup against control loss, including credential and
+        # demand waits. Cancellation owns and closes the in-flight allocation.
+        warmup = asyncio.create_task(self.warm_recovered_gateway())
+        try:
+            await asyncio.wait((warmup, self.gateway.failure),
+                               return_when=asyncio.FIRST_COMPLETED)
+            if self.gateway.failure.done():
+                reason, recoverable = self.gateway_failure(self.gateway)
+                raise GatewayControlError(
+                    reason if recoverable or reason not in RECOVERABLE_REASONS else 'unknown')
+            await warmup
+        finally:
+            if not warmup.done():
+                warmup.cancel()
+            await asyncio.gather(warmup, return_exceptions=True)
+        if self.stopping.is_set():
+            raise asyncio.CancelledError()
+        self.require_gateway()
+        # Existing TCP listeners and streams are never reopened or closed.
+        if self.ssh.server is None:
+            await self.ssh.open(self.config['listen_port'], self.ssh_destination)
+        if self.stopping.is_set():
+            raise asyncio.CancelledError()
+        self.require_gateway()
+        if self.status['state'] == 'error':
+            raise RelayError(self.status['error'])
+        self.recovery_error = None
+        self.gateway_recovering = False
+        self.status.update(ok=True, state='ready', error=None)
         atomic_json(self.directory / 'status.json', self.snapshot())
+
+    async def recover_gateway(self):
+        for delay in GATEWAY_RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            if self.stopping.is_set():
+                raise asyncio.CancelledError()
+            self.gateway_recovering = True
+            self.gateway_reconnects += 1
+            self.gateway = GatewayControl(self.config, self.directory)
+            try:
+                await self.gateway.open()
+                if self.stopping.is_set():
+                    raise asyncio.CancelledError()
+                self.verify_gateway_generation()
+                self.gateway_ready = True
+                self.require_gateway()
+                await self.finish_gateway_recovery()
+                return
+            except GatewayControlError as exc:
+                self.gateway_failure_reason = exc.reason
+                self.recovery_error = safe_error(exc)
+                self.gateway_recovering = True
+                await self.retire_gateway()
+                if exc.recoverable is not True or exc.reason not in RECOVERABLE_REASONS:
+                    raise
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    self.gateway_failure_reason = 'unknown'
+                await self.retire_gateway()
+                raise
+        raise RelayError('Exclusive gateway recovery exhausted its bounded attempts; no direct fallback was attempted.')
+
+    async def monitor_gateway(self):
+        if self.gateway_descriptor is None:
+            descriptor = getattr(self.gateway, 'descriptor', None)
+            if isinstance(descriptor, dict):
+                self.gateway_descriptor = dict(descriptor)
+        while not self.stopping.is_set():
+            await asyncio.shield(self.gateway.failure)
+            reason, recoverable = self.gateway_failure(self.gateway)
+            recoverable = recoverable and self.status['state'] != 'error'
+            self.gateway_failure_reason = reason
+            self.gateway_ready = False
+            self.gateway_recovering = recoverable
+            if recoverable:
+                self.status.update(ok=False, state='starting', error=None)
+                self.recovery_error = 'Exclusive gateway control lost; reconnecting the verified route.'
+            else:
+                self.fail('Exclusive gateway control failed; UDP forwarding is disabled. No direct fallback was attempted.')
+            if self.startup and not self.startup.done():
+                self.startup.cancel()
+                await asyncio.gather(self.startup, return_exceptions=True)
+            await self.retire_gateway()
+            if not recoverable:
+                break
+            try:
+                await self.recover_gateway()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, GatewayControlError):
+                    self.gateway_failure_reason = exc.reason
+                elif not isinstance(exc, RelayError):
+                    self.gateway_failure_reason = 'unknown'
+                self.fail(safe_error(exc, 'Exclusive gateway recovery failed; no direct fallback was attempted.'))
+                break
+        self.gateway_recovering = False
+        # Fatal failures preserve the independent TCP path, but need no UDP
+        # demand tracking because only explicit stop/start can recover them.
+        if self.status['state'] == 'error' and self.local:
+            self.local.close()
+            self.local = None
+        atomic_json(self.directory / 'status.json', self.snapshot())
+
+    async def watch_gateway(self):
+        monitor = asyncio.create_task(self.monitor_gateway())
+        stopped = asyncio.create_task(self.stopping.wait())
+        try:
+            await asyncio.wait((monitor, stopped), return_when=asyncio.FIRST_COMPLETED)
+            if monitor.done():
+                await monitor
+        finally:
+            monitor.cancel()
+            stopped.cancel()
+            await asyncio.gather(monitor, stopped, return_exceptions=True)
+            self.gateway_recovering = False
+
+    def idle_expired(self, now):
+        return ((self.startup is None or self.startup.done())
+                and not self.flows and not self.ssh.connections
+                and not self.gateway_recovering
+                and now - self.no_clients_since >= NO_CLIENT_SECONDS)
 
     async def handle_control(self, reader, writer):
         task = asyncio.current_task()
@@ -486,8 +670,12 @@ class Service:
     async def initialize(self):
         try:
             ssh_endpoint = await resolve_ssh_destination(self.config)
+            self.ssh_destination = ssh_endpoint
             self.turn = load_aioice(self.config['dependency_dir'])
             await self.gateway.open()
+            descriptor = getattr(self.gateway, 'descriptor', None)
+            if isinstance(descriptor, dict):
+                self.gateway_descriptor = dict(descriptor)
             self.gateway_ready = True
             self.require_gateway()
             self.gateway_watch = asyncio.create_task(self.watch_gateway())
@@ -560,8 +748,7 @@ class Service:
                         self.fail(self.warm.failure.result())
                     warm, self.warm = self.warm, None
                     await self.close_endpoint(warm)
-                if (self.startup.done() and not self.flows and not self.ssh.connections
-                        and now - self.no_clients_since >= NO_CLIENT_SECONDS):
+                if self.idle_expired(now):
                     self.stopping.set()
                 if (self.status['state'] == 'ready' and self.credentials.expires
                         and time.time() >= self.credentials.expires - 300

@@ -54,6 +54,9 @@ local function decode(raw)
         or (value.recovering_flows ~= nil and not count(value.recovering_flows))
         or (value.allocation_refreshes ~= nil and not count(value.allocation_refreshes))
         or (value.recovery_error ~= nil and not text(value.recovery_error, 4096))
+        or (value.gateway_recovering ~= nil and type(value.gateway_recovering) ~= "boolean")
+        or (value.gateway_reconnects ~= nil and not count(value.gateway_reconnects))
+        or (value.gateway_failure_reason ~= nil and not text(value.gateway_failure_reason, 128))
         or type(value.congested) ~= "boolean"
         or (value.ssh_destination ~= nil and not text(value.ssh_destination, 256))
         or (value.relay_fingerprint ~= nil and not text(value.relay_fingerprint, 256))
@@ -102,6 +105,7 @@ end
 
 local function phaseLabel()
     if stopAfterResume or busy == "stop" then return "停止中" end
+    if cache.gateway_recovering then return "网关恢复中" end
     if (cache.recovering_flows or 0) > 0 then return "恢复中" end
     if cache.state == "starting" and cache.recovery_error then return "等待重连" end
     if busy == "start" or busy == "resume" or cache.state == "starting" then return "启动中" end
@@ -196,7 +200,7 @@ local function helper(command, mode, token, _cx, callback)
         local value, err = decode(result.stdout)
         if not value then callback(nil, err, fresh); return end
         if command == "status" and value.state == "starting"
-            and ((value.recovering_flows or 0) > 0 or value.recovery_error ~= nil) then
+            and (value.gateway_recovering or (value.recovering_flows or 0) > 0 or value.recovery_error ~= nil) then
             callback(value, nil, fresh)
             return
         end
@@ -750,6 +754,9 @@ local function showDetails(cx)
     row("TURN flows / SSH TCP", tostring(cache.flows) .. " / " .. tostring(cache.ssh_connections))
     row("恢复中的 flow", cache.recovering_flows or 0)
     row("成功续期次数", cache.allocation_refreshes or 0)
+    row("网关恢复中", cache.gateway_recovering and "是" or "否")
+    row("网关重连尝试次数", cache.gateway_reconnects or 0)
+    row("最近网关事件", cache.gateway_failure_reason)
     row("当前恢复原因", cache.recovery_error)
     row("排队", tostring(cache.queued_packets) .. " 包 / " .. bytes(cache.queued_bytes))
     row("累计上行丢弃", tostring(cache.queue_dropped_packets) .. " 包 / " .. bytes(cache.queue_dropped_bytes))
@@ -899,7 +906,7 @@ tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, 
 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
 tern.chrome.status(function()
-    return { { text = statusText, tone = lastError and "error" or ((cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = "plugin.tern-turn-relay.status" } }
+    return { { text = statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = "plugin.tern-turn-relay.status" } }
 end)
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
