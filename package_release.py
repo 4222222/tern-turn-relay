@@ -29,6 +29,7 @@ TESTS = (
     'tests/test_intent.py', 'tests/work_queue_spec.luau',
     'tests/test_distribution.py', 'tests/test_setup.py', 'tests/test_credentials.py',
     'tests/test_allocation_recovery.py',
+    'tests/test_renewal.py', 'tests/test_flow_recovery.py',
 )
 
 

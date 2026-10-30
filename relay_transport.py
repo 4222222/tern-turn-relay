@@ -41,6 +41,20 @@ class TransientTurnError(RelayError):
     """A network failure eligible for bounded allocation retries, never bypass."""
 
 
+def _transient_error(exc, turn):
+    # SSL errors inherit OSError, but trust/handshake failures must fail closed.
+    if isinstance(exc, ssl.SSLError):
+        return False
+    timeout = getattr(getattr(turn, 'stun', None), 'TransactionTimeout', ())
+    return (isinstance(exc, (asyncio.TimeoutError, OSError, TransientTurnError))
+            or isinstance(exc, timeout))
+
+
+def _allocation_lost(exc):
+    response = getattr(exc, 'response', None)
+    return getattr(response, 'attributes', {}).get('ERROR-CODE', (None,))[0] == 437
+
+
 def fetch_credentials(path):
     try:
         return issue_turn_credentials(load_management_key(path), ttl=CREDENTIAL_TTL)
@@ -155,15 +169,32 @@ class Endpoint(asyncio.DatagramProtocol):
         self.transport = None
         self.expires = None
         self.failure = asyncio.get_running_loop().create_future()
+        self.failure_recoverable = False
+        self.refresh_count = 0
+        self.allocation_deadline = None
+        self._allocation_started = None
         self.closed = asyncio.get_running_loop().create_future()
         self.closing = False
         self.writable = asyncio.Event()
         self.writable.set()
 
-    def fail(self, message):
+    def fail(self, message, recoverable=False):
         if not self.closing and not self.failure.done():
+            self.failure_recoverable = recoverable
             self.failure.set_result(message)
             self.writable.set()
+
+    def _expire_allocation(self):
+        if self.allocation_deadline is not None and time.monotonic() >= self.allocation_deadline:
+            self.fail('TURN allocation expired; a new allocation is required.', recoverable=True)
+
+    def _check_usable(self):
+        if self.closing:
+            raise RelayError('TURN endpoint is closed; no packet was sent.')
+        self._expire_allocation()
+        if self.failure.done():
+            error = TransientTurnError if self.failure_recoverable else RelayError
+            raise error(self.failure.result())
 
     def connection_made(self, transport):
         self.transport = transport
@@ -171,16 +202,19 @@ class Endpoint(asyncio.DatagramProtocol):
     def connection_lost(self, exc):
         if not self.closed.done():
             self.closed.set_result(None)
-        self.fail('TURN connection closed; disconnect and reconnect to recover.')
+        self.fail('TURN connection closed; a new allocation is required.',
+                  recoverable=exc is None or _transient_error(exc, self.turn))
 
     def datagram_received(self, data, addr):
+        self._expire_allocation()
         if addr == self.peer and not self.closing and not self.failure.done():
             payload = self.codec.decode(data)
             if payload is not None:
                 self.receive(payload)
 
     def error_received(self, exc):
-        self.fail('TURN socket reported an asynchronous transport error.')
+        self.fail('TURN socket reported an asynchronous transport error.',
+                  recoverable=_transient_error(exc, self.turn))
 
     async def open(self, entries, expires):
         self.expires = expires
@@ -189,6 +223,17 @@ class Endpoint(asyncio.DatagramProtocol):
         original = turn.TurnClientTcpProtocol if self.mode == 'tls' else turn.TurnClientUdpProtocol
 
         class OwnedProtocol(original):
+            async def connect(self):
+                endpoint._allocation_started = time.monotonic()
+                return await super().connect()
+
+            def _send(self, data):
+                # send_data may await a channel bind past the allocation deadline.
+                # Gate the actual payload write, but allow STUN cleanup requests.
+                if data and data[0] & 0xC0 == 0x40:
+                    endpoint._check_usable()
+                super()._send(data)
+
             def connection_made(self, transport):
                 endpoint.native = transport
                 super().connection_made(transport)
@@ -214,19 +259,52 @@ class Endpoint(asyncio.DatagramProtocol):
 
             async def refresh(self, lifetime):
                 try:
-                    while True:
-                        if not isinstance(lifetime, int) or lifetime <= 0:
-                            raise RelayError('TURN server expired an allocation.')
-                        await asyncio.sleep(lifetime * 5 / 6)
-                        request = turn.stun.Message(message_method=turn.stun.Method.REFRESH,
-                                                    message_class=turn.stun.Class.REQUEST)
-                        request.attributes['LIFETIME'] = self.lifetime
-                        response, _ = await asyncio.wait_for(self.request_with_retry(request), min(18, lifetime / 12))
-                        lifetime = response.attributes['LIFETIME']
+                    started = endpoint._allocation_started
+                    if started is None:
+                        started = time.monotonic()
+                    if type(lifetime) is not int or lifetime < 0:
+                        raise RelayError('TURN server returned an invalid allocation lifetime.')
+                    if endpoint.allocation_deadline is None:
+                        endpoint.allocation_deadline = started + lifetime
+                    refresh_at = endpoint.allocation_deadline - lifetime / 2
+                    while not endpoint.closing and not endpoint.failure.done():
+                        endpoint._check_usable()
+                        await asyncio.sleep(max(0, refresh_at - time.monotonic()))
+                        for attempt in range(3):
+                            endpoint._check_usable()
+                            started = time.monotonic()
+                            remaining = endpoint.allocation_deadline - started
+                            request = turn.stun.Message(message_method=turn.stun.Method.REFRESH,
+                                                        message_class=turn.stun.Class.REQUEST)
+                            request.attributes['LIFETIME'] = self.lifetime
+                            try:
+                                # Keep the existing per-request cap; start earlier
+                                # instead of extending the timeout or allocation.
+                                response, _ = await asyncio.wait_for(
+                                    self.request_with_retry(request), min(18, lifetime / 12, remaining))
+                            except Exception as exc:
+                                if not _transient_error(exc, turn) or attempt == 2:
+                                    raise
+                                endpoint._check_usable()
+                                await asyncio.sleep(min(2 ** attempt,
+                                                        endpoint.allocation_deadline - time.monotonic()))
+                                continue
+                            endpoint._check_usable()
+                            lifetime = response.attributes['LIFETIME']
+                            if type(lifetime) is not int or lifetime < 0:
+                                raise RelayError('TURN server returned an invalid allocation lifetime.')
+                            # Start at request transmission, not response receipt:
+                            # network delay must never extend our expiry budget.
+                            endpoint.allocation_deadline = started + lifetime
+                            endpoint._check_usable()
+                            endpoint.refresh_count += 1
+                            refresh_at = started + lifetime / 2
+                            break
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    endpoint.fail('TURN allocation refresh failed; disconnect and reconnect to recover.')
+                except Exception as exc:
+                    endpoint.fail('TURN allocation refresh failed; a new allocation is required.',
+                                  recoverable=_transient_error(exc, turn) or _allocation_lost(exc))
 
         self.inner = OwnedProtocol((host, port), username=username, password=password,
                                    lifetime=120, channel_refresh_time=90)
@@ -243,8 +321,7 @@ class Endpoint(asyncio.DatagramProtocol):
                 # globals: concurrent flow allocations must not steal ownership.
                 transport = turn.TurnTransport(self.inner)
                 await transport._connect(self)
-                if self.failure.done():
-                    raise RelayError(self.failure.result())
+                self._check_usable()
             await asyncio.wait_for(allocate(), ALLOCATION_TIMEOUT)
         except asyncio.CancelledError:
             await self.close()
@@ -253,31 +330,29 @@ class Endpoint(asyncio.DatagramProtocol):
             await self.close()
             if isinstance(exc, ssl.SSLError):
                 raise RelayError('TURN TLS verification or handshake failed; no direct fallback was attempted.') from None
-            if isinstance(exc, (asyncio.TimeoutError, OSError, self.turn.stun.TransactionTimeout)):
+            if _transient_error(exc, self.turn) or _allocation_lost(exc):
                 raise TransientTurnError('TURN network allocation failed or timed out; no direct fallback was attempted.') from None
             raise RelayError('TURN allocation was rejected or failed; check provider authorization and quota. No direct fallback was attempted.') from None
 
     async def send(self, data):
-        if self.closing:
-            raise RelayError('TURN endpoint is closed; no packet was sent.')
-        if self.failure.done():
-            raise RelayError(self.failure.result())
+        self._check_usable()
         if time.time() >= self.expires - 15:
             raise RelayError('TURN credentials expired; reconnect to establish a new allocation.')
         try:
             if not self.writable.is_set():
                 await asyncio.wait_for(self.writable.wait(), ALLOCATION_TIMEOUT)
-                if self.failure.done():
-                    raise RelayError(self.failure.result())
-            if self.closing:
-                raise RelayError('TURN endpoint is closed; no packet was sent.')
+            self._check_usable()
             await self.inner.send_data(self.codec.encode(data), self.peer)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            raise RelayError('TURN send or channel binding failed; reconnect to recover.') from None
-        if self.failure.done():
-            raise RelayError(self.failure.result())
+        except RelayError:
+            raise
+        except Exception as exc:
+            recoverable = _transient_error(exc, self.turn) or _allocation_lost(exc)
+            self.fail('TURN send or channel binding failed; a new allocation is required.',
+                      recoverable=recoverable)
+            self._check_usable()
+        self._check_usable()
 
     async def close(self):
         if self.closing:
@@ -285,17 +360,24 @@ class Endpoint(asyncio.DatagramProtocol):
         self.closing = True
         self.writable.set()
         refresh = self.inner.refresh_task if self.inner else None
-        if refresh:
+        if self.inner:
+            # aioice.delete cancels refresh_task too. A second cancellation while
+            # Python 3.9 wait_for is joining its child can strand that child.
+            self.inner.refresh_task = None
+        if refresh is asyncio.current_task():
+            refresh = None
+        if refresh and not refresh.done():
             refresh.cancel()
         try:
+            if refresh:
+                await asyncio.shield(asyncio.gather(refresh, return_exceptions=True))
             if self.inner and self.native and not self.native.is_closing():
                 try:
                     await asyncio.wait_for(self.inner.delete(), 2)
-                except (Exception, asyncio.CancelledError):
+                except Exception:
                     pass
         finally:
-            if refresh:
-                await asyncio.gather(refresh, return_exceptions=True)
+            # Never cancel/join renewal a second time during teardown.
             if self.native:
                 self.native.close()
                 try:
@@ -303,3 +385,7 @@ class Endpoint(asyncio.DatagramProtocol):
                 except asyncio.TimeoutError:
                     if hasattr(self.native, 'abort'):
                         self.native.abort()
+                except asyncio.CancelledError:
+                    if hasattr(self.native, 'abort'):
+                        self.native.abort()
+                    raise

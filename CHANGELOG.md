@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Refresh TURN allocations at half-life with monotonic expiry checks and bounded transient retries; never forward using an expired allocation.
+- Rebuild failed flow transports against the same authenticated gateway while preserving flow identity, sequence and replay state. Healthy sibling flows continue forwarding.
+- Bound demand-driven recovery with shared cooldown, keep active demand out of the idle-exit path, and cancel recovery on Stop or gateway loss.
+- Expose recovery state and cumulative successful allocation refreshes; clear resolved backend error indicators without hiding unrelated UI errors.
+- Cover renewal loss, authorization denial, expiry, transport migration and recovery cancellation with deterministic regression scenarios.
+
 ## 0.2.0
 
 - Add private Cloudflare TURN-key configuration, local status, remote credential checks and explicit local removal for terminal users and agents.

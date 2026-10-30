@@ -51,6 +51,9 @@ local function decode(raw)
         or not count(value.ssh_connections)
         or not count(value.queued_packets) or not count(value.queued_bytes)
         or not count(value.queue_dropped_packets) or not count(value.queue_dropped_bytes)
+        or (value.recovering_flows ~= nil and not count(value.recovering_flows))
+        or (value.allocation_refreshes ~= nil and not count(value.allocation_refreshes))
+        or (value.recovery_error ~= nil and not text(value.recovery_error, 4096))
         or type(value.congested) ~= "boolean"
         or (value.ssh_destination ~= nil and not text(value.ssh_destination, 256))
         or (value.relay_fingerprint ~= nil and not text(value.relay_fingerprint, 256))
@@ -99,6 +102,8 @@ end
 
 local function phaseLabel()
     if stopAfterResume or busy == "stop" then return "停止中" end
+    if (cache.recovering_flows or 0) > 0 then return "恢复中" end
+    if cache.state == "starting" and cache.recovery_error then return "等待重连" end
     if busy == "start" or busy == "resume" or cache.state == "starting" then return "启动中" end
     if cache.state == "error" then return "不可用" end
     if cache.state ~= "ready" then return "已停止" end
@@ -124,9 +129,11 @@ local function report(cx, message)
 end
 
 local function accept(value)
+    local previousError = cache.error
     cache = value
     if value.address then alias = value.address end
-    if value.error then lastError = value.error:gsub("[%c]", " ") end
+    if value.error then lastError = value.error:gsub("[%c]", " ")
+    elseif previousError and lastError == previousError:gsub("[%c]", " ") then lastError = nil end
 end
 
 local function readState()
@@ -188,6 +195,11 @@ local function helper(command, mode, token, _cx, callback)
         end
         local value, err = decode(result.stdout)
         if not value then callback(nil, err, fresh); return end
+        if command == "status" and value.state == "starting"
+            and ((value.recovering_flows or 0) > 0 or value.recovery_error ~= nil) then
+            callback(value, nil, fresh)
+            return
+        end
         if result.status ~= 0 or not value.ok then
             callback(value, value.error or "Helper command failed; no direct fallback was attempted.", fresh)
             return
@@ -736,6 +748,9 @@ local function showDetails(cx)
     table.insert(rows, "\n## 流量与队列\n\n| 项目 | 数值 |\n| --- | --- |")
     row("上传 / 下载", bytes(cache.bytes_up) .. " / " .. bytes(cache.bytes_down))
     row("TURN flows / SSH TCP", tostring(cache.flows) .. " / " .. tostring(cache.ssh_connections))
+    row("恢复中的 flow", cache.recovering_flows or 0)
+    row("成功续期次数", cache.allocation_refreshes or 0)
+    row("当前恢复原因", cache.recovery_error)
     row("排队", tostring(cache.queued_packets) .. " 包 / " .. bytes(cache.queued_bytes))
     row("累计上行丢弃", tostring(cache.queue_dropped_packets) .. " 包 / " .. bytes(cache.queue_dropped_bytes))
     row("当前拥塞", cache.congested and "是（可恢复）" or "否")
@@ -884,7 +899,7 @@ tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, 
 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
 tern.chrome.status(function()
-    return { { text = statusText, tone = lastError and "error" or (cache.congested and "warn" or "muted"), command = "plugin.tern-turn-relay.status" } }
+    return { { text = statusText, tone = lastError and "error" or ((cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = "plugin.tern-turn-relay.status" } }
 end)
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be

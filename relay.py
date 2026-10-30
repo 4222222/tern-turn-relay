@@ -31,6 +31,7 @@ NO_CLIENT_SECONDS = 120
 START_TIMEOUT = 90
 STOP_TIMEOUT = 12
 ALLOCATION_RETRY_DELAYS = (2, 5)
+ALLOCATION_RECOVERY_COOLDOWN = 30
 
 
 def safe_error(exc, fallback='Relay operation failed; check configuration and local permissions.'):
@@ -102,6 +103,10 @@ class Flow:
         self.last_activity = time.monotonic()
         self.closing = False
         self.failure = None
+        self.codec = getattr(endpoint, 'codec', None)
+        self.recovering = endpoint is None
+        self.recovery_error = None
+        self.demand = asyncio.Event()
         if endpoint:
             endpoint.receive = self.receive
         self.task = asyncio.create_task(self.run())
@@ -109,13 +114,14 @@ class Flow:
     def enqueue(self, data):
         if self.closing:
             return
+        self.last_activity = time.monotonic()
+        self.demand.set()
         if self.queue.full() or self.pending_bytes + len(data) > MAX_PENDING_BYTES:
             # UDP overload is recoverable packet loss, not a dead allocation.
             self.service.record_queue_drop(len(data))
             return
         self.queue.put_nowait(data)
         self.pending_bytes += len(data)
-        self.last_activity = time.monotonic()
 
     def receive(self, data):
         if not self.closing and self.service.local and self.service.gateway_available():
@@ -133,17 +139,94 @@ class Flow:
         self.service.fail(message)
         self.task.cancel()
 
+    def require_active(self):
+        if self.closing or self.service.stopping.is_set():
+            raise asyncio.CancelledError()
+        self.service.require_gateway()
+        if self.service.status['state'] == 'error':
+            raise RelayError(self.service.status['error'])
+
+    async def retire_endpoint(self):
+        endpoint, self.endpoint = self.endpoint, None
+        if endpoint is not None:
+            await self.service.close_endpoint(endpoint)
+
+    async def allocate(self):
+        self.recovering = True
+        while True:
+            self.require_active()
+            await self.service.wait_for_allocation()
+            self.require_active()
+            entries, expires = await self.service.credentials.get()
+            self.require_active()
+            try:
+                self.endpoint = await self.service.open_endpoint(
+                    self.receive, entries, expires, codec=self.codec)
+                self.codec = getattr(self.endpoint, 'codec', self.codec)
+                self.require_active()
+                self.recovering = False
+                self.recovery_error = None
+                self.service.recovery_error = None
+                return
+            except TransientTurnError as exc:
+                self.recovery_error = safe_error(exc)
+                # open_endpoint owns the only bounded attempt loop. Once it
+                # exhausts, only new client demand may start another batch.
+                self.service.defer_allocations()
+                self.demand.clear()
+                await self.wait_for_demand()
+
+    async def wait_for_demand(self):
+        demand = asyncio.create_task(self.demand.wait())
+        stopped = asyncio.create_task(self.service.stopping.wait())
+        try:
+            await asyncio.wait((demand, stopped, self.service.gateway.failure),
+                               return_when=asyncio.FIRST_COMPLETED)
+            self.require_active()
+        finally:
+            demand.cancel()
+            stopped.cancel()
+            await asyncio.gather(demand, stopped, return_exceptions=True)
+
+    async def next_packet(self):
+        failure = getattr(self.endpoint, 'failure', None)
+        if failure is not None and failure.done():
+            kind = TransientTurnError if getattr(self.endpoint, 'failure_recoverable', False) else RelayError
+            raise kind(failure.result())
+        if not self.queue.empty():
+            return self.queue.get_nowait()
+        if failure is None:
+            return await self.queue.get()
+        packet = asyncio.create_task(self.queue.get())
+        try:
+            await asyncio.wait((packet, failure), return_when=asyncio.FIRST_COMPLETED)
+            if packet.done():
+                return packet.result()
+            kind = TransientTurnError if getattr(self.endpoint, 'failure_recoverable', False) else RelayError
+            raise kind(failure.result())
+        finally:
+            if not packet.done():
+                packet.cancel()
+                await asyncio.gather(packet, return_exceptions=True)
+
     async def run(self):
         try:
-            if self.endpoint is None:
-                entries, expires = await self.service.credentials.get()
-                self.endpoint = await self.service.open_endpoint(self.receive, entries, expires)
             batch = 0
             while True:
-                data = await self.queue.get()
-                self.pending_bytes -= len(data)
-                self.service.require_gateway()
-                await self.endpoint.send(data)
+                self.require_active()
+                if self.endpoint is None:
+                    await self.allocate()
+                try:
+                    data = await self.next_packet()
+                    self.pending_bytes -= len(data)
+                    self.require_active()
+                    await self.endpoint.send(data)
+                except TransientTurnError as exc:
+                    self.recovery_error = safe_error(exc)
+                    self.recovering = True
+                    self.service.defer_allocations()
+                    await self.retire_endpoint()
+                    continue
                 # Counts payload accepted by the actual TURN send operation,
                 # not a promise that the remote application received it.
                 self.service.status['bytes_up'] += len(data)
@@ -164,8 +247,7 @@ class Flow:
         if self.closing:
             return
         self.closing = True
-        if self.endpoint:
-            await self.endpoint.close()
+        await self.retire_endpoint()
         if self.service.flows.get(self.address) is self:
             del self.service.flows[self.address]
             if not self.service.flows and not self.service.ssh.connections:
@@ -183,6 +265,8 @@ class LocalProtocol(asyncio.DatagramProtocol):
         if len(data) > MAX_PAYLOAD:
             service.fail('Oversized UDP payload rejected; no TURN packet was sent.')
             return
+        # Demand remains activity even when allocation admission is cooling down.
+        service.no_clients_since = time.monotonic()
         flow = service.flows.get(address)
         if flow is None:
             if service.status['state'] != 'ready':
@@ -222,6 +306,9 @@ class Service:
         self.renewal = None
         self.no_clients_since = time.monotonic()
         self.last_queue_drop = None
+        self.allocation_retry_at = 0.0
+        self.allocation_refreshes = 0
+        self.recovery_error = None
 
     def snapshot(self):
         result = dict(self.status)
@@ -230,6 +317,28 @@ class Service:
         result['queued_packets'] = sum(flow.queue.qsize() for flow in self.flows.values())
         result['queued_bytes'] = sum(flow.pending_bytes for flow in self.flows.values())
         result['congested'] = self.last_queue_drop is not None and time.monotonic() - self.last_queue_drop < 5
+        endpoints = [flow.endpoint for flow in self.flows.values() if flow.endpoint]
+        if self.warm:
+            endpoints.append(self.warm)
+        result['allocation_refreshes'] = getattr(self, 'allocation_refreshes', 0) + sum(
+            getattr(endpoint, 'refresh_count', 0) for endpoint in endpoints)
+        result['recovering_flows'] = sum(
+            bool(getattr(flow, 'recovering', False) or
+                 (getattr(flow.endpoint, 'failure_recoverable', False) and
+                  flow.endpoint.failure.done())) for flow in self.flows.values())
+        usable = any(not getattr(endpoint, 'closing', False) and
+                     not (getattr(endpoint, 'failure', None) is not None and endpoint.failure.done()) and
+                     (getattr(endpoint, 'allocation_deadline', None) is None or
+                      endpoint.allocation_deadline > time.monotonic()) for endpoint in endpoints)
+        usable = usable and self.gateway_available() and not self.stopping.is_set()
+        result['recovery_error'] = next(
+            (getattr(flow, 'recovery_error', None) for flow in self.flows.values()
+             if getattr(flow, 'recovering', False) and getattr(flow, 'recovery_error', None)),
+            getattr(self, 'recovery_error', None) if not usable else None)
+        if result['state'] in ('error', 'stopped'):
+            result['recovery_error'] = None
+        if result['state'] == 'ready' and not usable:
+            result.update(ok=False, state='starting', error=None)
         expiries = [flow.endpoint.expires for flow in self.flows.values() if flow.endpoint and flow.endpoint.expires]
         if self.warm and self.warm.expires:
             expiries.append(self.warm.expires)
@@ -248,9 +357,32 @@ class Service:
             self.no_clients_since = time.monotonic()
 
     def fail(self, message):
-        # Latch failures until an explicit Disconnect/Connect. Existing healthy
-        # flows may drain, but packets cannot cause unlimited token retries.
+        # Only fatal failures latch. Typed transient TURN failures are handled
+        # by the affected flow, without disabling healthy sibling allocations.
         self.status.update(ok=False, state='error', error=message)
+
+    def defer_allocations(self):
+        self.allocation_retry_at = max(self.allocation_retry_at,
+                                       time.monotonic() + ALLOCATION_RECOVERY_COOLDOWN)
+
+    async def wait_for_allocation(self):
+        stopped = asyncio.create_task(self.stopping.wait())
+        try:
+            while not self.stopping.is_set():
+                self.require_gateway()
+                delay = self.allocation_retry_at - time.monotonic()
+                if delay <= 0:
+                    return
+                await asyncio.wait((stopped, self.gateway.failure), timeout=delay,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            raise asyncio.CancelledError()
+        finally:
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
+
+    async def close_endpoint(self, endpoint):
+        self.allocation_refreshes += getattr(endpoint, 'refresh_count', 0)
+        await endpoint.close()
 
     def gateway_available(self):
         return self.gateway_ready and not self.gateway.failure.done()
@@ -259,17 +391,24 @@ class Service:
         if not self.gateway_available():
             raise RelayError('Exclusive gateway is unavailable; no direct fallback was attempted.')
 
-    def endpoint(self, receive):
+    def endpoint(self, receive, codec=None):
         self.require_gateway()
-        return Endpoint(self.turn, self.mode, self.gateway.peer, receive, ClientCodec(self.gateway.key))
+        return Endpoint(self.turn, self.mode, self.gateway.peer, receive,
+                        codec if codec is not None else ClientCodec(self.gateway.key))
 
-    async def open_endpoint(self, receive, entries, expires):
+    async def open_endpoint(self, receive, entries, expires, codec=None):
         for attempt in range(len(ALLOCATION_RETRY_DELAYS) + 1):
             if self.stopping.is_set():
                 raise asyncio.CancelledError()
-            endpoint = self.endpoint(receive)
+            status = getattr(self, 'status', {})
+            if status.get('state') == 'error':
+                raise RelayError(status['error'])
+            endpoint = self.endpoint(receive) if codec is None else self.endpoint(receive, codec)
+            codec = getattr(endpoint, 'codec', codec)
             try:
                 await endpoint.open(entries, expires)
+                if self.stopping.is_set():
+                    raise asyncio.CancelledError()
                 return endpoint
             except TransientTurnError:
                 await endpoint.close()
@@ -309,7 +448,7 @@ class Service:
         await asyncio.gather(*(flow.finish() for flow in flows), return_exceptions=True)
         if self.warm:
             warm, self.warm = self.warm, None
-            await warm.close()
+            await self.close_endpoint(warm)
         await self.gateway.close()
         atomic_json(self.directory / 'status.json', self.snapshot())
 
@@ -406,16 +545,21 @@ class Service:
                         await flow.finish()
                         continue
                     endpoint = flow.endpoint
-                    if endpoint and endpoint.failure.done():
+                    if (endpoint and endpoint.failure.done() and
+                            not getattr(endpoint, 'failure_recoverable', False)):
                         flow.fail(endpoint.failure.result())
                     elif endpoint and endpoint.expires and time.time() >= endpoint.expires - 15:
                         flow.fail('Active TURN credentials are expiring; disconnect and reconnect to recover.')
                     elif now - flow.last_activity >= FLOW_IDLE_SECONDS:
                         flow.task.cancel()
                 if self.warm and self.warm.failure.done():
-                    self.fail(self.warm.failure.result())
+                    if getattr(self.warm, 'failure_recoverable', False):
+                        self.recovery_error = self.warm.failure.result()
+                        self.defer_allocations()
+                    else:
+                        self.fail(self.warm.failure.result())
                     warm, self.warm = self.warm, None
-                    await warm.close()
+                    await self.close_endpoint(warm)
                 if (self.startup.done() and not self.flows and not self.ssh.connections
                         and now - self.no_clients_since >= NO_CLIENT_SECONDS):
                     self.stopping.set()
@@ -446,7 +590,8 @@ class Service:
                     flow.task.cancel()
                 tasks.append(flow.task)
             if self.warm:
-                tasks.append(asyncio.create_task(self.warm.close()))
+                warm, self.warm = self.warm, None
+                tasks.append(asyncio.create_task(self.close_endpoint(warm)))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.gather(*(flow.finish() for flow in closing_flows), return_exceptions=True)
