@@ -1,0 +1,6 @@
+schema = 1
+id = "tern-turn-relay"
+name = "Tern TURN Relay"
+version = "0.2.0"
+description = "Exclusive TURN TLS/UDP gateway using verified Tern identities and an existing session daemon"
+window = "window.luau"

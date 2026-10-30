@@ -1,0 +1,14 @@
+.sdk/
+__pycache__/
+*.pyc
+.artifacts/
+dist/
+runtime/
+python-deps/
+.venv/
+config.json
+credentials.json
+cloudflare-key.json
+*.secret.json
+.env
+.env.*

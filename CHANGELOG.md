@@ -1,0 +1,13 @@
+# Changelog
+
+## 0.2.0
+
+- Add private Cloudflare TURN-key configuration, local status, remote credential checks and explicit local removal for terminal users and agents.
+- Discover existing remote Tern identity and daemon through strictly authenticated SSH; remove personal host aliases, paths and fingerprints from distributable defaults.
+- Install durable content-addressed packages, reuse compatible dependencies, preserve configuration on upgrade and validate ownership on uninstall.
+- Produce deterministic allowlisted release archives with SHA-256 checksums and MPL-2.0 licensing.
+- Retry transient network failures when allocating a new TURN flow at most twice after the initial attempt; certificate, authorization and identity failures remain fail-closed.
+- Treat flow-capacity exhaustion as bounded admission loss rather than permanently poisoning the relay; existing flows remain usable and new admission resumes after capacity is released.
+- Keep the independent authenticated gateway, existing daemon/session identity and explicit-only direct restoration.
+- Show compact binary-unit status summaries and persistent, reusable connection details instead of truncated diagnostic toasts.
+- Document human-confirmed Cloudflare Key creation and secret-safe agent-assisted configuration. OAuth login is not included in this release.
