@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Install through Tern's native Preferences or `tern plugin install`; load safely before configuration without starting Python or network work.
+- Add a native settings wizard for private runtime preparation, hidden credential input, verified server/workspace selection, explicit configuration review, connection, update and uninstall.
+- Prepare a private pinned CPython 3.13.9 on macOS arm64/x86_64 with publisher SHA-256 verification, bounded downloads and extraction, and no system Python installation.
+- Discover actual service-owned UDP listeners and daemon relationships; preserve process/socket identity and reject changed reviews before applying.
+- Support native package configuration and ownership-checked legacy-link migration with independent rollback; preserve private data during native removal.
+- Keep secrets out of Luau, arguments, environment variables and public results; cancellation and failed validation leave existing credentials unchanged.
+- Keep automation available through a bounded JSON onboarding interface. Remote Linux Python 3.9+ remains required.
+
 ## 0.2.2
 
 - Fix false daemon-identity rejection during in-place Tern upgrades: pin the process incarnation and socket, validate executable path/role/ownership, and migrate legacy executable-inode records only after stable identity checks pass.

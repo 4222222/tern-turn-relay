@@ -311,9 +311,14 @@ class UninstallTests(unittest.TestCase):
         def run(argv, env):
             if 'stop' in argv:
                 return '{"ok":true,"state":"stopped"}'
-            self.assertEqual(argv[-3:], ['plugin', 'unlink', install.PLUGIN_ID])
+            native = self.link.is_dir() and not self.link.is_symlink()
+            verb = 'remove' if native or self.link.is_symlink() else 'unlink'
+            self.assertEqual(argv[-3:], ['plugin', verb, install.PLUGIN_ID])
             if not leave_registration:
-                self.link.unlink()
+                if native:
+                    shutil.rmtree(self.link)
+                else:
+                    self.link.unlink()
             return '{}'
         with mock.patch.object(uninstall, 'tern_environment', return_value=(Path('/tern'), {}, self.plugins, self.data)), \
                 mock.patch.object(uninstall, 'run', side_effect=run) as command:
@@ -405,6 +410,90 @@ class UninstallTests(unittest.TestCase):
         with self.assertRaises(OSError):
             install.plugin_link(self.plugins)
         self.assertEqual(self.config.read_text(), 'configuration retained')
+
+    def use_native_copy(self):
+        self.link.unlink()
+        shutil.copytree(self.package, self.link)
+        self.package = self.link
+        (self.package / 'relay.py').chmod(0o644)  # Native git installs need not be 0600.
+        manifest = self.data / 'installation.json'
+        record = json.loads(manifest.read_text())
+        record.update(package=str(self.package), registration='native')
+        atomic_json(manifest, record)
+
+    def test_native_uninstall_uses_remove_preserving_all_private_data(self):
+        self.use_native_copy()
+        runtime = self.data / 'managed-python'
+        runtime.mkdir()
+        (runtime / 'keep').write_text('managed runtime retained')
+        result, calls = self.invoke()
+        self.assertTrue(result['plugin_removed'])
+        self.assertFalse(result['installed_package_preserved'])
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self.ssh.read_text(), self.unrelated)
+        self.assertEqual(self.config.read_text(), 'configuration retained')
+        self.assertEqual(self.credential.read_text(), 'private material retained')
+        self.assertTrue((runtime / 'keep').exists())
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_native_removal_preserves_owned_ssh_rule(self):
+        self.use_native_copy()
+        with self.assertRaisesRegex(ValueError, 'did not remove'):
+            self.invoke(leave_registration=True)
+        self.assertEqual(self.ssh.read_text(), self.block + self.unrelated)
+        self.assertTrue(self.package.is_dir())
+
+    def test_native_registration_cannot_borrow_legacy_ownership_record(self):
+        self.link.unlink()
+        self.link.mkdir()
+        with self.assertRaisesRegex(ValueError, 'points elsewhere'):
+            uninstall.owned_installation(self.data, self.plugins)
+
+    def test_native_ui_uninstall_never_requests_stop(self):
+        self.use_native_copy()
+        self.args.require_stopped_only = True
+        self.args.data_dir = self.data
+        self.args.package_dir = self.package
+        result, calls = self.invoke()
+        self.assertFalse(result['stop_requested'])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].args[0][-3:], ['plugin', 'remove', install.PLUGIN_ID])
+
+    def test_native_ui_uninstall_refuses_running_service_without_stop(self):
+        self.args.require_stopped_only = True
+        runtime = install.state_directory(self.data / 'runtime')
+        descriptor = lock_file(runtime / 'service.lock')
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(uninstall, 'tern_environment',
+                    return_value=(Path('/tern'), {}, self.plugins, self.data)), \
+                    mock.patch.object(uninstall, 'run') as command:
+                with self.assertRaisesRegex(ValueError, 'Disconnect TURN'):
+                    uninstall.uninstall(self.args)
+                command.assert_not_called()
+        finally:
+            os.close(descriptor)
+        self.assertTrue(self.link.is_symlink())
+        self.assertEqual(self.ssh.read_text(), self.block + self.unrelated)
+
+    def test_native_ui_uninstall_rejects_missing_registration(self):
+        self.args.require_stopped_only = True
+        self.use_path_marker()
+        self.link.unlink()
+        with self.assertRaisesRegex(ValueError, 'registration is missing'):
+            self.invoke()
+        self.assertEqual(self.ssh.read_text(), self.block + self.unrelated)
+
+    def test_native_ui_uninstall_asserts_reviewed_profile_and_package(self):
+        self.args.require_stopped_only = True
+        self.args.data_dir = self.root / 'another-profile'
+        with self.assertRaisesRegex(ValueError, 'selected Tern profile'):
+            self.invoke()
+        self.args.data_dir = self.data
+        self.args.package_dir = self.root
+        with self.assertRaisesRegex(ValueError, 'reviewed installation'):
+            self.invoke()
+        self.assertTrue(self.link.is_symlink())
 
 
 if __name__ == '__main__':

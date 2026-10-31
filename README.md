@@ -4,76 +4,59 @@
 
 ## 支持范围与前提
 
-- 本机 macOS、Tern 0.9.8、`/usr/bin/python3`（已验证 Python 3.9）。
-- 远端 Linux、Python 3.9+、已运行的 Tern 用户服务与 session daemon（已验证 Tern 0.9.6）。
+- 本机 macOS arm64 或 x86_64、Tern 0.9.8。无需自行安装或操作 Python；首次打开设置会准备插件私有的 CPython 3.13.9。
+- 远端 Linux、Python 3.9+、已运行的 Tern 用户服务与 session daemon（已验证 Tern 0.9.6、0.9.8）。远端 Python 仍是前提，但用户不需要手动执行部署脚本。
 - 已配置并核验主机密钥的 OpenSSH 别名，能够非交互公钥登录。当前要求 HostName 为公网 IPv4，不支持 ProxyJump/ProxyCommand、IPv6 或直接填域名。
 - 用户自己的 Cloudflare Realtime TURN Key。插件不附带共享凭据，不读取浏览器登录状态；流量费用由所用 Cloudflare 账户承担，请先查看官方计费规则。
 - 原生窗口插件仅支持 macOS；没有宣称跨平台 GUI 支持。此项目不是 Tern 或 Cloudflare 官方产品。
 
 ## 安装
 
-从 [Releases](https://github.com/jiwangyihao/tern-turn-relay/releases) 下载源码归档及 `.sha256` 文件，在同一目录执行 `shasum -a 256 -c <校验和文件>`，解压后进入源码目录。也可以克隆本仓库。
+在 **Tern → Preferences → Plugins → Install…** 中填写：
 
-### 1. 创建并配置自己的 TURN Key
-
-在 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls) 选择自己的账户并创建 TURN Key，取得 **Key ID** 与对应的 **TURN-key API token**。
-
-运行：
-
-```sh
-python3 credentials.py configure
-python3 credentials.py status
-python3 credentials.py check
+```text
+github.com/jiwangyihao/tern-turn-relay
 ```
 
-`configure` 在终端隐藏输入，验证一次真实的短期凭据签发后才保存；不要把秘密放进命令参数、聊天或截图。`check` 会请求一份短期凭据并丢弃，只输出脱敏结果；`status` 只检查本地配置。
+也可以只运行一次 Tern 原生命令：
 
-默认保存在：
+```sh
+tern plugin install github.com/jiwangyihao/tern-turn-relay
+```
+
+安装只注册插件，不要求预先生成配置，不访问 Cloudflare，不部署远端网关，也不自动切换服务器。GitHub 安装需要系统有 Git；没有 Git 时，从 [Releases](https://github.com/jiwangyihao/tern-turn-relay/releases) 下载并校验源码归档，解压后在 Install… 中选择包含 `plugin.toml` 的目录。
+
+### 首次配置
+
+1. 在命令面板选择 **TURN → Settings: server, Cloudflare Key and private runtime**；如果显示状态栏，也可以点击 **TURN · 待配置**。
+2. 向导自动下载、校验并准备插件私有 Python。使用固定发行版及 SHA-256，不安装系统级软件、不需要管理员权限；仅显式打开设置时准备，插件加载本身不会下载。首次准备需要联网，并要求至少 1 GiB 可用空间。
+3. 选择 **配置 Cloudflare TURN Key**。先在 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls) 创建自己的 TURN Key，再在系统隐藏输入窗口填写 **Key ID** 和 **TURN-key API token**。不要填写账户级 API Token。验证成功后才保存；取消或验证失败不会覆盖已有凭据。
+4. 选择已有 SSH 别名。向导通过严格 SSH 检查已有服务、daemon 和实际 UDP 监听端口；发现多个可验证工作区时列出供选择，不要求抄写路径或指纹。
+5. 阅读 **TURN 配置确认** 页，确认目标、原工作区、网关目录、本机端口及 SSH 规则文件，然后选择 **确认应用**。这一步安装依赖、部署专用网关并保存配置，不启动第二套 session daemon。
+6. 选择 **连接 TURN TLS**。可以从本机 Host 或对应服务器 Host 发起；拒绝切换无关远端 Host，失败不自动回退直连。
+
+已配置的凭据和目标会被识别并复用。运行中不自动停止连接来修改配置；需要更改时先显式 Stop（会中断共享入口上的连接）。默认本机端口为 `18377`；确有冲突时使用 **高级：自定义本机端口**，新端口会显示在确认页。
+
+### 凭据与配置保存位置
+
+默认凭据文件：
 
 ```text
 ~/Library/Application Support/Tern/plugin-data/tern-turn-relay/credentials/cloudflare.json
 ```
 
-目录权限 0700、文件权限 0600，原子写入，不跟随符号链接或接受硬链接。**这是权限保护的本地文件，不是 Keychain 加密存储。** 验证失败不会覆盖已有凭据。已有文件需交互确认，非交互覆盖必须显式 `--replace`。
+目录权限 0700、文件权限 0600；原子写入，不跟随符号链接或接受硬链接。**这是权限保护的本地文件，不是 Keychain 加密存储。** 输入只经过系统隐藏输入进程、匿名管道和可信 helper 内存，不进入 Luau 状态、命令参数、环境变量、日志或公开结果。
 
-账户级 API Token 与 TURN-key API token 不同：前者用于创建 Key，后者用于签发连接凭据，不能混用。有关让 agent 帮助创建和配置 Key，参见 [Agent 配置指南](docs/agent-setup.md)。本版没有 OAuth 登录入口。
+运行环境位于同一插件数据目录的 `managed-python/`，与连接后台的 `runtime/` 分离。自定义 Tern profile 默认把 SSH 兼容规则写入该 profile 的插件数据目录 `ssh-config`，不改用户全局 SSH 配置；服务器认证仍使用原有 OpenSSH 别名。该独立规则文件不会自动作用于普通 `ssh` 调用，需要显式使用它。已有安装保留其记录的 SSH 规则归属。
 
-### 2. 发现已有服务器并生成配置
-
-将 `my-server` 换成已经可用的 SSH 别名：
-
-```sh
-python3 setup.py --ssh-destination my-server --discover
-python3 setup.py --ssh-destination my-server \
-  --output "$HOME/Library/Application Support/Tern/plugin-data/tern-turn-relay/setup-config.json"
-```
-
-发现通过严格 SSH 执行只读检查，验证原服务身份、已有 daemon socket、用户及路径，不启动第二套 session daemon，不自动接受未知 SSH 主机密钥。`--discover` / `--dry-run` 输出脱敏 JSON，不写配置。
-
-如果服务器运行多个服务／daemon，或原监听端口未明确出现在进程参数中，必须根据服务器实际情况补充 `--original-state-dir`、`--daemon-socket`、`--target-port`。不要复制其他人的路径或指纹。可用 `--credential-file` 指定自己的私有凭据文件；`--listen-port` 默认 18377。
-
-`config.example.json` 是说明文件，故意不能直接运行；真实指纹必须由发现流程取得。
-
-### 3. 安装并连接
-
-```sh
-python3 install.py --config "$HOME/Library/Application Support/Tern/plugin-data/tern-turn-relay/setup-config.json"
-```
-
-安装器会：
-
-1. 复用版本匹配的依赖，否则在插件私有目录安装精确固定版本；不覆盖不兼容依赖目录。
-2. 将源码复制到插件数据目录中的内容寻址安装包，原解压目录删除后仍可运行。
-3. 经已有 SSH 自动部署远端小型 helper，创建独立服务身份，确认它仍连接原 daemon。
-4. 保存私有运行配置、安装所有权记录和精确作用域的 SSH 兼容规则，再链接 Tern 插件。
-
-安装不会自动切换 Host。选中原服务器 Host，在命令面板的 `TURN` 分组执行 **Connect configured Host via TURN TLS**。
+自动化仍可使用统一的 `onboarding.py` JSON 接口和底层 CLI；这是 agent／开发者接口，不是普通用户安装步骤。参见 [Agent 配置指南](docs/agent-setup.md)。本版不提供 OAuth 登录、不创建共享 Cloudflare 账户或 Key。
 
 ## 操作与状态
 
 | 命令 | 行为 |
 | --- | --- |
 | Connect configured Host via TURN TLS / UDP | 连接独立身份的专用入口，验证后切换；不自动直连回退。 |
+| Settings: server, Cloudflare Key and private runtime | 原生配置向导：准备运行环境、配置 Key、选择服务器、审核变更、更新或卸载。 |
 | Restore configured Host to direct | 显式恢复原地址及身份，不停止其他窗口使用的后台或 SSH。 |
 | Stop TURN for ALL windows and SSH TCP sessions | 停止共享后台、撤销自动恢复意图；会中断经本地 TCP 入口的 SSH，但不结束远端程序。 |
 | Status: TURN mode, native Host, SSH TCP, bytes and errors | 查询状态并打开可滚动详情；重复点击复用同一页。 |
@@ -113,25 +96,15 @@ TURN 不是普通 HTTP CDN，也不保证优于直连的延迟、吞吐或可用
 
 ## 升级与卸载
 
-从新版本源码目录运行以下命令。先恢复直连并 Stop，避免安装时中断仍在使用的共享后台：
+在 **TURN Settings → 插件管理** 中选择更新或卸载，随后明确确认。两项操作都要求连接已停止，不会代替用户执行 Stop。
 
-```sh
-python3 install.py
-```
+- **更新**：仅从固定仓库 `github.com/jiwangyihao/tern-turn-relay` 通过 Tern 原生安装器重新安装默认分支，随后重载插件。保留配置、凭据和运行环境，不自动重新连接；Tern 本身不比较版本，也没有自动更新服务。
+- **卸载**：验证本机安装所有权，移除原生插件及未被用户修改的自有 SSH 标记规则；保留私有配置、凭据、运行环境、远端网关身份和原 daemon。未配置的原生插件也可从同一入口卸载。
+- **旧版链接安装**：Tern 的 `--force` 不能覆盖 `.path` 链接。更新到带向导的包后，在服务器配置确认页显式迁移；或由 agent 使用新版本 `install.py --migrate-native` 完成一次性迁移。迁移保留原配置、凭据及旧源码包，失败时分别恢复注册、配置和 SSH 规则。不要直接删除旧目录。
 
-升级默认保留已有配置和凭据，拒绝替换正在运行的后台。需要换配置时使用 `--config ... --replace-config`。安装包按内容保留旧版本；激活失败会尝试恢复插件链接、配置和 SSH 规则。
+普通原生安装也可使用 `tern plugin install github.com/jiwangyihao/tern-turn-relay --force` 更新。直接用 Tern 删除插件只删除插件本体，不执行本项目的 SSH 规则清理；完整卸载应走设置入口。
 
-```sh
-python3 uninstall.py
-```
-
-卸载验证安装所有权，停止自有后台、解除插件链接，并且仅删除未被用户修改的标记 SSH 规则。配置、凭据、安装包及远端私有身份保留；原 daemon 不动。删除本地凭据是独立操作：
-
-```sh
-python3 credentials.py remove-local
-```
-
-这不会撤销 Cloudflare Key；云端撤销需用户在 Cloudflare 中明确操作。保留数据用于恢复，彻底清理前应核查其他窗口和安装引用，不能递归盲删。
+删除本地凭据与撤销 Cloudflare Key 是独立操作，均不包含在卸载中。Agent 可在用户明确授权后使用 `credentials.py remove-local`；云端撤销需要用户在 Cloudflare 中操作。彻底清理保留数据前应核查其他窗口和安装引用，不能递归盲删。
 
 ## 验证与打包
 

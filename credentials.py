@@ -39,6 +39,7 @@ import re
 import secrets
 import ssl
 import stat
+import subprocess
 import sys
 import time
 from urllib.error import HTTPError
@@ -290,6 +291,53 @@ def _atomic_store(directory, name, key, before):
             os.unlink(temporary, dir_fd=directory)
         except FileNotFoundError:
             pass
+
+
+NATIVE_KEY_DIALOG = '''try
+    set keyID to text returned of (display dialog "Cloudflare TURN key ID" default answer "" with hidden answer buttons {"Cancel", "Continue"} default button "Continue" cancel button "Cancel" with title "Tern TURN setup")
+    set apiToken to text returned of (display dialog "Cloudflare TURN-key API token (not an account token). Continue validates it with Cloudflare and saves it privately on this Mac." default answer "" with hidden answer buttons {"Cancel", "Validate and Save"} default button "Validate and Save" cancel button "Cancel" with title "Tern TURN setup")
+    if (length of keyID) > 128 or (length of apiToken) > 8192 then return "__INVALID__"
+    return keyID & linefeed & apiToken
+on error number -128
+    return "__CANCELLED__"
+end try'''
+
+
+def native_management_key(runner=subprocess.run):
+    """Standard Additions only; secrets travel solely through an anonymous pipe."""
+    try:
+        result = runner(['/usr/bin/osascript', '-e', NATIVE_KEY_DIALOG],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=300, check=False)
+        raw = result.stdout
+        if result.returncode or not isinstance(raw, bytes) or len(raw) > 16384:
+            raise CredentialError('Native hidden credential input failed.', 4)
+        text = raw.decode('utf-8').removesuffix('\n')
+        if text == '__CANCELLED__':
+            raise CredentialError('Local credential change cancelled.', 6)
+        fields = text.split('\n')
+        if len(fields) != 2:
+            raise CredentialError('Native credential input was invalid.', 4)
+        return validate_management_key({'provider': 'cloudflare',
+                                        'turn_key_id': fields[0], 'api_token': fields[1]})
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise CredentialError('Native hidden credential input failed or timed out.', 4) from None
+
+
+def configure_native(path, replace=False, runner=subprocess.run):
+    """Validate before atomic replacement; cancellation never changes an existing key."""
+    if type(replace) is not bool:
+        raise CredentialError('Credential replacement consent must be explicit.', 6)
+    path = _path(path)
+    with _parent(path, create=True, private=True) as directory:
+        before = _snapshot(directory, path.name)
+        if before is not None and not replace:
+            raise CredentialError('Replacing an existing credential requires explicit consent.', 6)
+        key = native_management_key(runner)
+        probe_credentials(key)
+        _atomic_store(directory, path.name, key, before)
+    return {'configured': True, 'validated': True, 'replaced': before is not None,
+            'provider': 'cloudflare', 'storage': 'private-file'}
 
 
 class _Parser(argparse.ArgumentParser):

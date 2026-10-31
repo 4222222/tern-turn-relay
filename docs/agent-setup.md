@@ -1,6 +1,6 @@
 # 让 Agent 帮助创建和配置 Cloudflare TURN Key
 
-适用场景：首次安装、已有 Key 导入、凭据失效检查、凭据替换。先阅读仓库 README 的支持范围，再按下列步骤执行。本版采用用户自有 Key，不提供 OAuth 登录，也不共享发布方的长期令牌。
+适用场景：原生插件安装、已有 Key 导入、凭据失效检查、凭据替换及旧版迁移。普通用户优先使用 README 的原生设置向导；本页保留 agent／自动化接口。本版采用用户自有 Key，不提供 OAuth 登录，也不共享发布方的长期令牌。
 
 ## 用户可以直接发送给 Agent
 
@@ -8,9 +8,11 @@
 
 ## 1. 只读预检
 
-运行各入口的 `--help`，然后 `credentials.py status`。该命令输出是否配置、私有存储路径和退出码，不显示 Key ID 或 token，也不调用 Cloudflare。
+先通过 Tern 原生安装入口注册插件。需要自动化时，在已安装的插件目录执行 `bootstrap-runtime.sh <该 profile 的插件数据目录> --prepare`，从成功 JSON 中取得私有 Python 路径；无需安装系统 Python。脚本仅在显式准备时下载固定版本，先核查平台、空间及用户授权。
 
-运行 `setup.py --ssh-destination <用户已有别名> --discover`。SSH 主机密钥必须已核验，禁止自动接受未知主机、复制他人的指纹或取消严格校验。存在多个原服务或 daemon 时，先读服务器进程及 socket 证据，再提供 `--original-state-dir`、`--daemon-socket`、`--target-port`，不能猜一个可能正确的工作区。
+用该解释器运行 `onboarding.py inspect --data-dir <数据目录> --package-dir <安装目录>`，stdin 为 `{}`。该操作只读、不会请求 Cloudflare 或连接 SSH；返回凭据是否存在、当前目标、运行状态及 SSH 别名建议，绝不返回秘密。检查已有配置时保留其路径和所有权记录，不另造默认配置。
+
+`onboarding.py discover` 的 stdin 为 `{"ssh_destination":"my-server"}`。若返回 `code:"choose"`，展示候选工作区，再把用户所选 `candidate_id` 传回；可选 `listen_port` 必须显式指定并在后续选择时保留。SSH 主机密钥必须已核验，不自动接受未知身份。该发现接口从实际进程、socket 和监听端口生成配置，不需要猜目录或端口。
 
 完成标准：确认支持的平台、目标账户／服务器和已有 daemon；缺少 Key 时进入第 2 步，有 Key 时进入第 3 步。配置错误时不启动服务、不修改账户。
 
@@ -21,7 +23,7 @@
 1. 打开 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls)。用户自行完成登录和 MFA。
 2. 确认所选账户、Key 名称、用途以及账户可能承担的 TURN 流量费用。**创建前取得用户对该账户和操作的明确确认。** 不代替用户接受条款、开通付费功能或修改账单。
 3. 在该账户的 TURN 管理页面创建专用 Key。界面名称可能变化；以当前官方界面和 [官方创建说明](https://developers.cloudflare.com/realtime/turn/generate-credentials/) 为准。
-4. 用户直接把 Key ID 和 TURN-key API token 输入 `python3 credentials.py configure` 的隐藏提示。不要复制到聊天或保存含秘密的屏幕截图。
+4. 用户在插件设置的系统隐藏输入窗口填写 Key ID 和 TURN-key API token；自动化可调用 `onboarding.py configure-credentials`，stdin 为 `{"replace":false}`。该动作需要可交互的 macOS 桌面。不要复制到聊天或保存含秘密的屏幕截图。
 
 ### 官方 API 路径（用户明确授权时）
 
@@ -42,12 +44,7 @@
 
 ## 3. 安全导入与验证
 
-人类终端流程：
-
-```sh
-python3 credentials.py configure
-python3 credentials.py check
-```
+普通用户使用插件设置入口。无桌面自动化时，保留下面的私有文件／管道接口；示例中的 `python3` 可替换为已准备的私有解释器。
 
 已有私有 JSON 文件可直接导入，agent 只需传路径，不读取或显示正文：
 
@@ -67,7 +64,9 @@ python3 credentials.py configure --input-file /absolute/private/source.json
 
 ## 4. 生成配置、安装和验证
 
-按 README 执行 setup 和 install。使用发现得到的真实指纹；`config.example.json` 不能当作运行配置。安装之前如果后台正在运行，应向用户说明共享连接会受影响，再显式停止；不能为了安装偷偷杀进程。
+保留 `discover` 返回的完整 `review`，向用户展示目标、原工作区、路径、SSH 规则文件和变更范围。取得授权后，调用 `onboarding.py apply`，stdin 为 `{"review":<原对象>,"authorize_replace":false}`；已有配置替换必须获准并设为 `true`。后端重新发现并逐项比较 review，目标或配置变化会拒绝应用，不能自行改写审核对象绕过检查。传输 JSON 时保留 null 字段，避免无配置标识被丢弃。
+
+运行中的后台必须先由用户明确授权停止。原生安装保持配置／凭据独立；旧 `.path` 安装会在 review 明示迁移，也可在新版本源码目录显式执行 `install.py --migrate-native`。底层 `setup.py`、`install.py` 仍供高级自动化使用，但不再让普通用户逐个手动运行。
 
 切换必须使用插件原生命令，不打开原生连接对话框。验证至少包括：
 
@@ -80,6 +79,6 @@ python3 credentials.py configure --input-file /absolute/private/source.json
 
 `credentials.py` 退出码：0 成功；2 输入／参数错误；3 未配置；4 隐藏终端输入不可用；5 Cloudflare 请求或响应验证失败；6 取消、缺少变更确认或并发修改；7 私有文件／存储错误；130 中断。遇到错误先读取脱敏说明，不把远端原始响应打印出来。
 
-`remove-local` 仅移除本机凭据文件，不撤销 Cloudflare Key。云端撤销和账户 API Token 撤销是独立操作，必须明确授权。卸载保留配置、秘密、安装包和远端私有身份，便于恢复；不要递归删除共享目录。
+`remove-local` 仅移除本机凭据文件，不撤销 Cloudflare Key。云端撤销和账户 API Token 撤销是独立操作，必须明确授权。统一接口的 `update`／`uninstall` 要求 stdin 严格为 `{"confirm":true}` 且后台已停止；更新仅使用固定项目仓库，卸载保留配置、秘密、运行环境及远端身份。原生安装包会移除；旧版迁移保留的源码包不会盲删。
 
 交付时列出安装版本、运行状态、凭据保存位置、尚存限制、已执行的验证、仍运行的进程，以及如何升级／停止／卸载。无需包含任何秘密。

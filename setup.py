@@ -20,7 +20,7 @@ from relay_config import load_config, private_file, validate_ssh_destination
 
 # Executed only through authenticated SSH. No package deployment or daemon start.
 REMOTE_DISCOVERY = r'''
-import base64, json, os, pwd, re, socket, stat, struct, subprocess, sys
+import base64, hashlib, json, os, pwd, re, socket, stat, struct, subprocess, sys
 from pathlib import Path
 
 def fail(message):
@@ -74,6 +74,66 @@ def select_daemon(daemons, wanted):
         fail('Existing session daemon is absent or ambiguous; pass --daemon-socket')
     return selected[0]
 
+def udp_listeners(entry, uid):
+    """Join kernel UDP rows to this process's open socket inodes, never argv defaults."""
+    inodes = set()
+    for fd in (entry / 'fd').iterdir():
+        try:
+            match = re.fullmatch(r'socket:\[([0-9]+)\]', os.readlink(fd))
+            if match:
+                inodes.add(match[1])
+        except (FileNotFoundError, PermissionError):
+            continue
+    result = []
+    for name, family in (('udp', socket.AF_INET), ('udp6', socket.AF_INET6)):
+        table = entry / 'net' / name
+        if not table.exists():
+            continue
+        with table.open() as stream:
+            next(stream, None)
+            for index, line in enumerate(stream):
+                if index >= 16384:
+                    fail('UDP inventory exceeded its limit')
+                fields = line.split()
+                if len(fields) < 10 or fields[9] not in inodes or int(fields[7]) != uid:
+                    continue
+                # Only unconnected bound sockets can be the original UDP listener.
+                if fields[3] != '07' or int(fields[2].replace(':', ''), 16) != 0:
+                    continue
+                address, port = fields[1].split(':')
+                packed = bytes.fromhex(address)
+                packed = b''.join(packed[i:i + 4][::-1] for i in range(0, len(packed), 4))
+                address = socket.inet_ntop(family, packed)
+                port = int(port, 16)
+                if port and address in ('0.0.0.0', '127.0.0.1'):
+                    result.append({'port': port, 'address': address, 'inode': fields[9]})
+    return sorted(result, key=lambda item: (item['port'], item['inode']))
+
+def candidate_id(service, daemon, listener):
+    binding = [service['pid'], service['start'], service['state'], daemon['pid'],
+               daemon['start'], daemon['socket'], listener['inode'], listener['port']]
+    return hashlib.sha256(json.dumps(binding, separators=(',', ':')).encode()).hexdigest()[:24]
+
+def verify_daemon(daemon):
+    endpoint = path(daemon['socket'])
+    directory(endpoint.parent)
+    info = endpoint.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        fail('Existing daemon socket has unsafe ownership or permissions')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2)
+        probe.connect(str(endpoint))
+        peer_pid, peer_uid, _ = struct.unpack('3i', probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    if peer_pid != daemon['pid'] or peer_uid != os.getuid():
+        fail('Existing daemon socket does not belong to the selected process')
+    return endpoint
+
+def related_daemons(service, daemons):
+    if service['daemon']:
+        return [item for item in daemons if item['socket'] == service['daemon']]
+    return [item for item in daemons if item['ppid'] == service['pid']
+            and int(item['start']) >= int(service['start'])]
+
 try:
     request = json.loads(sys.stdin.buffer.read(65537))
     uid = os.getuid()
@@ -86,55 +146,73 @@ try:
         try:
             if entry.stat().st_uid != uid:
                 continue
-            raw = (entry / 'cmdline').read_bytes()
+            with (entry / 'cmdline').open('rb') as stream:
+                raw = stream.read(65537)
             if len(raw) > 65536:
                 continue
             argv = [part.decode() for part in raw.split(b'\0') if part]
             executable = (entry / 'exe').resolve(strict=True)
             if not argv or Path(argv[0]).name != 'tern':
                 continue
+            process_stat = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            start = process_stat[19]
             if 'daemon' in argv and option(argv, '--socket'):
-                daemons.append({'pid': int(entry.name), 'socket': option(argv, '--socket')})
+                daemons.append({'pid': int(entry.name), 'ppid': int(process_stat[1]),
+                                'start': start, 'socket': option(argv, '--socket')})
             if argv[1:3] == ['remote', 'serve']:
-                environ = (entry / 'environ').read_bytes()
+                with (entry / 'environ').open('rb') as stream:
+                    environ = stream.read(1024 * 1024 + 1)
                 if len(environ) > 1024 * 1024:
                     fail('Service environment exceeded its discovery limit')
                 # Read only endpoint selection, never return process environment.
                 values = dict(item.split(b'=', 1) for item in environ.split(b'\0') if b'=' in item)
                 daemon = values.get(b'TERN_DAEMON_SOCKET') or values.get(b'TERN_PANE_SOCKET')
-                services.append({'pid': int(entry.name), 'state': option(argv, '--state-dir'),
+                services.append({'pid': int(entry.name), 'start': start, 'state': option(argv, '--state-dir'),
                                  'listen': option(argv, '--listen'), 'binary': str(executable),
-                                 'daemon': daemon.decode() if daemon else None})
+                                 'daemon': daemon.decode() if daemon else None,
+                                 'listeners': udp_listeners(entry, uid)})
         except (FileNotFoundError, ProcessLookupError, PermissionError, UnicodeError):
             continue
-    service = select_service(services, request.get('original_state_dir'))
-    state = path(request.get('original_state_dir') or service['state'])
-    directory(state)
-    # host-key may create missing material. Never call it on an incomplete identity.
-    for name in ('host_key', 'host_cert.der'):
-        regular(state / name)
-    daemon = select_daemon(daemons, request.get('daemon_socket') or service['daemon'])
-    if service['daemon'] and service['daemon'] != daemon['socket']:
-        fail('Selected daemon does not match the original service environment')
-    endpoint = path(daemon['socket'])
-    directory(endpoint.parent)
-    info = endpoint.lstat()
-    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
-        fail('Existing daemon socket has unsafe ownership or permissions')
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-        probe.settimeout(2)
-        probe.connect(str(endpoint))
-        peer_pid, peer_uid, _ = struct.unpack('3i', probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    if peer_pid != daemon['pid'] or peer_uid != uid:
-        fail('Existing daemon socket does not belong to the selected process')
-    port = request.get('target_port')
-    listen = service['listen']
-    discovered_port = int(listen.rsplit(':', 1)[-1]) if listen and re.fullmatch(r'.+:[0-9]{1,5}', listen) else None
-    if port is not None and discovered_port is not None and port != discovered_port:
-        fail('Explicit target port differs from the running original service')
-    port = discovered_port if port is None else port
-    if type(port) is not int or not 1 <= port <= 65535:
-        fail('Original UDP listener port is not explicit; pass --target-port')
+    candidates = []
+    for service in services:
+        if not service['state']:
+            continue  # Unknown identity directories are never guessed.
+        if request.get('original_state_dir') not in (None, service['state']):
+            continue
+        for daemon in related_daemons(service, daemons):
+            if request.get('daemon_socket') not in (None, daemon['socket']):
+                continue
+            try:
+                state = path(service['state'])
+                directory(state)
+                for name in ('host_key', 'host_cert.der'):
+                    regular(state / name)
+                verify_daemon(daemon)
+            except (OSError, ValueError):
+                continue
+            listen = service['listen']
+            declared = int(listen.rsplit(':', 1)[-1]) if listen and re.fullmatch(r'.+:[0-9]{1,5}', listen) else None
+            for listener in service['listeners']:
+                if declared is not None and declared != listener['port']:
+                    continue
+                if request.get('target_port') not in (None, listener['port']):
+                    continue
+                candidates.append((candidate_id(service, daemon, listener), service, daemon, listener))
+    if len(candidates) > 64:
+        fail('Too many verified service candidates')
+    selected = [item for item in candidates if item[0] == request.get('candidate_id')] if request.get('candidate_id') else candidates
+    if request.get('inventory') and not request.get('candidate_id') and len(selected) != 1:
+        print(json.dumps({'ok': True, 'home': home, 'uid': uid, 'user': user,
+                          'candidates': [{'id': item[0], 'pid': item[1]['pid'],
+                                          'state': str(path(item[1]['state'])), 'daemon_socket': str(path(item[2]['socket'])),
+                                          'port': item[3]['port']} for item in candidates]}))
+        sys.exit(0)
+    if len(selected) != 1:
+        fail('Original Tern service is absent or ambiguous; pass --original-state-dir for one existing remote serve process')
+    selected_id, service, daemon, listener = selected[0]
+    state = path(service['state'])
+    endpoint = verify_daemon(daemon)
+    port = listener['port']
     binary = path(service['binary'])
     directory(binary.parent)
     binary_info = binary.stat()
@@ -152,9 +230,19 @@ try:
     raw = base64.b64decode(fingerprint[7:] + '=', validate=True)
     if len(raw) != 32 or base64.b64encode(raw).decode().rstrip('=') != fingerprint[7:]:
         fail('Original host fingerprint is not canonical')
+    for process in (service, daemon):
+        entry = Path('/proc') / str(process['pid'])
+        current_stat = entry.joinpath('stat').read_text().rsplit(')', 1)[1].split()
+        if entry.stat().st_uid != uid or current_stat[19] != process['start']:
+            fail('Selected process changed during discovery')
+        if process is daemon and not service['daemon'] and int(current_stat[1]) != service['pid']:
+            fail('Selected daemon relationship changed during discovery')
+    if listener not in udp_listeners(Path('/proc') / str(service['pid']), uid):
+        fail('Selected UDP listener changed during discovery')
+    verify_daemon(daemon)
     print(json.dumps({'ok': True, 'home': home, 'uid': uid, 'user': user,
                       'original_state_dir': str(state), 'daemon_socket': str(endpoint),
-                      'target_port': port, 'fingerprint': fingerprint}))
+                      'target_port': port, 'fingerprint': fingerprint, 'candidate_id': selected_id}))
 except ValueError as error:
     print(json.dumps({'ok': False, 'error': str(error)}))
     sys.exit(1)
@@ -209,7 +297,8 @@ def resolve_destination(alias, runner=subprocess.run):
 def discover(args, runner=subprocess.run):
     endpoint = resolve_destination(args.ssh_destination, runner)
     request = {'original_state_dir': args.original_state_dir, 'daemon_socket': args.daemon_socket,
-               'target_port': args.target_port}
+               'target_port': args.target_port, 'inventory': getattr(args, 'inventory', False),
+               'candidate_id': getattr(args, 'candidate_id', None)}
     command = shlex.join(['python3', '-B', '-c', REMOTE_DISCOVERY])
     result = runner(['/usr/bin/ssh', '-T', *ssh_options(), args.ssh_destination, command],
                     input=json.dumps(request), capture_output=True, text=True, timeout=40)

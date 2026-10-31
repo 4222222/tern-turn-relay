@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 # No recursive repository copy: these are the complete distributable inputs.
 FILES = (
     'plugin.toml', 'window.luau', 'work-queue.luau', 'requirements.txt',
+    'onboarding.luau', 'onboarding.py', 'bootstrap-runtime.sh', 'managed_runtime.py',
     'relay.py', 'relay_config.py', 'relay_transport.py', 'relay_ssh.py',
     'relay_intent.py', 'gateway_client.py', 'gateway_protocol.py',
     'remote_gateway.py', 'ssh_compat.py', 'credentials.py', 'install.py',
@@ -31,6 +32,7 @@ TESTS = (
     'tests/test_allocation_recovery.py',
     'tests/test_renewal.py', 'tests/test_flow_recovery.py',
     'tests/test_gateway_errors.py', 'tests/test_gateway_recovery.py',
+    'tests/test_onboarding.py', 'tests/test_native_runtime.py',
 )
 
 

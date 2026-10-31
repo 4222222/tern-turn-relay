@@ -844,7 +844,7 @@ def start(config, directory, args):
                 result = dict(result, ok=False, state='error', error=result.get('error') or 'Existing relay is not ready. Disconnect before reconnecting.')
             return result
         child = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), '_serve', '--config', str(Path(args.config).absolute()),
+            [sys.executable, '-E', '-s', '-B', str(Path(__file__).resolve()), '_serve', '--config', str(Path(args.config).absolute()),
              '--state-dir', str(directory), '--mode', args.mode, '--lock-fd', str(lock), '--service-id', identity],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True, pass_fds=(lock,))

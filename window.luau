@@ -29,6 +29,17 @@ local runner
 local failNative
 local stepNative
 local helperRequests = {}
+local onboarding
+local managedPython = tern.plugin.data .. "/managed-python/python/bin/python3"
+local helperPython = "/usr/bin/python3"
+local hasConfig = false
+do
+    local ok, exists = pcall(tern.fs.exists, configPath)
+    hasConfig = ok and exists
+    local ready, installed = pcall(tern.fs.exists, managedPython)
+    if ready and installed then helperPython = managedPython end
+    if not hasConfig then statusText = "TURN · 待配置" end
+end
 
 local function text(value, max)
     return type(value) == "string" and #value > 0 and #value <= max
@@ -151,7 +162,7 @@ end
 
 local function supported(cx)
     if tern.runtime.os ~= "macos" then
-        report(cx, "This installation supports macOS with /usr/bin/python3 only.")
+        report(cx, "This plugin currently supports macOS. Open TURN: Settings to prepare its private runtime.")
         return false
     end
     return true
@@ -180,7 +191,7 @@ runner = require('./work-queue').new({ now = tern.now, timer = tern.timer },
     end)
 
 local function helper(command, mode, token, _cx, callback)
-    local argv = { "/usr/bin/python3", tern.plugin.dir .. "/relay.py", command,
+    local argv = { helperPython, "-E", "-s", "-B", tern.plugin.dir .. "/relay.py", command,
         "--config", configPath, "--state-dir", stateDir }
     if mode then table.insert(argv, "--mode"); table.insert(argv, mode) end
     local timeout = (command == "start" or command == "resume") and 120000 or (command == "stop" and 20000 or 15000)
@@ -194,7 +205,7 @@ local function helper(command, mode, token, _cx, callback)
             return
         end
         if not result or result.launchFailed then
-            callback(nil, "Cannot start relay.py using /usr/bin/python3. Check installation and config.json.", fresh)
+            callback(nil, "Cannot start the TURN helper. Open TURN: Settings to check its private runtime.", fresh)
             return
         end
         local value, err = decode(result.stdout)
@@ -247,7 +258,7 @@ local function targetConfig(cx)
         or not text(t.name, 64) or not text(t.host, 256) or not text(t.user, 128)
         or not text(t.fingerprint, 256) or not count(t.port) or t.port < 1 or t.port > 65535
         or not count(value.listen_port) or value.listen_port < 1 or value.listen_port > 65535 then
-        report(cx, "Cannot read the provisioned schema-3 configuration; run setup before connecting. No Host was changed.")
+        report(cx, "TURN configuration is absent or invalid. Open TURN: Settings; no Host was changed.")
         return nil
     end
     return { target = t, address = t.user .. "@127.0.0.1:" .. tostring(value.listen_port),
@@ -669,6 +680,7 @@ local function prepare(cx, allowLocal)
     cancelStartup()
     if not supported(cx) then return nil end
     if busy or pending then report(cx, "An operation is already in progress. Use Status and wait for its result."); return nil end
+    if onboarding and onboarding.active then report(cx, "Finish or cancel TURN Settings before changing the connection."); return nil end
     local config = targetConfig(cx)
     if not config then return nil end
     local source
@@ -684,7 +696,7 @@ local function prepare(cx, allowLocal)
     if not original then return nil end
     local fingerprint = source.detail and source.detail.fingerprint
     local expectedFingerprint = source.address == config.address and config.relayFingerprint or config.target.fingerprint
-    if fingerprint and fingerprint ~= expectedFingerprint then
+    if source.kind == "remote" and fingerprint and fingerprint ~= expectedFingerprint then
         report(cx, "Selected Host fingerprint differs from the independently verified target; no connection was changed.")
         return nil
     end
@@ -695,8 +707,8 @@ local function prepare(cx, allowLocal)
     return { config = config, source = source, original = original, token = generation }
 end
 
-local function convert(mode, cx)
-    local request = prepare(cx)
+local function convert(mode, cx, allowLocal)
+    local request = prepare(cx, allowLocal)
     if not request then return end
     busy = "start"
     refresh()
@@ -791,6 +803,7 @@ end
 
 local function status(cx)
     cancelStartup()
+    if not hasConfig then onboarding.open(cx); return end
     if not supported(cx) then return end
     -- Status also recovers expired receipts if a timer was paused or interrupted.
     for request in pairs(helperRequests) do
@@ -896,21 +909,36 @@ local function commandTick(callback)
     end
 end
 
+onboarding = require('./onboarding').new({
+    available = function() return not busy and not pending end,
+    runtimeReady = function(path) helperPython = path end,
+    configured = function() hasConfig = true; lastError = nil; refresh() end,
+    failed = function(message)
+        lastError = message:gsub("[%c]", " ")
+        if hasConfig then refresh() else statusText = "TURN · 配置失败" end
+    end,
+    connect = function(cx) convert("tls", cx, true) end,
+    status = status,
+})
+tern.command({ id = "setup", title = "Settings: server, Cloudflare Key and private runtime", group = "TURN",
+    run = commandTick(function(cx) onboarding.open(cx) end) })
+
 tern.command({ id = "convert-tls", title = "Connect configured Host via TURN TLS", group = "TURN",
-    run = commandTick(function(cx) convert("tls", cx) end) })
+    run = commandTick(function(cx) if hasConfig then convert("tls", cx) else onboarding.open(cx) end end) })
 tern.command({ id = "convert-udp", title = "Connect configured Host via TURN UDP", group = "TURN",
-    run = commandTick(function(cx) convert("udp", cx) end) })
+    run = commandTick(function(cx) if hasConfig then convert("udp", cx) else onboarding.open(cx) end end) })
 tern.command({ id = "restore-direct", title = "Restore configured Host to direct (keep relay and SSH)", group = "TURN", run = commandTick(restore) })
 tern.command({ id = "disconnect", title = "Stop TURN for ALL windows and SSH TCP sessions (interrupts TCP)", group = "TURN", run = commandTick(disconnect) })
 tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, bytes and errors", group = "TURN", run = commandTick(status) })
 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
 tern.chrome.status(function()
-    return { { text = statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = "plugin.tern-turn-relay.status" } }
+    return { { text = statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = hasConfig and "plugin.tern-turn-relay.status" or "plugin.tern-turn-relay.setup" } }
 end)
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
 -- paused. One asynchronous status query supplies the fresh owner context on load.
+if hasConfig then
 helper("status", nil, generation, nil, function(value, err, cx)
     if startupSeen then return end
     startupSeen = true
@@ -928,3 +956,4 @@ helper("status", nil, generation, nil, function(value, err, cx)
     startup = request
     discoverStartup(cx, request, true)
 end)
+end
