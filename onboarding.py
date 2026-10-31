@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import stat
 import sys
 import tempfile
@@ -71,14 +72,21 @@ def context(args):
     package = owned_path(args.package_dir or Path(__file__).resolve().parent, directory=True)
     default_profile = Path.home() / 'Library' / 'Application Support' / 'Tern'
     native = package.name == PLUGIN_ID and package.parent.name == 'plugins'
-    profile = owned_path(args.config_dir or (package.parent.parent if native else default_profile), directory=True)
-    data = owned_path(args.data_dir or profile / 'plugin-data' / PLUGIN_ID, directory=True)
+    supplied_data = owned_path(args.data_dir, directory=True) if args.data_dir is not None else None
+    inferred_linked = args.config_dir is None and not native and supplied_data is not None
+    if inferred_linked and (supplied_data.name != PLUGIN_ID or supplied_data.parent.name != 'plugin-data'):
+        raise OnboardingError('context-mismatch', 'Plugin data must have the selected Tern profile ownership layout.')
+    inferred_profile = package.parent.parent if native else supplied_data.parent.parent if inferred_linked else default_profile
+    profile = owned_path(args.config_dir or inferred_profile, directory=True)
+    data = supplied_data or owned_path(profile / 'plugin-data' / PLUGIN_ID, directory=True)
     if data != profile / 'plugin-data' / PLUGIN_ID:
         raise OnboardingError('context-mismatch', 'Plugin data must belong to the selected Tern profile.')
     ambient_ssh = owned_path(Path.home() / '.ssh' / 'config')
     default_ssh = ambient_ssh if profile == default_profile else data / 'ssh-config'
     ssh = owned_path(args.ssh_config or default_ssh)
     manifest = owned_path(data / 'installation.json')
+    if inferred_linked and not manifest.exists():
+        raise OnboardingError('ownership-required', 'A linked custom profile requires its installation ownership record.')
     if manifest.exists():
         private_file(manifest)
         descriptor = os.open(manifest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -100,6 +108,8 @@ def context(args):
                 or not Path(record['package']).is_absolute()
                 or (registered_package is not None and record['package'] != str(registered_package))):
             raise OnboardingError('invalid-installation', 'Installation ownership record does not match this profile and registration.')
+        if inferred_linked and (registered_package != package or record['package'] != str(package)):
+            raise OnboardingError('invalid-installation', 'Supplied data does not own this linked plugin package.')
         recorded_ssh = owned_path(record['ssh_config'])
         if args.ssh_config is not None and ssh != recorded_ssh:
             raise OnboardingError('context-mismatch', 'The existing installation owns a different SSH config path; it cannot move during setup.')
@@ -251,8 +261,10 @@ def discover(paths, request):
     selected = request.get('candidate_id')
     if selected is not None and (not isinstance(selected, str) or not re.fullmatch(r'[a-f0-9]{24}', selected)):
         raise OnboardingError('invalid-request', 'Candidate selection must be an ID returned by discovery.')
+    previous = current_configuration(paths)
     args = SimpleNamespace(ssh_destination=alias, original_state_dir=None, daemon_socket=None,
-                           target_port=None, inventory=True, candidate_id=selected)
+                           target_port=None, inventory=True, candidate_id=selected,
+                           excluded_state_dirs=[previous['gateway']['state_dir'] + '/native'] if previous else [])
     remote = setup.discover(args)
     if 'candidates' in remote:
         candidates = remote['candidates']
@@ -273,15 +285,26 @@ def discover(paths, request):
         return {'code': 'choose', 'candidates': public}
     if not isinstance(remote.get('candidate_id'), str) or not re.fullmatch(r'[a-f0-9]{24}', remote['candidate_id']):
         raise OnboardingError('discovery-failed', 'Remote discovery did not verify a stable process selection.')
-    previous = current_configuration(paths)
     same = previous is not None and previous['ssh_destination'] == alias
     args.name = previous['target']['name'] if same else (alias if len(alias) <= 64 else 'server-' + hashlib.sha256(alias.encode()).hexdigest()[:16])
     args.listen_port = request.get('listen_port', previous['listen_port'] if previous else 18377)
-    args.gateway_state_dir = previous['gateway']['state_dir'] if same else None
+    same_workspace = (previous is not None and previous['target']['host'] == remote['host']
+                      and previous['target']['user'] == remote['user']
+                      and previous['target']['fingerprint'] == remote['fingerprint']
+                      and previous['target']['port'] == remote['target_port']
+                      and previous['gateway']['daemon_socket'] == remote['daemon_socket'])
+    if same_workspace:
+        args.gateway_state_dir = previous['gateway']['state_dir']
+    else:
+        binding = [socket.gethostname(), str(owned_path(paths['data_dir'], directory=True)),
+                   remote['host'], remote['user'], remote['daemon_socket'],
+                   remote['original_state_dir'], remote['fingerprint'], remote['target_port']]
+        namespace = hashlib.sha256(json.dumps(binding, separators=(',', ':')).encode()).hexdigest()[:24]
+        args.gateway_state_dir = setup.remote_path(remote['home']) + '/.local/state/tern-turn-relay/workspaces/' + namespace
     args.credential_file = owned_path(previous['credential_file'] if previous else paths['credential_file'])
     args.dependency_dir = owned_path(previous['dependency_dir'] if previous else paths['dependency_dir'], directory=True)
     config = setup.configuration(args, remote)
-    if same and previous['gateway']['daemon_socket'] == config['gateway']['daemon_socket']:
+    if same_workspace:
         config['gateway']['fingerprint'] = previous['gateway']['fingerprint']
     registered = registration(paths)
     review = {'schema': 1, 'ssh_destination': alias, 'candidate_id': remote['candidate_id'],
@@ -294,6 +317,8 @@ def discover(paths, request):
                           'Provision the dedicated TURN gateway in the reviewed remote gateway state directory.',
                           'Write private plugin configuration and the managed SSH compatibility block.',
                           'Preserve the original Tern identity and existing session daemon; do not start a connection.']}
+    if previous is not None and not same_workspace:
+        review['changes'].append('Preserve the previous gateway state and daemon pin without modification: ' + previous['gateway']['state_dir'])
     if review['migrate_native']:
         review['changes'].append('Migrate the owned legacy .path registration to a native plugin copy; retain the durable old package for recovery.')
     return {'code': 'review', 'review': review, 'candidates': [],
@@ -342,10 +367,13 @@ def apply(paths, request, args):
 def lifecycle_change(paths):
     """Hold the same lifecycle locks as install/start; never stop a running relay."""
     from install import private_directory
-    from relay_config import lock_file, state_directory
-    data = Path(paths['data_dir'])
+    from relay_config import lock_file
+    data = owned_path(paths['data_dir'], directory=True)
     private_directory(data)
-    runtime = state_directory(data / 'runtime')
+    # These operations create regular lock files, not a UNIX control socket.
+    # Keep the daemon's socket-length restriction at actual socket startup.
+    runtime = owned_path(data / 'runtime', directory=True)
+    private_directory(runtime)
     descriptors = []
     try:
         for name in ('command.lock', 'service.lock'):
@@ -411,11 +439,15 @@ def manage(paths, request, args):
             # Fixed first-party source: never accept a repository, URL or path
             # from JSON input, and never touch plugin-data during replacement.
             run([str(tern), 'plugin', 'install', 'github.com/jiwangyihao/tern-turn-relay', '--force'], environment)
+            management_registration(paths, native_only=True)
             result = {'updated': True, 'registration': 'native'}
         else:
             if owned_path(manifest).exists() or owned_path(config_path).exists():
                 raise OnboardingError('registration-changed', 'Installation state changed before removal; inspect and confirm again.', 6)
             run([str(tern), 'plugin', 'remove', PLUGIN_ID], environment)
+            from install import plugin_link
+            if plugin_link(Path(paths['config_dir']) / 'plugins')[0] is not None:
+                raise OnboardingError('removal-unconfirmed', 'Tern did not remove the native registration; private data was preserved.', 7)
             result = {'plugin_removed': True, 'marked_ssh_rule_removed': False}
     return dict(result, configuration_preserved=True, credentials_preserved=True,
                 managed_runtime_preserved=True, data_preserved=True,

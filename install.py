@@ -116,7 +116,8 @@ def durable_package(data, source=ROOT):
     private_directory(packages)
     destination = packages / (release_version(source) + '-' + digest)
     if destination.exists() or destination.is_symlink():
-        if destination.is_symlink() or not destination.is_dir():
+        if (destination.is_symlink() or not destination.is_dir()
+                or destination.stat().st_uid != os.getuid()):
             raise ValueError('Installed package path is unsafe')
         names = {str(path.relative_to(destination)) for path in destination.rglob('*') if not path.is_dir()}
         if names != set(files):
@@ -127,6 +128,9 @@ def durable_package(data, source=ROOT):
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                     or info.st_mode & 0o022 or path.read_bytes() != expected):
                 raise ValueError('Existing immutable package was modified; it was preserved')
+        # A prior final chmod failure may leave an otherwise complete private
+        # copy. Revalidate every file above before sealing it for reuse.
+        destination.chmod(0o500)
         return destination
     with tempfile.TemporaryDirectory(prefix='.package-', dir=str(packages)) as temporary:
         staging = Path(temporary)
@@ -136,9 +140,11 @@ def durable_package(data, source=ROOT):
             with path.open('xb') as stream:
                 stream.write(content)
             path.chmod(0o600)
-        # Prevent runtime imports from adding bytecode to immutable source.
-        staging.chmod(0o500)
+        # macOS requires writable staging for this directory rename. Seal only
+        # after publication; on chmod failure retain the private owned copy for
+        # a fully revalidated retry, never remove a published package blindly.
         os.rename(staging, destination)
+        destination.chmod(0o500)
     return destination
 
 

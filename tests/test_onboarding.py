@@ -124,6 +124,31 @@ class OnboardingBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(onboarding.OnboardingError, 'does not match'):
             onboarding.context(self.args)
 
+    def test_linked_custom_profile_is_derived_only_from_owned_data_record(self):
+        data = Path(self.paths['data_dir'])
+        source = data / 'packages' / 'release'
+        source.mkdir(parents=True)
+        self.package.rmdir()
+        marker = self.profile / 'plugins' / 'tern-turn-relay.path'
+        marker.write_text(str(source) + '\n')
+        args = onboarding.parser().parse_args(['inspect', '--package-dir', str(source), '--data-dir', str(data)])
+        with self.assertRaises(onboarding.OnboardingError) as missing:
+            onboarding.context(args)
+        self.assertEqual(missing.exception.code, 'ownership-required')
+        manifest = data / 'installation.json'
+        record = {'schema': 1, 'plugin': 'tern-turn-relay', 'plugins': str(self.profile / 'plugins'),
+                  'package': str(source), 'ssh_config': str(self.ssh)}
+        manifest.write_text(json.dumps(record))
+        manifest.chmod(0o600)
+        paths = onboarding.context(args)
+        self.assertEqual(paths['config_dir'], str(self.profile))
+        self.assertEqual(paths['ssh_config'], str(self.ssh))
+        self.assertEqual(onboarding.registration(paths), 'linked')
+        record['package'] = str(self.root / 'unrelated-package')
+        manifest.write_text(json.dumps(record))
+        with self.assertRaises(onboarding.OnboardingError):
+            onboarding.context(args)
+
     def test_owned_path_rejects_symlink(self):
         link = self.root / 'link'
         link.symlink_to(self.profile, target_is_directory=True)
@@ -172,11 +197,73 @@ class OnboardingBoundaryTests(unittest.TestCase):
     def test_installed_local_port_is_preserved_without_override(self):
         previous = self.review()['configuration']
         previous['listen_port'] = 19002
+        previous['gateway']['state_dir'] = '/home/dev/.local/state/tern-turn-relay'
         previous['gateway']['fingerprint'] = 'SHA256:' + base64.b64encode(bytes(range(1, 33))).decode().rstrip('=')
         with mock.patch.object(onboarding, 'current_configuration', return_value=previous), mock.patch.object(setup, 'discover', return_value=self.remote()):
             review = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
         self.assertEqual(review['listen_port'], 19002)
         self.assertEqual(review['configuration']['listen_port'], 19002)
+        self.assertEqual(review['configuration']['gateway'], previous['gateway'])
+
+    def test_new_daemon_uses_separate_reviewed_gateway_without_repinning_old_state(self):
+        previous = self.review()['configuration']
+        previous['gateway']['fingerprint'] = 'SHA256:' + base64.b64encode(bytes(range(1, 33))).decode().rstrip('=')
+        before = json.dumps(previous, sort_keys=True)
+        remote = dict(self.remote(), daemon_socket='/run/user/1001/other.sock', original_state_dir='/home/dev/other')
+        with mock.patch.object(onboarding, 'current_configuration', return_value=previous), mock.patch.object(setup, 'discover', return_value=remote) as discovery:
+            review = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+        self.assertNotEqual(review['configuration']['gateway']['state_dir'], previous['gateway']['state_dir'])
+        self.assertEqual(review['configuration']['gateway']['daemon_socket'], '/run/user/1001/other.sock')
+        self.assertNotIn('fingerprint', review['configuration']['gateway'])
+        self.assertIn(previous['gateway']['state_dir'], ' '.join(review['changes']))
+        self.assertEqual(discovery.call_args.args[0].excluded_state_dirs, [previous['gateway']['state_dir'] + '/native'])
+        self.assertEqual(json.dumps(previous, sort_keys=True), before)
+
+    def test_fresh_gateway_namespaces_are_stable_and_independent_per_installation(self):
+        second_profile = self.root / 'second-profile'
+        second_package = second_profile / 'plugins' / 'tern-turn-relay'
+        second_package.mkdir(parents=True)
+        second_args = onboarding.parser().parse_args(['inspect', '--package-dir', str(second_package)])
+        second_paths = onboarding.context(second_args)
+        with mock.patch.object(setup, 'discover', return_value=self.remote()), mock.patch.object(onboarding.socket, 'gethostname', return_value='machine-a'):
+            first = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+            repeated = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+            second = onboarding.discover(second_paths, {'ssh_destination': 'dev'})['review']
+        self.assertEqual(first['configuration']['gateway']['state_dir'], repeated['configuration']['gateway']['state_dir'])
+        self.assertNotEqual(first['configuration']['gateway']['state_dir'], second['configuration']['gateway']['state_dir'])
+        self.assertNotEqual(first['configuration']['gateway']['state_dir'], '/home/dev/.local/state/tern-turn-relay')
+        with mock.patch.object(setup, 'discover', return_value=self.remote()), mock.patch.object(onboarding.socket, 'gethostname', return_value='machine-b'):
+            other_machine = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+        self.assertNotEqual(first['configuration']['gateway']['state_dir'], other_machine['configuration']['gateway']['state_dir'])
+
+    def test_changed_original_identity_on_same_daemon_does_not_reuse_old_gateway_pin(self):
+        previous = self.review()['configuration']
+        previous['gateway']['fingerprint'] = 'SHA256:' + base64.b64encode(bytes(range(1, 33))).decode().rstrip('=')
+        new_pin = 'SHA256:' + base64.b64encode(bytes(range(2, 34))).decode().rstrip('=')
+        remote = dict(self.remote(), original_state_dir='/home/dev/another-service', fingerprint=new_pin)
+        with mock.patch.object(onboarding, 'current_configuration', return_value=previous), mock.patch.object(setup, 'discover', return_value=remote):
+            review = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+        self.assertNotEqual(review['configuration']['gateway']['state_dir'], previous['gateway']['state_dir'])
+        self.assertNotIn('fingerprint', review['configuration']['gateway'])
+
+    def test_port_only_workspace_change_uses_different_gateway_namespace(self):
+        previous = self.review()['configuration']
+        previous['gateway']['fingerprint'] = 'SHA256:' + base64.b64encode(bytes(range(1, 33))).decode().rstrip('=')
+        before = json.dumps(previous, sort_keys=True)
+        remote = dict(self.remote(), target_port=9000)
+        with mock.patch.object(onboarding, 'current_configuration', return_value=previous), mock.patch.object(setup, 'discover', return_value=remote):
+            review = onboarding.discover(self.paths, {'ssh_destination': 'dev'})['review']
+        self.assertNotEqual(review['configuration']['gateway']['state_dir'], previous['gateway']['state_dir'])
+        self.assertNotIn('fingerprint', review['configuration']['gateway'])
+        self.assertEqual(json.dumps(previous, sort_keys=True), before)
+
+    def test_same_workspace_through_another_alias_preserves_existing_gateway(self):
+        previous = self.review()['configuration']
+        previous['gateway']['state_dir'] = '/home/dev/.local/state/tern-turn-relay'
+        previous['gateway']['fingerprint'] = 'SHA256:' + base64.b64encode(bytes(range(1, 33))).decode().rstrip('=')
+        with mock.patch.object(onboarding, 'current_configuration', return_value=previous), mock.patch.object(setup, 'discover', return_value=self.remote()):
+            review = onboarding.discover(self.paths, {'ssh_destination': 'other-alias'})['review']
+        self.assertEqual(review['configuration']['gateway'], previous['gateway'])
 
     def test_apply_rejects_modified_review_before_installer_or_write(self):
         review = self.review()
@@ -206,6 +293,20 @@ class OnboardingBoundaryTests(unittest.TestCase):
             code, result = self.cli('{}', 'configure-credentials')
         self.assertEqual(code, 6)
         self.assertEqual(result['code'], 'cancelled')
+
+    def test_credential_change_does_not_apply_control_socket_length_limit(self):
+        profile = self.root / ('long-profile-' + 'x' * 100)
+        package = profile / 'plugins' / 'tern-turn-relay'
+        package.mkdir(parents=True)
+        args = onboarding.parser().parse_args(['configure-credentials', '--package-dir', str(package)])
+        with mock.patch.object(credentials, 'configure_native', side_effect=credentials.CredentialError('Local credential change cancelled.', 6)):
+            with self.assertRaises(credentials.CredentialError) as failure:
+                onboarding.execute(args, {})
+        self.assertEqual(failure.exception.exit_code, 6)
+        locks = profile / 'plugin-data' / 'tern-turn-relay' / 'runtime'
+        self.assertTrue((locks / 'command.lock').is_file())
+        self.assertTrue((locks / 'service.lock').is_file())
+        self.assertFalse((locks / 'control.sock').exists())
 
     def test_apply_hands_only_reviewed_configuration_to_installer(self):
         credential = Path(self.paths['credential_file'])
@@ -317,13 +418,22 @@ class OnboardingBoundaryTests(unittest.TestCase):
         managed.write_bytes(b'preserved-runtime')
         before = {path: path.read_bytes() for path in (credential, config, managed)}
         environment = (Path('/verified/tern'), {}, self.profile / 'plugins', data)
-        with mock.patch('install.tern_environment', return_value=environment), mock.patch('install.run', return_value='') as run:
+        (self.package / 'old-version').write_text('old')
+        def replace_package(*_args, **_kwargs):
+            self.package.rename(self.root / 'replaced-native-package')
+            self.package.mkdir()
+            (self.package / 'new-version').write_text('new')
+            return ''
+        with mock.patch('install.tern_environment', return_value=environment), mock.patch('install.run', side_effect=replace_package) as run:
             code, result = self.cli('{"confirm":true}', 'update')
         self.assertEqual(code, 0)
         self.assertTrue(result['updated'])
         self.assertTrue(result['reload_expected'])
         self.assertEqual(run.call_count, 1)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertFalse((self.package / 'old-version').exists())
+        self.assertEqual((self.package / 'new-version').read_text(), 'new')
+        self.assertEqual(onboarding.registration(self.paths), 'native')
 
     def test_fresh_native_removal_preserves_existing_credential(self):
         data = Path(self.paths['data_dir'])
@@ -333,7 +443,10 @@ class OnboardingBoundaryTests(unittest.TestCase):
         credential.chmod(0o600)
         before = credential.read_bytes()
         environment = (Path('/verified/tern'), {}, self.profile / 'plugins', data)
-        with mock.patch('install.tern_environment', return_value=environment), mock.patch('install.run', return_value='') as run, mock.patch('uninstall.uninstall') as uninstall:
+        def remove_package(*_args, **_kwargs):
+            self.package.rmdir()
+            return ''
+        with mock.patch('install.tern_environment', return_value=environment), mock.patch('install.run', side_effect=remove_package) as run, mock.patch('uninstall.uninstall') as uninstall:
             code, result = self.cli('{"confirm":true}', 'uninstall')
         self.assertEqual(code, 0)
         self.assertTrue(result['plugin_removed'])
@@ -341,6 +454,17 @@ class OnboardingBoundaryTests(unittest.TestCase):
         self.assertEqual(credential.read_bytes(), before)
         self.assertEqual(run.call_count, 1)
         uninstall.assert_not_called()
+        self.assertFalse(self.package.exists())
+        self.assertEqual(onboarding.registration(self.paths), 'unregistered')
+
+    def test_fresh_removal_does_not_report_success_for_unchanged_registration(self):
+        data = Path(self.paths['data_dir'])
+        environment = (Path('/verified/tern'), {}, self.profile / 'plugins', data)
+        with mock.patch('install.tern_environment', return_value=environment), mock.patch('install.run', return_value=''):
+            code, result = self.cli('{"confirm":true}', 'uninstall')
+        self.assertEqual(code, 7)
+        self.assertEqual(result['code'], 'removal-unconfirmed')
+        self.assertTrue(self.package.is_dir())
 
     def test_management_rejects_wrong_resolved_profile_before_mutation(self):
         data = Path(self.paths['data_dir'])
@@ -454,6 +578,49 @@ class KernelSelectionTests(unittest.TestCase):
                              [{'port': 8376, 'address': '127.0.0.1', 'inode': '555'}])
             (entry / 'fd' / '5').unlink()
             self.assertEqual(self.remote['udp_listeners'](entry, 1001), [])
+
+    def test_observed_native_udp6_is_selected_instead_of_iroh_ephemeral_sockets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary)
+            (entry / 'fd').mkdir()
+            (entry / 'net').mkdir()
+            for descriptor, inode in ((10, 1010), (11, 1011), (12, 1012)):
+                (entry / 'fd' / str(descriptor)).symlink_to('socket:[%d]' % inode)
+            (entry / 'net' / 'udp').write_text('header\n0: 00000000:909D 00000000:0000 07 0:0 00:0 0 1001 0 1011\n')
+            (entry / 'net' / 'udp6').write_text('header\n'
+                '0: 00000000000000000000000000000000:20B8 00000000000000000000000000000000:0000 07 0:0 00:0 0 1001 0 1010\n'
+                '1: 00000000000000000000000000000000:E808 00000000000000000000000000000000:0000 07 0:0 00:0 0 1001 0 1012\n')
+            listeners = self.remote['udp_listeners'](entry, 1001)
+            self.assertEqual(len(listeners), 3)
+            self.assertEqual(self.remote['native_listeners']({'listen': None, 'listeners': listeners}, '8.8.8.8'),
+                             [{'port': 8376, 'address': '::', 'inode': '1010'}])
+            (entry / 'fd' / '10').unlink()
+            listeners = self.remote['udp_listeners'](entry, 1001)
+            self.assertEqual(self.remote['native_listeners']({'listen': None, 'listeners': listeners}, '8.8.8.8'), [])
+
+    def test_explicit_listener_requires_exact_observed_bind_and_accepts_target_ipv4(self):
+        public = {'port': 9000, 'address': '8.8.8.8', 'inode': '10'}
+        wildcard = {'port': 9000, 'address': '0.0.0.0', 'inode': '11'}
+        unrelated = {'port': 9000, 'address': '1.1.1.1', 'inode': '12'}
+        listeners = [public, wildcard, unrelated]
+        select = self.remote['native_listeners']
+        self.assertEqual(select({'listen': '8.8.8.8:9000', 'listeners': listeners}, '8.8.8.8'), [public])
+        self.assertEqual(select({'listen': '0.0.0.0:9000', 'listeners': listeners}, '8.8.8.8'), [wildcard])
+        self.assertEqual(select({'listen': '1.1.1.1:9000', 'listeners': listeners}, '8.8.8.8'), [])
+        self.assertEqual(select({'listen': '8.8.8.8:9001', 'listeners': listeners}, '8.8.8.8'), [])
+        self.assertEqual(select({'listen': None, 'listeners': listeners}, '8.8.8.8'), [])
+
+    def test_owned_gateway_frontends_cannot_be_selected_as_original_services(self):
+        classify = self.remote['gateway_frontend']
+        self.assertTrue(classify({'state': '/home/dev/.local/state/tern-turn-relay/native'}, '/home/dev', []))
+        self.assertTrue(classify({'state': '/custom/gateway/native'}, '/home/dev', ['/custom/gateway/native']))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            native = root / 'native'
+            native.mkdir()
+            self.assertFalse(classify({'state': str(native)}, '/home/dev', []))
+            (root / 'daemon-identity.json').write_text('{"version":2}')
+            self.assertTrue(classify({'state': str(native)}, '/home/dev', []))
 
 
 if __name__ == '__main__':

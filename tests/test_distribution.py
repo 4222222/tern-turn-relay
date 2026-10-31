@@ -111,6 +111,62 @@ class DistributionTests(unittest.TestCase):
             first.chmod(0o700)
             second.chmod(0o700)
 
+    def test_durable_package_renames_writable_staging_then_seals_destination(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, data = root / 'source', root / 'data'
+            release_source(source)
+            data.mkdir(mode=0o700)
+            rename = os.rename
+            def require_writable_staging(staging, destination):
+                self.assertEqual(Path(staging).stat().st_mode & 0o777, 0o700)
+                rename(staging, destination)
+            with mock.patch.object(package_release, 'FILES', MINIMAL), \
+                    mock.patch.object(install.os, 'rename', side_effect=require_writable_staging):
+                package = install.durable_package(data, source)
+            self.assertEqual(package.stat().st_mode & 0o777, 0o500)
+            self.assertEqual(list((data / 'packages').iterdir()), [package])
+            package.chmod(0o700)
+
+    def test_durable_package_failed_sealing_preserves_copy_for_verified_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, data = root / 'source', root / 'data'
+            release_source(source)
+            data.mkdir(mode=0o700)
+            chmod = Path.chmod
+            def fail_sealing(path, mode, *args, **kwargs):
+                if mode == 0o500:
+                    raise PermissionError('synthetic final chmod failure')
+                return chmod(path, mode, *args, **kwargs)
+            with mock.patch.object(package_release, 'FILES', MINIMAL):
+                with mock.patch.object(Path, 'chmod', new=fail_sealing):
+                    with self.assertRaisesRegex(PermissionError, 'final chmod failure'):
+                        install.durable_package(data, source)
+                packages = list((data / 'packages').iterdir())
+                self.assertEqual(len(packages), 1)
+                self.assertFalse(packages[0].name.startswith('.package-'))
+                self.assertEqual(packages[0].stat().st_mode & 0o777, 0o700)
+                self.assertEqual((packages[0] / 'relay.py').read_bytes(), (source / 'relay.py').read_bytes())
+                package = install.durable_package(data, source)
+            self.assertEqual(package, packages[0])
+            self.assertEqual(package.stat().st_mode & 0o777, 0o500)
+            package.chmod(0o700)
+
+    def test_durable_package_failed_rename_cleans_only_private_staging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, data = root / 'source', root / 'data'
+            release_source(source)
+            data.mkdir(mode=0o700)
+            with mock.patch.object(package_release, 'FILES', MINIMAL), \
+                    mock.patch.object(install.os, 'rename', side_effect=PermissionError('synthetic rename failure')):
+                with self.assertRaisesRegex(PermissionError, 'rename failure'):
+                    install.durable_package(data, source)
+            self.assertEqual(list((data / 'packages').iterdir()), [])
+            self.assertTrue((source / 'relay.py').is_file())
+
+
     def test_modified_immutable_package_is_not_replaced(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -307,18 +363,23 @@ class UninstallTests(unittest.TestCase):
             'ssh_block_sha256': install.ssh_block_digest(self.block + self.unrelated)})
         self.args = SimpleNamespace(tern=None, config_dir=None, ssh_config=None)
 
-    def invoke(self, leave_registration=False):
+    def invoke(self, leave_registration=False, fail_remove=False, edit_ssh=False):
         def run(argv, env):
             if 'stop' in argv:
                 return '{"ok":true,"state":"stopped"}'
             native = self.link.is_dir() and not self.link.is_symlink()
             verb = 'remove' if native or self.link.is_symlink() else 'unlink'
             self.assertEqual(argv[-3:], ['plugin', verb, install.PLUGIN_ID])
+            self.assertEqual(self.ssh.read_text(), self.unrelated)
             if not leave_registration:
                 if native:
                     shutil.rmtree(self.link)
                 else:
                     self.link.unlink()
+            if edit_ssh:
+                self.ssh.write_text(self.unrelated + 'Host independently-added\n')
+            if fail_remove:
+                raise ValueError('synthetic plugin CLI failure')
             return '{}'
         with mock.patch.object(uninstall, 'tern_environment', return_value=(Path('/tern'), {}, self.plugins, self.data)), \
                 mock.patch.object(uninstall, 'run', side_effect=run) as command:
@@ -442,6 +503,56 @@ class UninstallTests(unittest.TestCase):
             self.invoke(leave_registration=True)
         self.assertEqual(self.ssh.read_text(), self.block + self.unrelated)
         self.assertTrue(self.package.is_dir())
+
+    def test_native_ssh_cleanup_failure_keeps_package_available_for_retry(self):
+        self.use_native_copy()
+        self.args.require_stopped_only = True
+        with mock.patch.object(uninstall, 'update', side_effect=PermissionError('synthetic SSH write failure')):
+            with self.assertRaisesRegex(PermissionError, 'SSH write failure'):
+                self.invoke()
+        self.assertTrue((self.package / 'relay.py').is_file())
+        self.assertEqual(self.ssh.read_text(), self.block + self.unrelated)
+        self.assertEqual(self.config.read_text(), 'configuration retained')
+
+    def test_native_cli_error_after_removal_reports_observed_success(self):
+        self.use_native_copy()
+        result, _ = self.invoke(fail_remove=True)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['plugin_removed'])
+        self.assertTrue(result['cli_reported_error'])
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self.ssh.read_text(), self.unrelated)
+
+    def test_native_cli_failure_before_removal_restores_exact_ssh_bytes(self):
+        self.use_native_copy()
+        original = self.ssh.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'synthetic plugin CLI failure'):
+            self.invoke(leave_registration=True, fail_remove=True)
+        self.assertTrue((self.package / 'relay.py').is_file())
+        self.assertEqual(self.ssh.read_bytes(), original)
+
+    def test_failed_native_removal_never_overwrites_independent_ssh_changes(self):
+        self.use_native_copy()
+        with self.assertRaises(uninstall.UninstallRecoveryError):
+            self.invoke(leave_registration=True, fail_remove=True, edit_ssh=True)
+        self.assertTrue((self.package / 'relay.py').is_file())
+        self.assertEqual(self.ssh.read_text(), self.unrelated + 'Host independently-added\n')
+
+    def test_failed_native_removal_reports_ssh_restoration_failure(self):
+        self.use_native_copy()
+        update = uninstall.update
+        attempts = []
+        def fail_restore(path, transform):
+            attempts.append(path)
+            if len(attempts) == 2:
+                raise PermissionError('synthetic SSH restoration failure')
+            return update(path, transform)
+        with mock.patch.object(uninstall, 'update', side_effect=fail_restore):
+            with self.assertRaises(uninstall.UninstallRecoveryError) as failure:
+                self.invoke(leave_registration=True, fail_remove=True)
+        self.assertIsInstance(failure.exception.recovery_error, PermissionError)
+        self.assertTrue((self.package / 'relay.py').is_file())
+        self.assertEqual(self.ssh.read_text(), self.unrelated)
 
     def test_native_registration_cannot_borrow_legacy_ownership_record(self):
         self.link.unlink()

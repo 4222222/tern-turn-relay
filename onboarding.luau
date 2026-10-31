@@ -15,6 +15,7 @@ function M.new(api)
         function(token) return token == epoch end,
         function(cx)
             self.active = false
+            api.failed("设置操作已中断，请重新打开设置检查实际结果。")
             if cx then cx:toast("error", "TURN 设置已中断", "重新打开设置检查实际结果；不会自动重试配置变更。") end
         end)
 
@@ -256,7 +257,9 @@ function M.new(api)
             else finish() end
         end)
     end
-    inspect = function(cx) backend(cx, "inspect", {}, menu) end
+    inspect = function(cx)
+        backend(cx, "inspect", {}, function(snapshot, fresh) api.inspected(); menu(snapshot, fresh) end)
+    end
     function self.open(cx)
         if self.active then cx:toast("info", "TURN 设置已打开", "请完成当前选择或按 Esc 取消。"); return end
         if tern.runtime.os ~= "macos" then cx:toast("error", "当前配置向导仅支持 macOS"); return end

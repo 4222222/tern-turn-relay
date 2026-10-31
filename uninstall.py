@@ -12,6 +12,16 @@ from relay_config import lock_file, private_file, state_directory
 from ssh_compat import update, without_block
 
 
+class UninstallRecoveryError(ValueError):
+    """Safe summary retaining command/recovery exceptions for local callers."""
+
+    def __init__(self, removal_error, recovery_error):
+        self.removal_error = removal_error
+        self.recovery_error = recovery_error
+        super().__init__('Plugin removal failed; its package was preserved, but SSH rule restoration '
+                         'requires manual recovery. Independently changed SSH content was not overwritten.')
+
+
 def owned_installation(data, plugins):
     manifest = data / 'installation.json'
     private_file(manifest)
@@ -92,21 +102,57 @@ def uninstall(args):
             raise ValueError('Reviewed plugin registration disappeared; it was not removed')
         if source is not None and source != package.resolve():
             raise ValueError('Plugin registration changed during uninstall; it was preserved')
+        identity = None
         if current_link is not None:
-            verb = 'remove' if native or current_link.is_symlink() else 'unlink'
-            run([str(tern), 'plugin', verb, PLUGIN_ID], env)
-            if plugin_link(plugins)[0] is not None:
-                raise ValueError('Tern did not remove the plugin registration; SSH configuration was preserved')
+            info = current_link.lstat()
+            identity = (info.st_dev, info.st_ino)
+        # Complete the reversible SSH write before deleting the native package
+        # that contains this recovery helper. An SSH write failure leaves the
+        # installation intact and available for a normal retry.
+        ssh_change = None
         if ssh.exists():
             def remove_owned(text):
+                nonlocal ssh_change
                 found = ssh_block_digest(text)
                 if found is not None and found != expected_rule:
                     raise ValueError('Marked SSH rule changed during uninstall; it was preserved')
-                return without_block(text)
+                cleaned = without_block(text)
+                ssh_change = (text, cleaned)
+                return cleaned
             update(ssh, remove_owned)
+        removal_error = None
+        if current_link is not None:
+            verb = 'remove' if native or current_link.is_symlink() else 'unlink'
+            try:
+                run([str(tern), 'plugin', verb, PLUGIN_ID], env)
+            except Exception as error:
+                removal_error = error
+            remaining, remaining_source = plugin_link(plugins)
+            if remaining is not None:
+                info = remaining.lstat()
+                if ((remaining, remaining_source) != (current_link, source)
+                        or (info.st_dev, info.st_ino) != identity):
+                    raise ValueError('Plugin registration changed independently; SSH cleanup was retained')
+                failure = removal_error or ValueError('Tern did not remove the plugin registration')
+                try:
+                    if ssh_change is not None and ssh_change[0] != ssh_change[1]:
+                        if not ssh.exists() or ssh.is_symlink():
+                            raise ValueError('SSH configuration changed independently; it was preserved')
+                        def restore_owned(text):
+                            if text != ssh_change[1]:
+                                raise ValueError('SSH configuration changed independently; it was preserved')
+                            return ssh_change[0]
+                        update(ssh, restore_owned)
+                except Exception as recovery_error:
+                    raise UninstallRecoveryError(failure, recovery_error) from failure
+                raise failure
+            # A CLI error can occur after its filesystem mutation. Once absence
+            # is observed, removal and SSH cleanup are complete; do not restore
+            # an orphaned compatibility rule or claim that retry is required.
         return {'ok': True, 'plugin_unlinked': not native, 'plugin_removed': native,
                 'owned_backend_stopped': True,
                 'stop_requested': not stopped_only,
+                'cli_reported_error': removal_error is not None,
                 'marked_ssh_rule_removed': True, 'remote_daemon_preserved': True,
                 'remote_gateway_state_preserved': True, 'configuration_preserved': True,
                 'credentials_preserved': True, 'installed_package_preserved': not native,

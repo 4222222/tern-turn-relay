@@ -30,6 +30,7 @@ local failNative
 local stepNative
 local helperRequests = {}
 local onboarding
+local setupError
 local managedPython = tern.plugin.data .. "/managed-python/python/bin/python3"
 local helperPython = "/usr/bin/python3"
 local hasConfig = false
@@ -914,8 +915,14 @@ onboarding = require('./onboarding').new({
     runtimeReady = function(path) helperPython = path end,
     configured = function() hasConfig = true; lastError = nil; refresh() end,
     failed = function(message)
-        lastError = message:gsub("[%c]", " ")
-        if hasConfig then refresh() else statusText = "TURN · 配置失败" end
+        setupError = message:gsub("[%c]", " ")
+        lastError = setupError
+        if hasConfig then refresh() else statusText = "TURN · 配置失败"; tern.chrome.refresh() end
+    end,
+    inspected = function()
+        if setupError and lastError == setupError then lastError = nil end
+        setupError = nil
+        if hasConfig then refresh() else statusText = "TURN · 待配置"; tern.chrome.refresh() end
     end,
     connect = function(cx) convert("tls", cx, true) end,
     status = status,
@@ -924,9 +931,9 @@ tern.command({ id = "setup", title = "Settings: server, Cloudflare Key and priva
     run = commandTick(function(cx) onboarding.open(cx) end) })
 
 tern.command({ id = "convert-tls", title = "Connect configured Host via TURN TLS", group = "TURN",
-    run = commandTick(function(cx) if hasConfig then convert("tls", cx) else onboarding.open(cx) end end) })
+    run = commandTick(function(cx) if hasConfig then convert("tls", cx, true) else onboarding.open(cx) end end) })
 tern.command({ id = "convert-udp", title = "Connect configured Host via TURN UDP", group = "TURN",
-    run = commandTick(function(cx) if hasConfig then convert("udp", cx) else onboarding.open(cx) end end) })
+    run = commandTick(function(cx) if hasConfig then convert("udp", cx, true) else onboarding.open(cx) end end) })
 tern.command({ id = "restore-direct", title = "Restore configured Host to direct (keep relay and SSH)", group = "TURN", run = commandTick(restore) })
 tern.command({ id = "disconnect", title = "Stop TURN for ALL windows and SSH TCP sessions (interrupts TCP)", group = "TURN", run = commandTick(disconnect) })
 tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, bytes and errors", group = "TURN", run = commandTick(status) })

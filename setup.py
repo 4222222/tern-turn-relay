@@ -20,7 +20,7 @@ from relay_config import load_config, private_file, validate_ssh_destination
 
 # Executed only through authenticated SSH. No package deployment or daemon start.
 REMOTE_DISCOVERY = r'''
-import base64, hashlib, json, os, pwd, re, socket, stat, struct, subprocess, sys
+import base64, hashlib, ipaddress, json, os, pwd, re, socket, stat, struct, subprocess, sys
 from pathlib import Path
 
 def fail(message):
@@ -105,9 +105,50 @@ def udp_listeners(entry, uid):
                 packed = b''.join(packed[i:i + 4][::-1] for i in range(0, len(packed), 4))
                 address = socket.inet_ntop(family, packed)
                 port = int(port, 16)
-                if port and address in ('0.0.0.0', '127.0.0.1'):
+                if port:
                     result.append({'port': port, 'address': address, 'inode': fields[9]})
     return sorted(result, key=lambda item: (item['port'], item['inode']))
+
+def native_listeners(service, host):
+    """Separate native QUIC from Iroh: a default is useful only when observed."""
+    allowed = {'0.0.0.0', '127.0.0.1', '::', '::1', str(ipaddress.IPv4Address(host))}
+    listen = service['listen']
+    address = None
+    port = 8376  # Native remote endpoint default; never synthesize a socket.
+    if listen is not None:
+        match = re.fullmatch(r'(\[[0-9a-fA-F:]+\]|[^:]+):([0-9]{1,5})', listen)
+        if not match:
+            return []
+        try:
+            address = str(ipaddress.ip_address(match[1].strip('[]')))
+            port = int(match[2])
+        except ValueError:
+            return []
+        if address not in allowed or not 1 <= port <= 65535:
+            return []
+    return [item for item in service['listeners']
+            if item['port'] == port and item['address'] in allowed
+            and (address is None or item['address'] == address)]
+
+def gateway_frontend(service, home, excluded):
+    if not service['state']:
+        return False
+    state = path(service['state'])
+    reserved = {str(path(value)) for value in excluded}
+    reserved.add(str(path(home) / '.local/state/tern-turn-relay/native'))
+    if str(state) in reserved:
+        return True
+    # Custom/per-workspace gateways retain this ownership record beside native/.
+    # Its presence makes this reserved state ineligible even if the pin is stale.
+    marker = state.parent / 'daemon-identity.json'
+    if state.name == 'native' and (marker.exists() or marker.is_symlink()):
+        try:
+            directory(state.parent)
+            regular(marker)
+        except (OSError, ValueError):
+            return True
+        return True
+    return False
 
 def candidate_id(service, daemon, listener):
     binding = [service['pid'], service['start'], service['state'], daemon['pid'],
@@ -175,8 +216,8 @@ try:
             continue
     candidates = []
     for service in services:
-        if not service['state']:
-            continue  # Unknown identity directories are never guessed.
+        if not service['state'] or gateway_frontend(service, home, request.get('excluded_state_dirs', [])):
+            continue  # Never use our own frontend as the original service.
         if request.get('original_state_dir') not in (None, service['state']):
             continue
         for daemon in related_daemons(service, daemons):
@@ -190,11 +231,7 @@ try:
                 verify_daemon(daemon)
             except (OSError, ValueError):
                 continue
-            listen = service['listen']
-            declared = int(listen.rsplit(':', 1)[-1]) if listen and re.fullmatch(r'.+:[0-9]{1,5}', listen) else None
-            for listener in service['listeners']:
-                if declared is not None and declared != listener['port']:
-                    continue
+            for listener in native_listeners(service, request['target_host']):
                 if request.get('target_port') not in (None, listener['port']):
                     continue
                 candidates.append((candidate_id(service, daemon, listener), service, daemon, listener))
@@ -298,7 +335,8 @@ def discover(args, runner=subprocess.run):
     endpoint = resolve_destination(args.ssh_destination, runner)
     request = {'original_state_dir': args.original_state_dir, 'daemon_socket': args.daemon_socket,
                'target_port': args.target_port, 'inventory': getattr(args, 'inventory', False),
-               'candidate_id': getattr(args, 'candidate_id', None)}
+               'candidate_id': getattr(args, 'candidate_id', None), 'target_host': endpoint['host'],
+               'excluded_state_dirs': getattr(args, 'excluded_state_dirs', [])}
     command = shlex.join(['python3', '-B', '-c', REMOTE_DISCOVERY])
     result = runner(['/usr/bin/ssh', '-T', *ssh_options(), args.ssh_destination, command],
                     input=json.dumps(request), capture_output=True, text=True, timeout=40)
