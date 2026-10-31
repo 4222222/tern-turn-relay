@@ -245,8 +245,10 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("ttr-asset-{:032x}", rand::random::<u128>()));
+            let base = std::env::temp_dir().canonicalize().unwrap();
+            #[cfg(windows)]
+            let base = crate::windows_security::normalize_system_path(&base).unwrap();
+            let path = base.join(format!("ttr-asset-{:032x}", rand::random::<u128>()));
             #[cfg(unix)]
             std::fs::create_dir(&path).unwrap();
             #[cfg(unix)]

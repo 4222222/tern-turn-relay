@@ -1213,9 +1213,10 @@ mod tests {
         let target = path.clone();
         PUBLICATION_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
-                std::thread::spawn(move || std::fs::write(target, br#"{"value":"user"}"#).unwrap())
-                    .join()
-                    .unwrap();
+                std::thread::spawn(move || {
+                    let mut created = create_file(&target).unwrap();
+                    created.file.write_all(br#"{"value":"user"}"#).unwrap();
+                }).join().unwrap();
             }))
         });
         assert!(install::replace(&path, None, Some(br#"{"value":"staged"}"#), 0o600).is_err());

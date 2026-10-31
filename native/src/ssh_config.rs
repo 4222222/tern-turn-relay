@@ -713,7 +713,16 @@ mod tests {
     }
 
     async fn assert_trust_roundtrip(directory: &Path, original: &Path) -> ResolvedOptions {
-        let resolved = resolve_fixture(original, "server", "2222").await.unwrap();
+        let resolved = match resolve_fixture(original, "server", "2222").await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // 仅测试夹具：记录原生解析结果，定位平台差异；不读取用户配置。
+                let executable = common::ssh_executable().unwrap();
+                let invocation = vec!["-F".into(), original.to_str().unwrap().into(), "-l".into(), "alice".into(), "-p".into(), "2222".into(), "server".into()];
+                let diagnostic = native_dump(&executable, &invocation, &[], true).await.unwrap();
+                panic!("fixture trust resolution failed: {error}; stdout={}; stderr={}", String::from_utf8_lossy(&diagnostic.stdout), String::from_utf8_lossy(&diagnostic.stderr));
+            }
+        };
         let config = serde_json::json!({"ssh_destination":"server","target":{"host":"8.8.8.8","user":"alice"},"listen_port":18377});
         let (block, pin) = render(&config, &resolved.options, directory.to_str().unwrap(), &resolved.trust).unwrap();
         let generated = directory.join(format!("generated-{:032x}", rand::random::<u128>()));

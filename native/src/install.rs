@@ -1662,8 +1662,8 @@ mod tests {
     fn registration_rejects_ambiguity_and_unsafe_marker() {
         let dir = temporary();
         let plugins = dir.join("plugins");
-        std::fs::create_dir(&plugins).unwrap();
-        std::fs::create_dir(plugins.join(PLUGIN)).unwrap();
+        common::private_dir(&plugins, true).unwrap();
+        common::private_dir(&plugins.join(PLUGIN), true).unwrap();
         replace(
             &plugins.join(format!("{PLUGIN}.path")),
             None,
