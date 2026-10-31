@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "version": "0.4.0",
+  "assets": {
+    "tern-turn-relay-darwin-arm64": {
+      "sha256": "9613050cfa7d7e7c66ca1de67f8703e6a95e2eb1e3a2820e54cdaeb43184185c",
+      "size": 4042608
+    },
+    "tern-turn-relay-linux-x86_64": {
+      "sha256": "f9baaf2ee8ee4d9ee38dc2a617825c44288d40bb2f2392caca555e00435dc9d4",
+      "size": 4925648
+    },
+    "tern-turn-relay-linux-arm64": {
+      "sha256": "360b388318dffb4e2c1dfbdb9639134f84cb0bf99cba49e654aff7516ed5bf2b",
+      "size": 4265632
+    },
+    "tern-turn-relay-darwin-x86_64": {
+      "sha256": "bc762584491fa56f8e179fd654bde2b39cb92f30459e348b44be099e4382b02c",
+      "size": 4306544
+    }
+  }
+}
