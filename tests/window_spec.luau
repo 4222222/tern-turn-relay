@@ -42,7 +42,12 @@ local function fixture(os, configured, installed)
         end },
         process = { run = function(argv, options, callback) table.insert(f.calls, { argv = argv, options = options, callback = callback }) end },
         command = function(command) f.commands[command.id] = command end,
-        chrome = { refresh = function() end, status = function(callback) f.status = callback end },
+        chrome = { refresh = function()
+            if f.interruptRefresh then
+                f.interruptRefresh = false
+                error('simulated interrupted timer hook')
+            end
+        end, status = function(callback) f.status = callback end },
     }
     function f:context()
         local function mutate() self.mutations += 1; error('不应修改 Host') end
@@ -201,6 +206,45 @@ function cases.periodic_status_is_live_deduplicated_and_failure_invalidates_read
     for _, path in ipairs(f.reads) do assert(not path:find('status.json', 1, true)) end
     f:command('status'); f:complete(f:value('ready'))
     assert(f.status()[1].text:find('已连接'))
+end
+
+function cases.disconnected_host_does_not_freeze_recovery_status()
+    for _, os in ipairs({ 'macos', 'windows' }) do
+        local f = fixture(os, true, true)
+        f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377',
+            state = 'disconnected', detail = { fingerprint = 'relay-pin' } } }
+        local recovering = f:value('ready')
+        recovering.recovering_flows = 1
+        f:complete(recovering)
+        assert(f.status()[1].text:find('恢复中'))
+        -- Native Tern reconnects independently; no plugin command wakes polling.
+        f.hosts[1].state = 'connected'
+        f.time = 3000; f:flush()
+        assert(#f.calls == 2, '断开期间不能停止读取后台状态，否则恢复文字会永久冻结')
+        f:complete(f:value('ready'))
+        assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+        assert(f.mutations == 0, '观察恢复不能修改原生 Host')
+    end
+end
+
+function cases.interrupted_refresh_does_not_stop_future_status_observation()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377',
+        state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+    f:complete(f:value('ready'))
+    f.time = 3000; f:flush()
+    f.interruptRefresh = true
+    f:complete(f:value('ready'))
+    f.time = 6000; f:flush()
+    assert(#f.calls == 3, '刷新回调被中断后，下一次状态观察仍必须发生')
+    local recovering = f:value('ready')
+    recovering.recovering_flows = 1
+    f:complete(recovering)
+    assert(f.status()[1].text:find('恢复中'), '中断后必须继续反映真实状态变化')
+    f.time = 9000; f:flush()
+    f:complete(f:value('ready'))
+    assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+    assert(f.mutations == 0)
 end
 
 function cases.live_status_timeout_discards_late_ready()
