@@ -914,6 +914,7 @@ onboarding = require('./onboarding').new({
     available = function() return not busy and not pending end,
     runtimeReady = function(path) helperPython = path end,
     configured = function() hasConfig = true; lastError = nil; refresh() end,
+    reviewChanged = function() tern.chrome.refresh() end,
     failed = function(message)
         setupError = message:gsub("[%c]", " ")
         lastError = setupError
@@ -940,7 +941,8 @@ tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, 
 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
 tern.chrome.status(function()
-    return { { text = statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = hasConfig and "plugin.tern-turn-relay.status" or "plugin.tern-turn-relay.setup" } }
+    local reviewing = onboarding and onboarding.reviewed ~= nil
+    return { { text = reviewing and "TURN · 确认配置" or statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = (reviewing or not hasConfig) and "plugin.tern-turn-relay.setup" or "plugin.tern-turn-relay.status" } }
 end)
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be

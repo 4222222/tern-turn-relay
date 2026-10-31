@@ -32,7 +32,7 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 2. 向导自动下载、校验并准备插件私有 Python。使用固定发行版及 SHA-256，不安装系统级软件、不需要管理员权限；仅显式打开设置时准备，插件加载本身不会下载。首次准备需要联网，并要求至少 1 GiB 可用空间。
 3. 选择 **配置 Cloudflare TURN Key**。先在 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls) 创建自己的 TURN Key，再在系统隐藏输入窗口填写 **Key ID** 和 **TURN-key API token**。不要填写账户级 API Token。验证成功后才保存；取消或验证失败不会覆盖已有凭据。
 4. 选择已有 SSH 别名。向导通过严格 SSH 检查已有服务、daemon 和实际 UDP 监听端口；发现多个可验证工作区时列出供选择，不要求抄写路径或指纹。
-5. 阅读 **TURN 配置确认** 页，确认目标、原工作区、网关目录、本机端口及 SSH 规则文件，然后选择 **确认应用**。这一步安装依赖、部署专用网关并保存配置，不启动第二套 session daemon。
+5. 阅读无遮挡的 **TURN 配置确认** 页，核对目标、原工作区、网关目录、本机端口及 SSH 规则文件。然后点击状态栏的 **TURN · 确认配置**（或再次打开 Settings），选择 **确认应用**。这一步安装依赖、部署专用网关并保存配置，不启动第二套 session daemon。
 6. 选择 **连接 TURN TLS**。可以从本机 Host 或对应服务器 Host 发起；拒绝切换无关远端 Host，失败不自动回退直连。
 
 已配置的凭据和目标会被识别并复用。运行中不自动停止连接来修改配置；需要更改时先显式 Stop（会中断共享入口上的连接）。默认本机端口为 `18377`；确有冲突时使用 **高级：自定义本机端口**，新端口会显示在确认页。

@@ -8,7 +8,7 @@
 
 ## 1. 只读预检
 
-先通过 Tern 原生安装入口注册插件。需要自动化时，在已安装的插件目录执行 `bootstrap-runtime.sh <该 profile 的插件数据目录> --prepare`，从成功 JSON 中取得私有 Python 路径；无需安装系统 Python。脚本仅在显式准备时下载固定版本，先核查平台、空间及用户授权。
+先通过 Tern 原生安装入口注册插件。需要自动化时，在已安装的插件目录执行 `/bin/sh bootstrap-runtime.sh <该 profile 的插件数据目录> --prepare`，从成功 JSON 中取得私有 Python 路径；无需安装系统 Python。脚本仅在显式准备时下载固定版本，先核查平台、空间及用户授权。
 
 用该解释器运行 `onboarding.py inspect --data-dir <数据目录> --package-dir <安装目录>`，stdin 为 `{}`。该操作只读、不会请求 Cloudflare 或连接 SSH；返回凭据是否存在、当前目标、运行状态及 SSH 别名建议，绝不返回秘密。检查已有配置时保留其路径和所有权记录，不另造默认配置。
 

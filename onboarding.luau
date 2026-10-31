@@ -132,23 +132,29 @@ function M.new(api)
             local pane = cx.canvas:open({ title = "TURN 配置确认", about = ABOUT, md = table.concat(rows, "\n"), how = "tab" })
             if not pane then fail(cx, "无法显示配置审核，未应用任何更改。"); return end
         end
-        -- Separate tick: the review surface is rendered before requesting consent.
-        queue:post(epoch, function(fresh)
-            pick(fresh, "审核 TURN 配置后继续", {
-                { label = "确认应用", value = "apply", detail = "部署专用网关、保存配置及作用域限定的 SSH 规则；不更改原服务" },
-                { label = "重新选择服务器", value = "choose" },
-                { label = "取消，不应用", value = "cancel" },
-            }, function(answer, current)
-                if answer.value == "cancel" then finish(); return end
-                if answer.value == "choose" then inspect(current); return end
-                current:toast("info", "正在应用 TURN 配置", "正在校验依赖、SSH 身份与原工作区；请等待结果。")
-                backend(current, "apply", { review = plan, authorize_replace = plan.previous_config_sha256 ~= nil and plan.previous_config_sha256 ~= tern.json.null },
-                    function(_result, applied)
-                        api.configured()
-                        applied:toast("success", "TURN 配置已保存", "可以从本机或对应服务器 Host 连接 TLS；配置本身不会切换连接。")
-                        inspect(applied)
-                    end)
-            end)
+        self.reviewed = value
+        finish()
+        api.reviewChanged()
+        cx:toast("info", "请阅读完整配置确认页", "阅读后点击「TURN · 确认配置」，或再次打开 TURN Settings，确认应用或取消。")
+    end
+    local function confirmReview(cx)
+        local plan = self.reviewed.review
+        pick(cx, "确认配置 " .. plan.configuration.target.user .. "@" .. plan.configuration.target.host, {
+            { label = "确认应用", value = "apply", detail = "部署专用网关、保存配置及作用域限定的 SSH 规则；不更改原服务" },
+            { label = "重新选择服务器", value = "choose" },
+            { label = "取消，不应用", value = "cancel" },
+        }, function(answer, current)
+            self.reviewed = nil
+            api.reviewChanged()
+            if answer.value == "cancel" then finish(); return end
+            if answer.value == "choose" then inspect(current); return end
+            current:toast("info", "正在应用 TURN 配置", "正在校验依赖、SSH 身份与原工作区；请等待结果。")
+            backend(current, "apply", { review = plan, authorize_replace = plan.previous_config_sha256 ~= nil and plan.previous_config_sha256 ~= tern.json.null },
+                function(_result, applied)
+                    api.configured()
+                    applied:toast("success", "TURN 配置已保存", "可以从本机或对应服务器 Host 连接 TLS；配置本身不会切换连接。")
+                    inspect(applied)
+                end)
         end)
     end
     discover = function(cx, alias, candidate, port)
@@ -266,6 +272,7 @@ function M.new(api)
         if not api.available() then cx:toast("info", "连接操作仍在进行", "请等待结果后再打开设置。"); return end
         self.active = true
         epoch += 1
+        if self.reviewed then confirmReview(cx); return end
         -- Only an explicit setup action can acquire a runtime; plugin loading never downloads.
         cx:toast("info", "正在准备 TURN 设置", "首次使用将下载并校验插件私有 Python；无需自行安装或执行脚本。")
         run(cx, { "/bin/sh", tern.plugin.dir .. "/bootstrap-runtime.sh", tern.plugin.data, "--prepare" }, {}, 320000,
