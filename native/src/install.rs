@@ -44,21 +44,83 @@ pub(crate) fn home() -> Result<PathBuf> {
     common::safe_absolute(path.to_str().ok_or_else(io_error)?)?;
     Ok(path)
 }
-fn trusted_directory(file: &File, leaf: bool) -> Result<()> {
+#[derive(Clone, Copy)]
+enum AncestorPolicy {
+    PrivateData,
+    Executable { admin_gid: Option<libc::gid_t> },
+}
+fn directory_permissions_trusted(
+    owner: libc::uid_t,
+    group: libc::gid_t,
+    mode: u32,
+    uid: libc::uid_t,
+    policy: AncestorPolicy,
+) -> bool {
+    let sticky = owner == 0 && mode & (libc::S_ISVTX as u32) != 0;
+    // macOS platform administrators manage installed applications. This extra
+    // trust never applies to credential/configuration/package-data ancestry.
+    let platform_admin = match policy {
+        AncestorPolicy::Executable { admin_gid: Some(admin_gid) } => {
+            owner == 0 && group == admin_gid && mode & 0o002 == 0
+        }
+        _ => false,
+    };
+    (owner == uid || owner == 0) && (mode & 0o022 == 0 || sticky || platform_admin)
+}
+fn trusted_directory_with_policy(file: &File, leaf: bool, policy: AncestorPolicy) -> Result<()> {
     let m = file.metadata().map_err(|_| io_error())?;
     let uid = unsafe { libc::getuid() };
-    let sticky = m.uid() == 0 && m.mode() & (libc::S_ISVTX as u32) != 0;
     if !m.is_dir()
-        || (m.uid() != uid && m.uid() != 0)
-        || (m.mode() & 0o022 != 0 && !sticky)
+        || !directory_permissions_trusted(m.uid(), m.gid(), m.mode(), uid, policy)
         || (leaf && m.uid() != uid)
     {
         return Err(io_error());
     }
     Ok(())
 }
+fn trusted_directory(file: &File, leaf: bool) -> Result<()> {
+    trusted_directory_with_policy(file, leaf, AncestorPolicy::PrivateData)
+}
+#[cfg(target_os = "macos")]
+fn executable_admin_gid() -> Result<Option<libc::gid_t>> {
+    // Resolve the named system group through the platform account database;
+    // do not assume an arbitrary group or hard-code macOS's usual numeric gid.
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getgrnam_r(
+                b"admin\0".as_ptr().cast(),
+                &mut group,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && buffer.len() < 65536 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if status != 0 { return Err(io_error()); }
+        if result.is_null() { return Ok(None); }
+        if group.gr_name.is_null()
+            || unsafe { std::ffi::CStr::from_ptr(group.gr_name) }.to_bytes() != b"admin"
+        {
+            return Err(io_error());
+        }
+        return Ok(Some(group.gr_gid));
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn executable_admin_gid() -> Result<Option<libc::gid_t>> {
+    Ok(None)
+}
 /// Opens every ancestor using directory descriptors, never following symlinks.
 fn parent(path: &Path, create: bool) -> Result<Option<File>> {
+    parent_with_policy(path, create, AncestorPolicy::PrivateData)
+}
+fn parent_with_policy(path: &Path, create: bool, policy: AncestorPolicy) -> Result<Option<File>> {
     common::safe_absolute(path.to_str().ok_or_else(io_error)?)?;
     let base = path.parent().ok_or_else(io_error)?;
     let mut current = File::open("/").map_err(|_| io_error())?;
@@ -89,7 +151,7 @@ fn parent(path: &Path, create: bool) -> Result<Option<File>> {
             return Err(io_error());
         }
         current = unsafe { File::from_raw_fd(fd) };
-        trusted_directory(&current, false)?;
+        trusted_directory_with_policy(&current, false, policy)?;
     }
     Ok(Some(current))
 }
@@ -556,7 +618,8 @@ async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
         .tern
         .clone()
         .unwrap_or_else(|| PathBuf::from("/Applications/Tern.app/Contents/MacOS/tern"));
-    let directory = parent(&binary, false)?.ok_or_else(io_error)?;
+    let policy = AncestorPolicy::Executable { admin_gid: executable_admin_gid()? };
+    let directory = parent_with_policy(&binary, false, policy)?.ok_or_else(io_error)?;
     let name = cstring(binary.file_name().ok_or_else(io_error)?)?;
     let fd = unsafe {
         libc::openat(
@@ -1771,5 +1834,21 @@ mod tests {
         );
         assert!(require_revoked_intent(&paths).is_ok());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn root_admin_group_write_is_allowed_only_for_executable_ancestry() {
+        let executable = AncestorPolicy::Executable { admin_gid: Some(80) };
+        assert!(directory_permissions_trusted(0, 80, 0o775, 501, executable));
+        assert!(!directory_permissions_trusted(0, 80, 0o775, 501, AncestorPolicy::PrivateData));
+        assert!(!directory_permissions_trusted(0, 80, 0o775, 501, AncestorPolicy::Executable { admin_gid: None }));
+        for (owner, group, mode) in [(0, 80, 0o777), (0, 80, 0o757), (501, 80, 0o775), (0, 20, 0o775), (999, 80, 0o755)] {
+            assert!(!directory_permissions_trusted(owner, group, mode, 501, executable));
+        }
+        for policy in [AncestorPolicy::PrivateData, executable] {
+            assert!(directory_permissions_trusted(501, 20, 0o755, 501, policy));
+            assert!(directory_permissions_trusted(0, 0, 0o755, 501, policy));
+        }
+        // Preserve the existing private-data policy for root-owned sticky /tmp.
+        assert!(directory_permissions_trusted(0, 0, 0o1777, 501, AncestorPolicy::PrivateData));
     }
 }

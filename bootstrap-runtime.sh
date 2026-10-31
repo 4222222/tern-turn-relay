@@ -28,7 +28,7 @@ while [ "$check" != / ]; do
     if [ -e "$check" ]; then
         [ -d "$check" ] || fail 'Plugin-data ancestors must be directories'
         owner=$(/usr/bin/stat -f '%u' "$check") || fail 'Cannot verify ancestor ownership'
-        permissions=$(/usr/bin/stat -f '%Lp' "$check") || fail 'Cannot verify ancestor permissions'
+        permissions=$(/usr/bin/stat -f '%p' "$check") || fail 'Cannot verify ancestor permissions'
         case "$permissions" in ''|*[!0-7]*) fail 'Invalid ancestor permissions' ;; esac
         [ "$owner" = 0 ] || [ "$owner" = "$uid" ] || fail 'Plugin-data ancestor belongs to another user'
         bits=$((0$permissions))
