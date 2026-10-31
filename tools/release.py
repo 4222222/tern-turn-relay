@@ -74,17 +74,26 @@ def package(destination):
 
 def smoke(binary):
     binary=binary.resolve(strict=True)
+    environment=None
     def invoke(args,data=None):
-        result=subprocess.run([str(binary),*args],input=None if data is None else json.dumps(data).encode(),capture_output=True,timeout=20)
+        result=subprocess.run([str(binary),*args],input=None if data is None else json.dumps(data).encode(),env=environment,capture_output=True,timeout=20)
         if result.stderr:raise AssertionError('Unexpected native stderr')
         return result.returncode,json.loads(result.stdout)
     code,value=invoke(['--version']);assert code==0 and value['runtime']=='rust' and value['version']==version()
     code,value=invoke(['credentials','not-a-command','DO_NOT_ECHO_PRIVATE_ARGUMENT']);assert code!=0 and 'DO_NOT_ECHO_PRIVATE_ARGUMENT' not in json.dumps(value)
     with tempfile.TemporaryDirectory(prefix='native-release-smoke-') as temporary:
         root=Path(temporary).resolve();root.chmod(0o700)
-        profile=['--config-dir',str(root),'--data-dir',str(root/'plugin-data/tern-turn-relay'),'--package-dir',str(ROOT)]
+        home=root/'home';home.mkdir(mode=0o700)
+        package_dir=root/'plugins/tern-turn-relay';package_dir.mkdir(parents=True,mode=0o700)
+        for name in RUNTIME_FILES:
+            source=ROOT/name
+            if not source.exists():continue
+            destination=package_dir/name;destination.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            destination.write_bytes(source.read_bytes());destination.chmod(0o600)
+        environment=dict(os.environ,HOME=str(home))
+        profile=['--config-dir',str(root),'--data-dir',str(root/'plugin-data/tern-turn-relay'),'--package-dir',str(package_dir)]
         code,value=invoke(['onboarding','inspect',*profile],{})
-        assert code==0 and value['configured'] is False and value['running'] is False
+        assert code==0 and value.get('configured') is False and value.get('running') is False, {key:value.get(key) for key in ('code','error','exit_code','configured','running')}
         assert not (root/'plugin-data/tern-turn-relay/config.json').exists()
         code,value=invoke(['onboarding','apply',*profile],{'review':{}})
         assert code!=0 and not (root/'plugin-data/tern-turn-relay/config.json').exists()

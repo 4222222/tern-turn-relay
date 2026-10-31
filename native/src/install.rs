@@ -789,7 +789,8 @@ impl Transaction {
 fn rename_no_replace(from: &File, name: &CString, to: &File, destination: &CString) -> Result<()> {
     #[cfg(target_os = "linux")]
     let status = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             from.as_raw_fd(),
             name.as_ptr(),
             to.as_raw_fd(),

@@ -64,3 +64,11 @@ jobs:
           name: ${{ matrix.asset }}
           path: artifact/
           retention-days: 7
+      - name: Preserve failed smoke executable for diagnosis
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-${{ matrix.asset }}
+          path: native/target/${{ matrix.target }}/release/tern-turn-relay
+          if-no-files-found: ignore
+          retention-days: 1
