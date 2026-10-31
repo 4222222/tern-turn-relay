@@ -137,3 +137,5 @@ python tools/release.py package dist --assets .artifacts/release
 ### 验收边界
 
 自动化测试不等于真实 Cloudflare/Tern 连接验收。本版本的发布记录应分别列出五平台 CI、Windows 原生安装/Settings/隐藏输入/ACL、TLS 与 UDP 真实 Host 连接、Stop/Restore/升级卸载、原远端 daemon 与会话保留证据。没有对应记录的场景不能视为已通过；Windows ARM64 不在本次覆盖范围。维护者不能仅凭后台 `ready` 宣称原生 Host 已连接，也不能用 macOS 或 Linux 编译代替 Windows 真机验收。
+
+Windows 真机验收已验证：隐藏输入后向 Cloudflare 签发短期凭据、DPAPI 加密保存、TURN TLS 精确 Host 连接与双向流量、原远端 daemon 和会话保留、停止入口后恢复 TLS。当前测试网络的 TURN UDP 分配超时并失败关闭，未回退直连；不能据此声明 UDP 真实连接通过。Windows 后台启动同时验证了启动器及时返回与后台继续存活，而非仅检查一次 `ready`。

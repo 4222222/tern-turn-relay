@@ -67,7 +67,7 @@ Windows 信任现有 Tern 插件环境：不要求收紧宿主或普通数据目
 ## Windows 发布验收
 
 - 原生 OpenSSH Client 必须来自系统目录，公钥登录与 known_hosts 已核验；禁止通过 PATH、WSL 或 Git Bash 替代可信执行器。
-- 测试空格/中文 profile、现有继承 ACL 的安全收紧、junction/reparse point、硬链接、路径穿越/ADS/UNC、下载失败、并发准备和损坏资产；失败应保留已有配置与凭据。
+- 测试空格/中文 profile、普通宿主目录含额外 ACL 时仍可运行且权限不变、专用运行时的局部保护、junction/reparse point、硬链接、路径穿越/ADS/UNC、下载失败、并发准备和损坏资产；失败应保留已有配置与凭据。
 - 系统 PowerShell 等 Windows 组件可以具有系统维护的硬链接；例外仅限原生 `GetSystemDirectoryW` 所指 System32 子树内 `.exe` / `.com`，必须核验 SYSTEM/Administrators/TrustedInstaller 所有权及禁止所有非系统主体写入的 DACL。祖先固定与 reparse 拒绝不放宽，私有文件和用户目录程序仍拒绝硬链接。
 - Windows 原子 CAS 依赖启用 TxF 的本地 NTFS：在内核事务写锁保护下创建私有暂存文件、调用 `MoveFileTransacted` 并提交，拒绝同名替换交错造成的丢失更新。验收须包含确定性交错测试；不得以最终文件 ID 重查加普通 rename 代替事务保证，不得先删旧值或删除重写降级。
 - ReFS、FAT、网络卷、EFS 加密文件或 TxF 不可用时必须失败关闭。微软已弃用 TxF，未来可能移除，发布与系统升级时均需确认实际兼容性；参见 [编程限制](https://learn.microsoft.com/en-us/windows/win32/fileio/programming-considerations-for-transacted-fileio-) 与 [弃用说明](https://learn.microsoft.com/en-us/windows/win32/fileio/deprecation-of-txf)。
