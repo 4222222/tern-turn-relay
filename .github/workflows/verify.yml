@@ -1,6 +1,7 @@
 name: Verify release
 on:
   push:
+    branches-ignore: [rust-turn-prototype]
   pull_request:
 permissions:
   contents: read
