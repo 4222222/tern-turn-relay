@@ -77,7 +77,7 @@ public static class BootstrapBoundaryProbe {
         string input=Console.In.ReadToEnd();
         if(args[0]=="nonzero") { Console.Write("{\"ok\":false}"); return 23; }
         if(args[0]=="stderr") { Console.Error.Write("probe diagnostic"); Console.Write("{\"ok\":true}"); return 0; }
-        if(args[0]=="oversize") { Console.Write(new string('x',70000)); return 0; }
+        if(args[0]=="oversize") { Console.Write(new string('x',1048576)); return 0; }
         if(args[0]=="invalid-json") { Console.Write("not-json"); return 0; }
         var encoded=Array.ConvertAll(args,s=>"\""+Convert.ToBase64String(Encoding.UTF8.GetBytes(s))+"\"");
         Console.Write("{\"ok\":true,\"args\":["+String.Join(",",encoded)+"],\"input\":\""+Convert.ToBase64String(Encoding.UTF8.GetBytes(input))+"\"}");

@@ -263,7 +263,12 @@ public static class RelayBootstrapNative {
             $out = [RelayBootstrapNative]::ReadAsync($child.StandardOutput, 65536)
             $err = [RelayBootstrapNative]::ReadAsync($child.StandardError, 4096)
             $child.StandardInput.Write($inputText); $child.StandardInput.Close(); $inputText = $null
-            if (-not $child.WaitForExit(360000)) { $child.Kill(); throw 'timeout' }
+            $deadline = [Diagnostics.Stopwatch]::StartNew()
+            while (-not $child.WaitForExit(50)) {
+                # 超限读取任务已停止消费管道；立即终止本次子进程，避免写端堵塞。
+                if ($out.IsFaulted -or $err.IsFaulted) { $child.Kill(); $child.WaitForExit(); throw 'output' }
+                if ($deadline.ElapsedMilliseconds -ge 360000) { $child.Kill(); $child.WaitForExit(); throw 'timeout' }
+            }
             $outputText = $out.GetAwaiter().GetResult()
             if ($outputText.Length -gt 65536 -or $err.GetAwaiter().GetResult().Length -gt 0) { throw 'output' }
             [void]($outputText | ConvertFrom-Json)
