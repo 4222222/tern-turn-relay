@@ -88,11 +88,11 @@ def validate_client(request):
     integer(work['window'], 1, 1024)
     number(work['packet_timeout_s'], 0.05, 10)
     number(work['idle_s'], 0, 30)
-    number(work['renewal_soak_s'], 0, 300)
+    number(work['renewal_soak_s'], 0, 600)
     integer(work['renewals'], 0, 3)
     if type(work['recovery']) is not bool:
         raise ValueError('invalid_request')
-    number(work['run_timeout_s'], 1, 600)
+    number(work['run_timeout_s'], 1, 900)
     return request
 
 

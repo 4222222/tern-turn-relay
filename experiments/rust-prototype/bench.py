@@ -6,7 +6,7 @@ JSON line: {"version":1,"repetitions":2,"request":<v1 client request>,
 "lifecycle":true}. The same ephemeral credentials, pinned TURN IP/SNI, gateway
 key and peer are passed to both workers exclusively through anonymous stdin.
 Default short-run order is Python/Rust/Rust/Python; lifecycle adds one separate
-Python/Rust pair (150-second renewal soak, owned TLS abort/recovery, explicit Stop).
+Python/Rust pair (150s/330s renewal soaks, owned TLS abort/recovery, explicit Stop).
 Only redacted JSONL is emitted. Each comparison run is <=16 MiB and aggregate
 comparison throughput targets are <=64 MiB; lifecycle sends two tiny workloads.
 
@@ -53,6 +53,8 @@ LIMITATIONS = [
     'Stop latency includes pipe/scheduler delay until observed process exit; forced termination is not successful Stop.',
     'Two interleaved samples per implementation expose variation but do not establish statistical significance.',
     'Recovery injects only an owned TLS abort; it does not model WAN outages or provider-wide failures.',
+    'Lifecycle observation differs intentionally: Python soaks 150s with a 300s deadline; Rust soaks 330s with a 600s deadline. These are not matched-duration performance samples.',
+    'Production Python requests a 120s allocation lifetime; Rust retains its upstream library lifetime policy. The observed Rust server-granted lifetime was 600s, requiring a longer natural-renewal observation.',
 ]
 
 
@@ -61,7 +63,13 @@ def clean_event(value):
         raise ValueError('worker_protocol')
     event = value.get('event')
     if event in ('ready', 'done', 'stopped'):
-        return {'event': event}
+        result = {'event': event}
+        if event == 'ready' and 'allocation_lifetime_s' in value:
+            lifetime = value['allocation_lifetime_s']
+            if type(lifetime) not in (int, float) or not math.isfinite(lifetime) or not 0 < lifetime <= 86400:
+                raise ValueError('worker_protocol')
+            result['allocation_lifetime_s'] = lifetime
+        return result
     if event == 'error':
         return {'event': 'error', 'code': 'worker_reported_error'}
     if event == 'state':
@@ -342,7 +350,7 @@ async def run(args):
     target = repetitions * 2 * request['workload']['throughput_bytes']
     if target > 64 * 1024 * 1024:
         raise ValueError('aggregate_byte_cap')
-    if repetitions * 2 * request['workload']['run_timeout_s'] + (600 if lifecycle else 0) > 3600:
+    if repetitions * 2 * request['workload']['run_timeout_s'] + (900 if lifecycle else 0) > 3600:
         raise ValueError('aggregate_time_cap')
     peer = str(Path(__file__).with_name('python_peer.py').resolve(strict=True))
     source = str(Path(args.source_root).resolve(strict=True))
@@ -353,6 +361,9 @@ async def run(args):
     emit('experiment', version=1, order='alternating_AB_BA', repetitions=repetitions,
          comparison_target_bytes=target, lifecycle=lifecycle,
          payload_bytes=request['workload']['payload_bytes'], window=request['workload']['window'],
+         lifecycle_observation=({'python': {'renewal_soak_s': 150, 'run_timeout_s': 300, 'required_renewals': 1},
+                                 'rust': {'renewal_soak_s': 330, 'run_timeout_s': 600, 'required_renewals': 1}}
+                                if lifecycle else None),
          limitations=LIMITATIONS)
     results = []
     for index in range(repetitions):
@@ -363,9 +374,9 @@ async def run(args):
     if lifecycle:
         lifecycle_request = copy.deepcopy(request)
         work = lifecycle_request['workload']
-        work.update(latency_packets=1, throughput_bytes=0, renewal_soak_s=150,
-                    renewals=1, recovery=True, run_timeout_s=300)
-        for name in ('python', 'rust'):
+        work.update(latency_packets=1, throughput_bytes=0, renewals=1, recovery=True)
+        for name, soak, deadline in (('python', 150, 300), ('rust', 330, 600)):
+            work.update(renewal_soak_s=soak, run_timeout_s=deadline)
             validate_client(lifecycle_request)
             results.append(await run_one(commands[name], lifecycle_request, name, 1, 'lifecycle'))
     summary(results)

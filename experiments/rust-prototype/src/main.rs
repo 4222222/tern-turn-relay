@@ -175,8 +175,8 @@ async fn client(turn:TurnInput,peer:Peer,work:Workload,stop:watch::Receiver<bool
     if !(20..=MAX_PAYLOAD).contains(&work.payload_bytes) || !(1..=5000).contains(&work.latency_packets)
         || work.latency_packets*work.payload_bytes as u64>1024*1024 || work.throughput_bytes>16*1024*1024
         || !(1..=1024).contains(&work.window) || work.renewals>3 {return Err("invalid_request");}
-    finite(work.packet_timeout_s,0.05,10.)?;finite(work.idle_s,0.,30.)?;finite(work.renewal_soak_s,0.,300.)?;
-    let bound=finite(work.run_timeout_s,1.,600.)?;
+    finite(work.packet_timeout_s,0.05,10.)?;finite(work.idle_s,0.,30.)?;finite(work.renewal_soak_s,0.,600.)?;
+    let bound=finite(work.run_timeout_s,1.,900.)?;
     let (cfg,valid)=turn_config(turn)?;let peer_addr=address(&peer.host,peer.port)?;
     let mut buffers=WorkBuffers::new(key(&peer.key_hex)?,work.payload_bytes);
     let mut endpoint=tokio::select! {
