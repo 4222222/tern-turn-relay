@@ -340,7 +340,7 @@ pub(crate) async fn deploy(alias: &str, endpoint: &Value) -> Result<String> {
 
 async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
     let probe = common::run(
-        "/usr/bin/ssh",
+        &common::ssh_executable()?,
         &common::ssh_args(
             alias,
             "PATH=/usr/bin:/bin; export PATH; printf '%s\\n' \"$(uname -m)\" \"$HOME\"",
@@ -384,7 +384,7 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
     let helper = format!("{root}/{}/tern-turn-relay", asset.digest);
     let command = cache_command(&root, &asset.digest, asset.size, "probe");
     let probe = common::run(
-        "/usr/bin/ssh",
+        &common::ssh_executable()?,
         &common::ssh_args(alias, &command),
         None,
         Duration::from_secs(15),
@@ -397,7 +397,7 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
     };
     let command = cache_command(&root, &asset.digest, asset.size, "install");
     let output = common::run(
-        "/usr/bin/ssh",
+        &common::ssh_executable()?,
         &common::ssh_args(alias, &command),
         Some(&bytes),
         Duration::from_secs(150),
@@ -452,7 +452,7 @@ pub async fn provision(config: &Value) -> Result<Value> {
             .map_err(|_| failure("protocol_error"))?;
         input.push(b'\n');
         let output = common::run(
-            "/usr/bin/ssh",
+            &common::ssh_executable()?,
             &common::ssh_args(alias, &command),
             Some(&input),
             Duration::from_secs(30),
@@ -519,14 +519,17 @@ impl Gateway {
             common::shell_quote(&helper),
             common::shell_quote(state)
         );
-        let mut child = Command::new("/usr/bin/ssh")
+        let mut ssh_command = Command::new(common::ssh_executable()?);
+        ssh_command
             .args(common::ssh_args(alias, &command))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| failure("connectivity_uncertain"))?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        let mut child = ssh_command.spawn().map_err(|_| failure("connectivity_uncertain"))?;
+        #[cfg(windows)]
+        let (mut child, owned_job) = crate::windows_process::spawn(&mut ssh_command, false)?;
         let input = child.stdin.take().ok_or_else(|| failure("unknown"))?;
         let output = child.stdout.take().ok_or_else(|| failure("unknown"))?;
         let cancel = CancellationToken::new();
@@ -554,6 +557,8 @@ impl Gateway {
         }
         let config = config.clone();
         result.task = Some(tokio::spawn(async move {
+            #[cfg(windows)]
+            let _owned_job = owned_job;
             let mut input = input;
             let mut output = BufReader::new(output);
             let work = async {

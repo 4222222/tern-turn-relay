@@ -4,7 +4,7 @@
 
 ## 入口与秘密边界
 
-新版唯一运行入口是经固定 SHA-256 校验的 `tern-turn-relay` 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.4.0/tern-turn-relay`。
+新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.0/tern-turn-relay`；Windows 为 `native-runtime/0.5.0/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
 
 只在用户明确准备运行环境时，从已安装插件执行：
 
@@ -12,9 +12,23 @@
 /bin/sh "$PACKAGE/bootstrap-runtime.sh" "$DATA" --prepare
 ```
 
+Windows 10/11 x64 使用系统可信执行器与明确脚本路径；下例中的路径变量不含秘密，调用运算符逐个传递参数，支持空格与中文：
+
+```powershell
+& "$([Environment]::SystemDirectory)\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PACKAGE\bootstrap-runtime.ps1" "$DATA" --prepare
+```
+
+Windows `report`（或省略模式）只验证已安装的运行时；`--exec COMMAND ...` 只执行通过大小/散列/权限校验的程序，不下载。`--prepare` 下载固定仓库的固定版本 HTTPS 资产，受时限、大小、私有 stage 和原子目录发布约束。显式 Stop 可为旧版迁移准备缺失的控制程序；普通状态查询和加载不能触发准备。不要把 PowerShell 作为持续转发器。
+
 核对返回的 `binary` 位于预期私有版本目录。普通查询不得触发下载；插件加载本身也不准备运行环境。
 
-长期 Key 和临时凭据均不得放入 argv、环境变量、聊天、日志、报告或公开 JSON。自动化配置凭据使用匿名 stdin 管道或已有的 0600 私有输入文件；原生向导使用系统隐藏输入。新凭据先远程验证，再原子替换。替换和删除需要明确授权；取消保留原文件。
+插件中的所有实际命令通过平台 `--exec` 包装器重新验证后执行。下文 `BINARY ...` 表示原生命令及参数形态；自动化实际执行也应通过对应 bootstrap 的 `--exec ...`，不能仅凭路径存在或先前校验结果直启可能已改变的程序。`report`/`--exec` 不下载；只有明确准备操作和兼容旧后台的显式 Stop 可进入 `--prepare`。
+
+未配置加载不访问 Cloudflare。已配置安装只有在既有持久恢复授权、相同配置和精确 loopback Host 均存在时才能恢复后台，不自动添加或切换 Host；Stop 必须撤销恢复意图。实时查询失败时状态应为未知或不可用，不回读陈旧 `status.json` 冒充存活。
+
+长期 Key 和临时凭据均不得放入 argv、环境变量、聊天、日志、报告或公开 JSON。自动化配置凭据使用匿名 stdin 管道或已有私有明文输入文件（Unix 0600；Windows 当前用户及必要可信系统身份的受保护 DACL）；原生向导使用系统隐藏输入。新凭据先远程验证，再原子替换。Windows 持久化使用用户级 DPAPI，返回 `storage: windows-dpapi-user`；Unix 仍为 `private-file`。替换和删除需要明确授权；取消保留原文件。Windows 旧明文或其他用户无法解密的凭据需显式重新配置，不自动覆盖。
+
+Windows 信任现有 Tern 插件环境：不要求收紧宿主或普通数据目录的额外 ACL，不修改整个 Tern 目录权限。只有专用运行时、私有资源及 IPC 保留局部保护。用户级加密不防御已控制当前用户或能修改插件代码的本机进程；不得将这一模型描述为对宿主篡改的隔离。
 
 ## 已有配置优先
 
@@ -49,3 +63,13 @@
 - update/uninstall 走 onboarding，stdin `{"confirm":true}`，要求后台已停止。固定源更新；保留用户改动的文件和 SSH 规则。
 - 卸载不删除 Key、不撤销云端 Key、不关闭原 daemon。清理遗留运行环境前验证进程、安装、链接与回退引用。
 - 交付记录版本、CI/真实场景证据、安装路径、仍在运行的进程及保留资源，不公开私有配置或会话密钥。
+
+## Windows 发布验收
+
+- 原生 OpenSSH Client 必须来自系统目录，公钥登录与 known_hosts 已核验；禁止通过 PATH、WSL 或 Git Bash 替代可信执行器。
+- 测试空格/中文 profile、现有继承 ACL 的安全收紧、junction/reparse point、硬链接、路径穿越/ADS/UNC、下载失败、并发准备和损坏资产；失败应保留已有配置与凭据。
+- 系统 PowerShell 等 Windows 组件可以具有系统维护的硬链接；例外仅限原生 `GetSystemDirectoryW` 所指 System32 子树内 `.exe` / `.com`，必须核验 SYSTEM/Administrators/TrustedInstaller 所有权及禁止所有非系统主体写入的 DACL。祖先固定与 reparse 拒绝不放宽，私有文件和用户目录程序仍拒绝硬链接。
+- Windows 原子 CAS 依赖启用 TxF 的本地 NTFS：在内核事务写锁保护下创建私有暂存文件、调用 `MoveFileTransacted` 并提交，拒绝同名替换交错造成的丢失更新。验收须包含确定性交错测试；不得以最终文件 ID 重查加普通 rename 代替事务保证，不得先删旧值或删除重写降级。
+- ReFS、FAT、网络卷、EFS 加密文件或 TxF 不可用时必须失败关闭。微软已弃用 TxF，未来可能移除，发布与系统升级时均需确认实际兼容性；参见 [编程限制](https://learn.microsoft.com/en-us/windows/win32/fileio/programming-considerations-for-transacted-fileio-) 与 [弃用说明](https://learn.microsoft.com/en-us/windows/win32/fileio/deprecation-of-txf)。
+- 五个平台分别运行实际二进制测试。使用 `python tools/release.py manifest ASSET_DIR release.json` 生成真实五资产清单；合并所有目标的依赖许可，不遗漏 Windows crates。归档不能带占位散列。
+- 发布前记录 Windows 真机 Tern 0.9.8 Settings、隐藏凭据输入、真实 TLS/UDP 精确 Host、共享 Stop、Restore 不停止其他窗口、更新/卸载归属检查及原远端 daemon/会话不变证据。若未执行或无凭据，应明确写「未验证」，不能写成通过。

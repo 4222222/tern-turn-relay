@@ -2,13 +2,20 @@
 use crate::common::{self, Error, Options, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
 use std::time::Duration;
 
 pub const PLUGIN: &str = "tern-turn-relay";
@@ -18,6 +25,8 @@ const PACKAGE_FILES: &[&str] = &[
     "onboarding.luau",
     "work-queue.luau",
     "bootstrap-runtime.sh",
+    "bootstrap-runtime.ps1",
+    "platform.luau",
     "release.json",
     "LICENSE",
     "THIRD_PARTY_NOTICES.txt",
@@ -34,9 +43,11 @@ fn changed() -> Error {
 fn recovery_error() -> Error {
     Error::with_exit("recovery-required", "Installation failed and independent rollback was attempted; retained local files require manual recovery. No user changes were overwritten.", 7)
 }
+#[cfg(unix)]
 fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|_| io_error())
 }
+#[cfg(unix)]
 pub(crate) fn home() -> Result<PathBuf> {
     let path = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -44,11 +55,13 @@ pub(crate) fn home() -> Result<PathBuf> {
     common::safe_absolute(path.to_str().ok_or_else(io_error)?)?;
     Ok(path)
 }
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum AncestorPolicy {
     PrivateData,
     Executable { admin_gid: Option<libc::gid_t> },
 }
+#[cfg(unix)]
 fn directory_permissions_trusted(
     owner: libc::uid_t,
     group: libc::gid_t,
@@ -67,6 +80,7 @@ fn directory_permissions_trusted(
     };
     (owner == uid || owner == 0) && (mode & 0o022 == 0 || sticky || platform_admin)
 }
+#[cfg(unix)]
 fn trusted_directory_with_policy(file: &File, leaf: bool, policy: AncestorPolicy) -> Result<()> {
     let m = file.metadata().map_err(|_| io_error())?;
     let uid = unsafe { libc::getuid() };
@@ -78,6 +92,7 @@ fn trusted_directory_with_policy(file: &File, leaf: bool, policy: AncestorPolicy
     }
     Ok(())
 }
+#[cfg(unix)]
 fn trusted_directory(file: &File, leaf: bool) -> Result<()> {
     trusted_directory_with_policy(file, leaf, AncestorPolicy::PrivateData)
 }
@@ -112,14 +127,16 @@ fn executable_admin_gid() -> Result<Option<libc::gid_t>> {
         return Ok(Some(group.gr_gid));
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn executable_admin_gid() -> Result<Option<libc::gid_t>> {
     Ok(None)
 }
 /// Opens every ancestor using directory descriptors, never following symlinks.
+#[cfg(unix)]
 fn parent(path: &Path, create: bool) -> Result<Option<File>> {
     parent_with_policy(path, create, AncestorPolicy::PrivateData)
 }
+#[cfg(unix)]
 fn parent_with_policy(path: &Path, create: bool, policy: AncestorPolicy) -> Result<Option<File>> {
     common::safe_absolute(path.to_str().ok_or_else(io_error)?)?;
     let base = path.parent().ok_or_else(io_error)?;
@@ -155,6 +172,7 @@ fn parent_with_policy(path: &Path, create: bool, policy: AncestorPolicy) -> Resu
     }
     Ok(Some(current))
 }
+#[cfg(unix)]
 pub(crate) fn owned_path(path: &Path, directory: bool) -> Result<()> {
     let Some(parent) = parent(path, false)? else {
         return Ok(());
@@ -195,6 +213,8 @@ pub(crate) struct Snapshot {
     mode: u32,
     modified: (i64, i64),
     changed: (i64, i64),
+    #[cfg(windows)]
+    windows: crate::windows_security::FileStamp,
 }
 impl Snapshot {
     pub(crate) fn require_private(&self) -> Result<()> {
@@ -204,6 +224,7 @@ impl Snapshot {
         Ok(())
     }
 }
+#[cfg(unix)]
 fn snapshot_at(directory: &File, name: &CString, limit: usize) -> Result<Option<Snapshot>> {
     let fd = unsafe {
         libc::openat(
@@ -252,6 +273,7 @@ fn snapshot_at(directory: &File, name: &CString, limit: usize) -> Result<Option<
         changed: (m.ctime(), m.ctime_nsec()),
     }))
 }
+#[cfg(unix)]
 pub(crate) fn snapshot(path: &Path, limit: usize) -> Result<Option<Snapshot>> {
     let Some(directory) = parent(path, false)? else {
         return Ok(None);
@@ -263,6 +285,7 @@ pub(crate) fn snapshot(path: &Path, limit: usize) -> Result<Option<Snapshot>> {
     )
 }
 /// Atomic compare-and-swap with a pinned parent descriptor and fsynced private stage.
+#[cfg(unix)]
 pub(crate) fn replace(
     path: &Path,
     expected: Option<&Snapshot>,
@@ -331,6 +354,25 @@ pub(crate) fn replace(
     }
     result
 }
+#[cfg(windows)]
+pub(crate) fn home() -> Result<PathBuf> { crate::windows_security::home() }
+#[cfg(windows)]
+pub(crate) fn owned_path(path: &Path, directory: bool) -> Result<()> {
+    crate::windows_security::owned(path, directory)
+}
+#[cfg(windows)]
+pub(crate) fn snapshot(path: &Path, limit: usize) -> Result<Option<Snapshot>> {
+    Ok(crate::windows_security::snapshot(path, limit)?.map(|s| Snapshot {
+        bytes: s.bytes, dev: s.stamp.identity.volume, ino: s.stamp.identity.index,
+        mode: if s.stamp.private { 0o600 } else { 0o644 },
+        modified: (s.stamp.identity.written as i64, 0), changed: (s.stamp.identity.created as i64, 0), windows: s.stamp,
+    }))
+}
+#[cfg(windows)]
+pub(crate) fn replace(path: &Path, expected: Option<&Snapshot>, bytes: Option<&[u8]>, _mode: u32) -> Result<()> {
+    crate::windows_security::replace(path, expected.map(|s| (&s.windows, s.bytes.as_slice())), bytes)
+}
+
 fn json_bytes(value: &Value) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| io_error())?;
     bytes.push(b'\n');
@@ -350,6 +392,7 @@ pub(crate) struct Registration {
     dev: u64,
     ino: u64,
 }
+#[cfg(unix)]
 fn normalize_link_target(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io_error());
@@ -370,6 +413,7 @@ fn normalize_link_target(path: &Path) -> Result<PathBuf> {
     common::safe_absolute(result.to_str().ok_or_else(io_error)?)?;
     Ok(result)
 }
+#[cfg(unix)]
 pub(crate) fn registration(plugins: &Path) -> Result<Option<Registration>> {
     owned_path(plugins, true)?;
     let mut found = Vec::new();
@@ -425,6 +469,29 @@ pub(crate) fn registration(plugins: &Path) -> Result<Option<Registration>> {
     }
     Ok(found.pop())
 }
+#[cfg(windows)]
+pub(crate) fn registration(plugins: &Path) -> Result<Option<Registration>> {
+    owned_path(plugins, true)?;
+    let mut found = Vec::new();
+    let native = plugins.join(PLUGIN);
+    if let Some(directory) = crate::windows_security::directory(&native, false, false)? {
+        crate::windows_security::check_acl(&directory.file, false, true, false)?;
+        let id = crate::windows_security::identity(&directory.file, true)?;
+        found.push(Registration { marker: native.clone(), source: native, kind: "native", dev: id.volume, ino: id.index });
+    }
+    let marker = plugins.join(format!("{PLUGIN}.path"));
+    if let Some(s) = snapshot(&marker, 8192)? {
+        let text = std::str::from_utf8(&s.bytes).map_err(|_| io_error())?;
+        let source = PathBuf::from(text.trim_end_matches(['\r', '\n']));
+        common::safe_local_absolute(source.to_str().ok_or_else(io_error)?)?;
+        let directory = crate::windows_security::directory(&source, false, false)?.ok_or_else(io_error)?;
+        crate::windows_security::check_acl(&directory.file, false, true, false)?;
+        found.push(Registration { marker, source, kind: "linked", dev: s.dev, ino: s.ino });
+    }
+    if found.len() > 1 { return Err(Error::new("ambiguous-registration", "发现多个插件注册，已保留所有文件，请先消除歧义。")); }
+    Ok(found.pop())
+}
+
 #[derive(Clone)]
 pub(crate) struct Paths {
     pub data: PathBuf,
@@ -456,7 +523,16 @@ impl Paths {
     }
 }
 pub(crate) fn context(opts: &Options) -> Result<Paths> {
+    #[cfg(target_os = "macos")]
     let default = home()?.join("Library/Application Support/Tern");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let default = home()?.join(".config/tern");
+    #[cfg(windows)]
+    let default = crate::windows_security::profile()?;
+    #[cfg(windows)]
+    let default_data = crate::windows_security::state_dir()?.join("plugin-data").join(PLUGIN);
+    #[cfg(unix)]
+    let default_data = default.join("plugin-data").join(PLUGIN);
     let package_arg = opts.get("--package-dir").map(PathBuf::from);
     let supplied_data = opts.get("--data-dir").map(PathBuf::from);
     let native_profile = package_arg
@@ -475,15 +551,14 @@ pub(crate) fn context(opts: &Options) -> Result<Paths> {
         .get("--config-dir")
         .map(PathBuf::from)
         .or(native_profile)
-        .or_else(|| {
-            supplied_data
-                .as_ref()
-                .and_then(|p| p.parent().and_then(Path::parent))
-                .map(Path::to_path_buf)
-        })
+        .or_else(|| supplied_data.as_ref().and_then(|path| {
+            if path == &default_data { Some(default.clone()) }
+            else { path.parent().and_then(Path::parent).map(Path::to_path_buf) }
+        }))
         .unwrap_or(default.clone());
-    let data = supplied_data.unwrap_or_else(|| profile.join("plugin-data").join(PLUGIN));
-    if data != profile.join("plugin-data").join(PLUGIN) {
+    let expected_data = if profile == default { default_data } else { profile.join("plugin-data").join(PLUGIN) };
+    let data = supplied_data.unwrap_or_else(|| expected_data.clone());
+    if data != expected_data {
         return Err(Error::new(
             "context-mismatch",
             "Plugin data must belong to the selected Tern profile.",
@@ -584,7 +659,10 @@ pub(crate) fn current(paths: &Paths) -> Result<Option<Value>> {
     Ok(Some(common::load_config(&paths.config(), false)?))
 }
 pub(crate) fn lifecycle(paths: &Paths) -> Result<(File, File)> {
+    #[cfg(unix)]
     common::private_dir(&paths.data, true)?;
+    #[cfg(windows)]
+    crate::windows_security::directory(&paths.data, true, false)?.ok_or_else(io_error)?;
     common::private_dir(&paths.runtime(), true)?;
     let command = common::lock(&paths.runtime().join("command.lock"), true).map_err(|_| {
         Error::with_exit(
@@ -606,13 +684,19 @@ pub(crate) fn runtime_ready() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|p| {
+            #[cfg(windows)]
+            let p = crate::windows_security::normalize_system_path(&p).ok()?;
             owned_path(&p, false).ok()?;
-            let m = std::fs::symlink_metadata(p).ok()?;
-            Some(m.mode() & 0o111 != 0 && env!("CARGO_PKG_VERSION") == "0.4.0")
+            let m = std::fs::symlink_metadata(&p).ok()?;
+            #[cfg(unix)]
+            { Some(m.is_file() && m.mode() & 0o111 != 0) }
+            #[cfg(windows)]
+            { Some(m.is_file() && p.extension().is_some_and(|s| s.eq_ignore_ascii_case("exe"))) }
         })
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
     let binary = paths
         .tern
@@ -658,11 +742,23 @@ async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
     command.extend(args.iter().map(|s| (*s).to_owned()));
     common::run("/usr/bin/env", &command, None, Duration::from_secs(180)).await
 }
+#[cfg(windows)]
+async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
+    let binary = match &paths.tern {
+        Some(path) => path.clone(),
+        None => crate::windows_security::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData)?.join("Programs/Tern/tern.exe"),
+    };
+    let _executable = crate::windows_security::open(&binary, false, true)?.ok_or_else(io_error)?;
+    let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    crate::windows_process::run_with_env(binary.to_str().ok_or_else(io_error)?, &args, None, Duration::from_secs(180),
+        &[("TERN_CONFIG_DIR", paths.profile.to_str().ok_or_else(io_error)?)]).await
+}
+
 pub(crate) async fn verify_profile(paths: &Paths) -> Result<()> {
     let output = tern(paths, &["plugin", "dir"]).await?;
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| io_error())?
-        .trim_end_matches('\n');
+        .trim_end_matches(['\r', '\n']);
     if !output.status.success() || Path::new(text) != paths.plugins() {
         return Err(Error::new(
             "context-mismatch",
@@ -711,6 +807,8 @@ fn package_inventory(package: &Path) -> Result<Value> {
                 .to_str()
                 .ok_or_else(io_error)?
                 .to_owned();
+            #[cfg(windows)]
+            let name = name.replace('\\', "/");
             if name.len() > 1024 || files.len() >= 512 {
                 return Err(Error::new("package-limit", "Installed package inventory exceeds its safe ownership limit; all files were preserved."));
             }
@@ -849,6 +947,7 @@ impl Transaction {
     }
 }
 
+#[cfg(unix)]
 fn rename_no_replace(from: &File, name: &CString, to: &File, destination: &CString) -> Result<()> {
     #[cfg(target_os = "linux")]
     let status = unsafe {
@@ -876,6 +975,7 @@ fn rename_no_replace(from: &File, name: &CString, to: &File, destination: &CStri
     }
     Ok(())
 }
+#[cfg(unix)]
 fn rename_owned_directory(source: &Path, destination: &Path) -> Result<()> {
     owned_path(source, true)?;
     let m = std::fs::symlink_metadata(source).map_err(|_| io_error())?;
@@ -899,6 +999,7 @@ fn rename_owned_directory(source: &Path, destination: &Path) -> Result<()> {
     rename_no_replace(&from, &from_name, &to, &to_name)?;
     Ok(())
 }
+#[cfg(unix)]
 fn move_registration(paths: &Paths, expected: &Registration, destination: &Path) -> Result<()> {
     if registration(&paths.plugins())?.as_ref() != Some(expected) {
         return Err(changed());
@@ -915,6 +1016,23 @@ fn move_registration(paths: &Paths, expected: &Registration, destination: &Path)
     rename_no_replace(&from, &source, &to, &target)?;
     Ok(())
 }
+#[cfg(windows)]
+fn rename_owned_directory(source: &Path, destination: &Path) -> Result<()> {
+    let expected = crate::windows_security::path_identity(source, true)?;
+    crate::windows_security::move_owned(source, destination, Some(expected))
+}
+#[cfg(windows)]
+fn move_registration(paths: &Paths, expected: &Registration, destination: &Path) -> Result<()> {
+    if registration(&paths.plugins())?.as_ref() != Some(expected) { return Err(changed()); }
+    crate::windows_security::move_owned(&expected.marker, destination, Some((expected.dev, expected.ino)))
+}
+fn object_identity(path: &Path, directory: bool) -> Result<(u64, u64)> {
+    #[cfg(unix)]
+    { let _ = directory; let m = std::fs::symlink_metadata(path).map_err(|_| io_error())?; Ok((m.dev(), m.ino())) }
+    #[cfg(windows)]
+    { crate::windows_security::path_identity(path, directory) }
+}
+
 fn retire_ownership(tx: &mut Transaction, paths: &Paths, record: &Value) -> Result<()> {
     let before = snapshot(&paths.manifest(), 65536)?.ok_or_else(changed)?;
     if common::read_json(&paths.manifest(), true)? != *record {
@@ -1009,14 +1127,14 @@ impl Migration {
             .data
             .join("retained-packages")
             .join(format!("registration-{:032x}", rand::random::<u128>()));
-        let metadata = std::fs::symlink_metadata(&stage).map_err(|_| io_error())?;
+        let identity = object_identity(&stage, true)?;
         Ok(Self {
             original,
             native: paths.plugins().join(PLUGIN),
             stage,
             backup_marker,
             activated: false,
-            identity: (metadata.dev(), metadata.ino()),
+            identity,
         })
     }
     fn activate(&mut self, paths: &Paths) -> Result<()> {
@@ -1041,15 +1159,19 @@ impl Migration {
             }
             rename_owned_directory(&self.native, &self.stage)?;
         }
-        let backup = std::fs::symlink_metadata(&self.backup_marker).map_err(|_| io_error())?;
-        if (backup.dev(), backup.ino()) != (self.original.dev, self.original.ino) {
+        if object_identity(&self.backup_marker, self.original.kind == "native")? != (self.original.dev, self.original.ino) {
             return Err(changed());
         }
+        #[cfg(unix)]
+        {
         let from = parent(&self.backup_marker, false)?.ok_or_else(io_error)?;
         let to = parent(&self.original.marker, false)?.ok_or_else(io_error)?;
         let name = cstring(self.backup_marker.file_name().ok_or_else(io_error)?)?;
         let target = cstring(self.original.marker.file_name().ok_or_else(io_error)?)?;
         rename_no_replace(&from, &name, &to, &target)?;
+        }
+        #[cfg(windows)]
+        crate::windows_security::move_owned(&self.backup_marker, &self.original.marker, Some((self.original.dev, self.original.ino)))?;
         Ok(())
     }
 }
@@ -1338,6 +1460,11 @@ pub(crate) async fn manage(paths: &Paths, action: &str) -> Result<Value> {
         package_inventory(&reg.source)?
     };
     ensure_package_unchanged(&reg.source, &owned_hashes)?;
+    #[cfg(windows)]
+    if action == "uninstall" {
+        // 按已审核句柄移动注册，比让外部 CLI 对可变目录递归删除更严格。
+        return uninstall_retained(paths, &reg, previous.as_ref());
+    }
     if action == "update" {
         let retained = paths
             .data
@@ -1345,7 +1472,7 @@ pub(crate) async fn manage(paths: &Paths, action: &str) -> Result<Value> {
             .join(format!("pre-update-{:032x}", rand::random::<u128>()));
         let old_manifest = snapshot(&paths.manifest(), 65536)?;
         let old_config = snapshot(&paths.config(), 65536)?;
-        rename_owned_directory(&reg.source, &retained)?;
+        move_registration(paths, &reg, &retained)?;
         let command = tern(
             paths,
             &[
@@ -1399,8 +1526,11 @@ pub(crate) async fn manage(paths: &Paths, action: &str) -> Result<Value> {
                         .data
                         .join("retained-packages")
                         .join(format!("failed-update-{:032x}", rand::random::<u128>()));
-                    rename_owned_directory(&new.source, &rejected)?;
+                    move_registration(paths, &new, &rejected)?;
                 }
+                #[cfg(windows)]
+                crate::windows_security::move_owned(&retained, &reg.source, Some((reg.dev, reg.ino)))?;
+                #[cfg(unix)]
                 rename_owned_directory(&retained, &reg.source)?;
                 Ok(())
             })();
@@ -1471,13 +1601,21 @@ pub async fn run(args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     fn temporary() -> PathBuf {
+        #[cfg(unix)]
         let path = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("tern-install-test-{:032x}", rand::random::<u128>()));
+        #[cfg(windows)]
+        let path = std::env::temp_dir().join(format!("tern-install-test-{:032x}", rand::random::<u128>()));
+        #[cfg(unix)]
         std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        common::private_dir(&path, true).unwrap();
         path
     }
     #[test]
@@ -1489,8 +1627,11 @@ mod tests {
         replace(&file, Some(&old), Some(b"second"), 0o600).unwrap();
         assert!(replace(&file, Some(&old), Some(b"lost update"), 0o600).is_err());
         assert_eq!(snapshot(&file, 64).unwrap().unwrap().bytes, b"second");
+        #[cfg(unix)]
+        {
         symlink(&file, dir.join("link")).unwrap();
         assert!(snapshot(&dir.join("link"), 64).is_err());
+        }
         std::fs::hard_link(&file, dir.join("hard")).unwrap();
         assert!(snapshot(&file, 64).is_err());
         std::fs::remove_dir_all(dir).unwrap();
@@ -1573,12 +1714,15 @@ mod tests {
             .unwrap()
             .require_private()
             .is_ok());
+        #[cfg(unix)]
+        {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(snapshot(&path, 64)
             .unwrap()
             .unwrap()
             .require_private()
             .is_err());
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -1642,6 +1786,7 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn relative_legacy_links_normalize_without_following_filesystem_links() {
         assert_eq!(
@@ -1825,6 +1970,8 @@ mod tests {
         }
         let outside = root.join("outside");
         replace(&outside, None, Some(b"preserve external target"), 0o600).unwrap();
+        #[cfg(unix)]
+        {
         symlink(&outside, &intent).unwrap();
         assert_eq!(migrate(&paths).await.unwrap_err().code, "stopped-required");
         crate::intent::clear(&paths.runtime()).unwrap();
@@ -1833,8 +1980,29 @@ mod tests {
             b"preserve external target"
         );
         assert!(require_revoked_intent(&paths).is_ok());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn stale_registration_never_moves_a_replacement_directory() {
+        let root = temporary();
+        let package = root.join("plugins").join(PLUGIN);
+        let paths = Paths {
+            data: root.join("plugin-data").join(PLUGIN), package: package.clone(), profile: root.clone(),
+            ssh: root.join("ssh-config"), aliases: root.join("aliases"), tern: None,
+        };
+        replace(&package.join("plugin.toml"), None, Some(b"original"), 0o600).unwrap();
+        let reviewed = registration(&paths.plugins()).unwrap().unwrap();
+        std::fs::rename(&package, root.join("retained-original")).unwrap();
+        replace(&package.join("plugin.toml"), None, Some(b"user replacement"), 0o600).unwrap();
+        let destination = paths.data.join("retained-packages/removed");
+        assert_eq!(move_registration(&paths, &reviewed, &destination).unwrap_err().code, "review-changed");
+        assert!(!destination.exists());
+        assert_eq!(snapshot(&package.join("plugin.toml"), 64).unwrap().unwrap().bytes, b"user replacement");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn root_admin_group_write_is_allowed_only_for_executable_ancestry() {
         let executable = AncestorPolicy::Executable { admin_gid: Some(80) };

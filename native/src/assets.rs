@@ -3,18 +3,24 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 pub(crate) struct VerifiedAsset {
     pub file: File,
     pub digest: String,
     pub size: u64,
+    #[cfg(windows)]
+    _parent: crate::windows_security::Directory,
 }
 struct TemporaryAsset(PathBuf);
 impl Drop for TemporaryAsset {
@@ -42,6 +48,7 @@ pub fn manifest(directory: &Path) -> Result<Value> {
         "tern-turn-relay-darwin-x86_64",
         "tern-turn-relay-linux-arm64",
         "tern-turn-relay-linux-x86_64",
+        "tern-turn-relay-windows-x86_64.exe",
     ];
     if assets.len() != expected.len() {
         return Err(invalid());
@@ -62,12 +69,16 @@ pub fn manifest(directory: &Path) -> Result<Value> {
     Ok(value)
 }
 fn verify(path: &Path, row: &Value) -> Result<VerifiedAsset> {
+    #[cfg(unix)]
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| invalid())?;
+    #[cfg(windows)]
+    let crate::windows_security::Opened { mut file, _parent } = crate::windows_security::open(path, true, false)?.ok_or_else(invalid)?;
     let info = file.metadata().map_err(|_| invalid())?;
+    #[cfg(unix)]
     if !info.is_file()
         || info.uid() != unsafe { libc::geteuid() }
         || info.nlink() != 1
@@ -76,6 +87,8 @@ fn verify(path: &Path, row: &Value) -> Result<VerifiedAsset> {
     {
         return Err(invalid());
     }
+    #[cfg(windows)]
+    if Some(crate::windows_security::identity(&file, false)?.size) != row["size"].as_u64() { return Err(invalid()); }
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 32768];
     loop {
@@ -93,6 +106,8 @@ fn verify(path: &Path, row: &Value) -> Result<VerifiedAsset> {
         file,
         digest: row["sha256"].as_str().ok_or_else(invalid)?.to_owned(),
         size: info.len(),
+        #[cfg(windows)]
+        _parent,
     })
 }
 pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
@@ -107,8 +122,12 @@ pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
         }
     };
     let executable = std::env::current_exe().map_err(|_| invalid())?;
+    #[cfg(windows)]
+    let executable = crate::windows_security::normalize_system_path(&executable)?;
     let directory = executable.parent().ok_or_else(invalid)?;
     common::private_dir(directory, false)?;
+    #[cfg(windows)]
+    let _directory = crate::windows_security::directory(directory, false, true)?.ok_or_else(invalid)?;
     let _lock = common::lock(&directory.join("assets.lock"), true)?;
     let value = manifest(directory)?;
     let name = format!("tern-turn-relay-linux-{arch}");
@@ -165,6 +184,7 @@ pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
         return Err(invalid());
     }
     let temporary_path = directory.join(format!(".asset-{:032x}", rand::random::<u128>()));
+    #[cfg(unix)]
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -172,6 +192,8 @@ pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temporary_path)
         .map_err(|_| invalid())?;
+    #[cfg(windows)]
+    let crate::windows_security::Opened { mut file, _parent: _temporary_parent } = crate::windows_security::create_file(&temporary_path)?;
     let temporary = TemporaryAsset(temporary_path);
     let result = async {
         let mut stream = response.bytes_stream();
@@ -196,11 +218,16 @@ pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
         {
             return Err(invalid());
         }
+        #[cfg(unix)]
         file.set_permissions(std::fs::Permissions::from_mode(0o500))
             .map_err(|_| invalid())?;
         file.sync_all().map_err(|_| invalid())?;
         drop(file);
+        #[cfg(unix)]
         std::fs::rename(&temporary.0, &destination).map_err(|_| invalid())?;
+        #[cfg(windows)]
+        crate::windows_security::move_owned(&temporary.0, &destination, None)?;
+        #[cfg(unix)]
         File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(|_| invalid())?;
@@ -220,8 +247,12 @@ mod tests {
         fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("ttr-asset-{:032x}", rand::random::<u128>()));
+            #[cfg(unix)]
             std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            #[cfg(windows)]
+            common::private_dir(&path, true).unwrap();
             Self(path)
         }
     }
@@ -231,6 +262,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn verified_asset_keeps_the_validated_inode_when_path_is_replaced() {
         let fixture = Fixture::new();
@@ -254,9 +286,40 @@ mod tests {
     fn executable_with_matching_size_but_wrong_digest_is_rejected() {
         let fixture = Fixture::new();
         let path = fixture.0.join("helper");
-        std::fs::write(&path, b"altered").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::write(&path, b"altered").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        #[cfg(windows)]
+        crate::install::replace(&path, None, Some(b"altered"), 0o500).unwrap();
         let row = serde_json::json!({"sha256":hex::encode(Sha256::digest(b"trusted")),"size":7});
         assert!(verify(&path, &row).is_err());
+    }
+
+    #[test]
+    fn executable_with_wrong_size_is_rejected() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("helper");
+        crate::install::replace(&path, None, Some(b"trusted"), 0o500).unwrap();
+        let row = serde_json::json!({"sha256":hex::encode(Sha256::digest(b"trusted")),"size":8});
+        assert!(verify(&path, &row).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_asset_blocks_path_replacement_until_handle_closes() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("helper.exe");
+        crate::install::replace(&path, None, Some(b"trusted"), 0o500).unwrap();
+        let row = serde_json::json!({"sha256":hex::encode(Sha256::digest(b"trusted")),"size":7});
+        let mut asset = verify(&path, &row).unwrap();
+        assert!(std::fs::rename(&path, fixture.0.join("previous")).is_err());
+        assert!(std::fs::write(&path, b"altered").is_err());
+        let mut bytes = Vec::new();
+        asset.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"trusted");
+        drop(asset);
+        std::fs::rename(&path, fixture.0.join("previous")).unwrap();
     }
 }

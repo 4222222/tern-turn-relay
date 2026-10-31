@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "tern-turn-relay"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1223,6 +1223,7 @@ dependencies = [
  "turn",
  "webpki-roots",
  "webrtc-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

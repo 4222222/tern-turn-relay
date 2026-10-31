@@ -2,19 +2,17 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CString, OsStr},
     fmt,
     fs::File,
-    io::{Read, Write},
+    io::Read,
     net::Ipv4Addr,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
-    path::{Component, Path},
+    path::Path,
     process::Output,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::{ffi::{CString, OsStr}, io::Write, path::Component, os::{fd::{AsRawFd, FromRawFd}, unix::{ffi::OsStrExt, fs::MetadataExt}}};
+#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -153,9 +151,11 @@ pub fn fingerprint(value: &str) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn cname(value: &OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|_| path_error())
 }
+#[cfg(unix)]
 fn check_directory(file: &File, leaf_private: bool) -> Result<()> {
     let info = file.metadata().map_err(|_| path_error())?;
     let uid = unsafe { libc::geteuid() };
@@ -169,6 +169,7 @@ fn check_directory(file: &File, leaf_private: bool) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn directory_fd(path: &Path, create: bool, leaf_private: bool) -> Result<File> {
     if !path.is_absolute() {
         return Err(path_error());
@@ -222,13 +223,16 @@ fn directory_fd(path: &Path, create: bool, leaf_private: bool) -> Result<File> {
     check_directory(&directory, leaf_private)?;
     Ok(directory)
 }
+#[cfg(unix)]
 fn parent_fd(path: &Path) -> Result<(File, CString)> {
     let parent = directory_fd(path.parent().ok_or_else(path_error)?, false, false)?;
     Ok((parent, cname(path.file_name().ok_or_else(path_error)?)?))
 }
+#[cfg(unix)]
 pub fn private_dir(path: &Path, create: bool) -> Result<()> {
     directory_fd(path, create, true).map(|_| ())
 }
+#[cfg(unix)]
 fn check_file(file: &File, private: bool, limit: u64) -> Result<()> {
     let info = file.metadata().map_err(|_| path_error())?;
     if !info.is_file()
@@ -317,6 +321,7 @@ pub fn parse_json(data: &[u8]) -> Result<Value> {
         .map(|v| v.0)
         .map_err(|_| input_error())
 }
+#[cfg(unix)]
 pub fn read_json(path: &Path, private: bool) -> Result<Value> {
     let (parent, name) = parent_fd(path)?;
     let fd = unsafe {
@@ -358,6 +363,7 @@ pub fn read_json_stdin(limit: usize) -> Result<Value> {
     }
     parse_json(&data)
 }
+#[cfg(unix)]
 pub fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     let (parent, name) = parent_fd(path)?;
     let existing = unsafe {
@@ -408,6 +414,7 @@ pub fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     }
     result
 }
+#[cfg(unix)]
 pub fn lock(path: &Path, nonblocking: bool) -> Result<File> {
     let (parent, name) = parent_fd(path)?;
     let fd = unsafe {
@@ -437,6 +444,7 @@ pub fn lock(path: &Path, nonblocking: bool) -> Result<File> {
     }
     Ok(file)
 }
+#[cfg(unix)]
 pub fn is_locked(path: &Path) -> Result<bool> {
     match path.symlink_metadata() {
         Ok(_) => {}
@@ -556,7 +564,7 @@ pub fn validate_config(mut value: Value, allow_unprovisioned: bool) -> Result<Va
     for name in ["state_dir", "daemon_socket"] {
         safe_absolute(gateway[name].as_str().ok_or_else(input_error)?)?;
     }
-    safe_absolute(value["credential_file"].as_str().ok_or_else(input_error)?)?;
+    safe_local_absolute(value["credential_file"].as_str().ok_or_else(input_error)?)?;
     Ok(value)
 }
 pub fn load_config(path: &Path, allow_unprovisioned: bool) -> Result<Value> {
@@ -591,6 +599,7 @@ pub fn ssh_args(alias: &str, remote_command: &str) -> Vec<String> {
     args.extend([alias.to_owned(), remote_command.to_owned()]);
     args
 }
+#[cfg(unix)]
 async fn bounded_output<R: AsyncRead + Unpin>(reader: R) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     reader
@@ -607,7 +616,9 @@ async fn bounded_output<R: AsyncRead + Unpin>(reader: R) -> Result<Vec<u8>> {
     Ok(data)
 }
 // Every bounded helper owns a private process group, including SSH Match-exec children.
+#[cfg(unix)]
 struct OwnedProcessGroup(Option<libc::pid_t>);
+#[cfg(unix)]
 impl OwnedProcessGroup {
     fn terminate(&mut self) {
         if let Some(pid) = self.0.take() {
@@ -668,11 +679,13 @@ impl OwnedProcessGroup {
         }
     }
 }
+#[cfg(unix)]
 impl Drop for OwnedProcessGroup {
     fn drop(&mut self) {
         self.terminate();
     }
 }
+#[cfg(unix)]
 pub async fn run(
     program: &str,
     args: &[String],
@@ -747,6 +760,56 @@ pub async fn run(
         }
     }
 }
+#[cfg(windows)]
+pub async fn run(program: &str, args: &[String], input: Option<&[u8]>, deadline: Duration) -> Result<Output> {
+    crate::windows_process::run(program, args, input, deadline).await
+}
+
+pub fn safe_local_absolute(value: &str) -> Result<()> {
+    #[cfg(unix)]
+    { safe_absolute(value) }
+    #[cfg(windows)]
+    { crate::windows_security::validate_path(value) }
+}
+
+pub fn ssh_executable() -> Result<String> {
+    #[cfg(unix)]
+    { Ok("/usr/bin/ssh".to_owned()) }
+    #[cfg(windows)]
+    { crate::windows_security::ssh_executable() }
+}
+
+#[cfg(windows)]
+pub fn private_dir(path: &Path, create: bool) -> Result<()> {
+    crate::windows_security::directory(path, create, true)?.ok_or_else(path_error).map(|_| ())
+}
+#[cfg(windows)]
+pub fn read_json(path: &Path, private: bool) -> Result<Value> {
+    let snapshot = crate::install::snapshot(path, 65536)?.ok_or_else(|| Error::with_exit("not-found", "私有文件不存在。", 3))?;
+    if private { snapshot.require_private()?; }
+    parse_json(&snapshot.bytes)
+}
+#[cfg(windows)]
+pub fn atomic_json(path: &Path, value: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(value).map_err(|_| input_error())?;
+    bytes.push(b'\n');
+    if bytes.len() > 65536 { return Err(input_error()); }
+    let before = crate::install::snapshot(path, 1024 * 1024)?;
+    crate::install::replace(path, before.as_ref(), Some(&bytes), 0o600)
+}
+#[cfg(windows)]
+pub fn lock(path: &Path, nonblocking: bool) -> Result<File> {
+    crate::windows_security::lock(path, nonblocking, true)?.ok_or_else(path_error)
+}
+#[cfg(windows)]
+pub fn is_locked(path: &Path) -> Result<bool> {
+    match crate::windows_security::lock(path, true, false) {
+        Ok(_) => Ok(false),
+        Err(error) if error.code == "lock-busy" => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn unix_time() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -808,7 +871,9 @@ mod tests {
             false
         );
     }
+    #[cfg(unix)]
     struct PrivateTestDir(std::path::PathBuf);
+    #[cfg(unix)]
     impl PrivateTestDir {
         fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
@@ -821,11 +886,13 @@ mod tests {
             Self(root)
         }
     }
+    #[cfg(unix)]
     impl Drop for PrivateTestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[cfg(unix)]
     #[test]
     fn private_json_rejects_links_and_public_permissions() {
         use std::os::unix::fs::{symlink, PermissionsExt};
@@ -843,6 +910,7 @@ mod tests {
         assert!(read_json(&source, true).is_err());
         assert_eq!(read_json(&source, false).unwrap()["value"], "private");
     }
+    #[cfg(unix)]
     #[test]
     fn atomic_write_refuses_shared_inode_without_modification() {
         let root = PrivateTestDir::new();
@@ -856,6 +924,7 @@ mod tests {
             "original"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn lifecycle_observation_does_not_create_or_follow_locks() {
         use std::os::unix::fs::symlink;
@@ -875,7 +944,11 @@ mod tests {
     fn schema_migration_preserves_identity_and_rejects_null_pin() {
         let target_pin = format!("SHA256:{}", STANDARD_NO_PAD.encode([1u8; 32]));
         let gateway_pin = format!("SHA256:{}", STANDARD_NO_PAD.encode([2u8; 32]));
-        let old = json!({"schema":3,"target":{"name":"server","host":"8.8.8.8","port":8376,"user":"user","fingerprint":target_pin},"gateway":{"state_dir":"/home/user/gateway","daemon_socket":"/run/user/1000/tern.sock","fingerprint":gateway_pin},"listen_port":18377,"credential_file":"/home/user/key.json","dependency_dir":"/home/user/deps","ssh_destination":"server"});
+        #[cfg(unix)]
+        let credential = "/home/user/key.json".to_owned();
+        #[cfg(windows)]
+        let credential = crate::windows_security::home().unwrap().join("key.json").to_str().unwrap().to_owned();
+        let old = json!({"schema":3,"target":{"name":"server","host":"8.8.8.8","port":8376,"user":"user","fingerprint":target_pin},"gateway":{"state_dir":"/home/user/gateway","daemon_socket":"/run/user/1000/tern.sock","fingerprint":gateway_pin},"listen_port":18377,"credential_file":credential,"dependency_dir":"/home/user/deps","ssh_destination":"server"});
         let migrated = validate_config(old.clone(), false).unwrap();
         assert_eq!(migrated["schema"], 4);
         assert!(migrated.get("dependency_dir").is_none());
@@ -892,6 +965,7 @@ mod tests {
         bad["gateway"]["fingerprint"] = Value::Null;
         assert!(validate_config(bad, true).is_err());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_helper_cannot_leave_a_descendant_writing_later() {
         let root = PrivateTestDir::new();
@@ -914,6 +988,7 @@ mod tests {
             "owned descendant survived the operation deadline"
         );
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn group_cleanup_preserves_the_leaders_exit_status() {
         let output = run(

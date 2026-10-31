@@ -1,8 +1,8 @@
-name: Verify native release
+name: 验证原生发行版
 on:
   push:
-    branches: [main, rust-native-release]
-    paths: ['native/**', '.github/workflows/verify.yml', 'tools/**']
+    branches: [main, rust-native-release, feat/windows-native]
+    paths: ['native/**', '.github/workflows/verify.yml', 'tools/**', 'tests/**', '*.luau', 'bootstrap-runtime.*', 'plugin.toml', 'release.json']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -11,6 +11,18 @@ concurrency:
   group: native-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  luau:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建固定版本 Luau 测试解释器
+        run: |
+          git clone --depth 1 --branch 0.700 https://github.com/luau-lang/luau.git "$RUNNER_TEMP/luau"
+          cmake -S "$RUNNER_TEMP/luau" -B "$RUNNER_TEMP/luau-build" -DCMAKE_BUILD_TYPE=Release -DLUAU_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/luau-build" --target Luau.Repl.CLI --parallel 2
+      - name: Luau 平台和窗口行为测试
+        run: '"$RUNNER_TEMP/luau-build/luau" tests/run.luau'
   native:
     strategy:
       fail-fast: false
@@ -20,55 +32,69 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: tern-turn-relay-darwin-arm64
+            binary: tern-turn-relay
           - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: tern-turn-relay-darwin-x86_64
+            binary: tern-turn-relay
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             asset: tern-turn-relay-linux-x86_64
+            binary: tern-turn-relay
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: tern-turn-relay-linux-arm64
+            binary: tern-turn-relay
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: tern-turn-relay-windows-x86_64.exe
+            binary: tern-turn-relay.exe
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CARGO_BUILD_JOBS: '2'
       RUST_BACKTRACE: '0'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install Linux static toolchain
+      - name: 安装 Linux 静态工具链
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
-      - name: Resource snapshot
-        run: df -h . && (free -m || sysctl vm.swapusage)
-      - name: Behavioral tests
+      - name: 检查可用磁盘
+        run: python -c "import shutil; print(shutil.disk_usage('.'))"
+      - name: 发布工具行为测试
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Rust 行为测试
         run: cargo test --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
-      - name: Build release binary
+      - name: 构建发行程序
         run: cargo build --release --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
-      - name: Smoke actual binary
+      - name: 运行实际二进制
         run: |
-          native/target/${{ matrix.target }}/release/tern-turn-relay --version
-          native/target/${{ matrix.target }}/release/tern-turn-relay --help
-          python3 tools/release.py smoke native/target/${{ matrix.target }}/release/tern-turn-relay
-      - name: Collect artifact and licenses
-        run: |
-          mkdir -p artifact
-          cp native/target/${{ matrix.target }}/release/tern-turn-relay artifact/${{ matrix.asset }}
-          python3 tools/release.py notices artifact/THIRD_PARTY_NOTICES.txt --target ${{ matrix.target }}
-          shasum -a 256 artifact/${{ matrix.asset }}
+          native/target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+          native/target/${{ matrix.target }}/release/${{ matrix.binary }} --help
+          python tools/release.py smoke native/target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Windows 准备器行为测试
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: '& tests/bootstrap_spec.ps1 -Binary native/target/${{ matrix.target }}/release/${{ matrix.binary }}'
+      - name: 收集实际资产和目标依赖许可
+        run: python tools/release.py collect native/target/${{ matrix.target }}/release/${{ matrix.binary }} artifact --asset ${{ matrix.asset }} --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: artifact/
           retention-days: 7
-      - name: Preserve failed smoke executable for diagnosis
+      - name: 保留失败诊断程序
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostic-${{ matrix.asset }}
-          path: native/target/${{ matrix.target }}/release/tern-turn-relay
+          path: native/target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: ignore
           retention-days: 1

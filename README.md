@@ -1,13 +1,19 @@
 # Tern TURN Relay
 
-为 macOS Tern 提供 **Rust 原生 Cloudflare TURN 专用连接入口**。复用 Linux 服务器已有的 session daemon，不修改 Tern 二进制、原服务、系统路由或远端工作区；连接失败不自动退回直连。采用 [MPL-2.0](LICENSE)，依赖许可见 [第三方声明](THIRD_PARTY_NOTICES.txt)。不是 Tern 或 Cloudflare 官方产品。
+为 Windows / macOS Tern 提供 **Rust 原生 Cloudflare TURN 专用连接入口**。复用 Linux 服务器已有的 session daemon，不修改 Tern 二进制、原服务、系统路由或远端工作区；连接失败不自动退回直连。采用 [MPL-2.0](LICENSE)，依赖许可见 [第三方声明](THIRD_PARTY_NOTICES.txt)。不是 Tern 或 Cloudflare 官方产品。
 
 ## 支持范围
 
-- 本机：macOS Apple Silicon / Intel，Tern 0.9.8。
-- 远端：Linux x86_64 / arm64，已有 Tern 用户服务与 session daemon。
-- 本机和远端均不需要 Python、Cargo、系统级安装或本机编译。构建工具中的 Python 仅用于维护者打包和 CI，不属于运行时。
-- 已核验 SSH 主机密钥的 OpenSSH 别名，可非交互公钥登录；HostName 为公网 IPv4。ProxyJump、ProxyCommand、IPv6 和域名目标不在支持范围内。
+| 角色 | 系统与架构 | 发行程序 |
+|---|---|---|
+| 本机客户端 | Windows 10/11 x64，Tern 0.9.8 | `tern-turn-relay-windows-x86_64.exe` |
+| 本机客户端 | macOS Apple Silicon / Intel，Tern 0.9.8 | `tern-turn-relay-darwin-arm64` / `tern-turn-relay-darwin-x86_64` |
+| 远端 helper | Linux arm64 / x86_64，已有 Tern 用户服务与 session daemon | `tern-turn-relay-linux-arm64` / `tern-turn-relay-linux-x86_64` |
+
+- 不声明支持 Windows ARM64、x86 或 ARM64 上的 x64 仿真。Linux 资产用于远端 helper，不代表提供 Linux Tern 窗口设置向导。
+- Windows 需要系统自带的 Windows PowerShell 5.1 和 **原生 OpenSSH Client**（Windows 可选功能）；不需要 WSL、Git Bash、Python、Cargo 或本机编译。PowerShell 仅短暂校验/准备运行时，持续转发由 Rust 完成。构建工具中的 Python 仅用于维护者打包和 CI。
+- Windows 私有数据和受管理文件必须位于启用文件事务（TxF）的本地 NTFS 卷；ReFS、FAT、网络卷、EFS 加密文件或 TxF 不可用时拒绝写入。微软已弃用 TxF，未来系统可能移除；升级系统前需重新确认兼容性，不能把该依赖视为长期平台保证。
+- 需要已核验 SSH 主机密钥的 OpenSSH 别名，可非交互公钥登录；HostName 为公网 IPv4。先使用系统 OpenSSH 成功登录并核验主机指纹。ProxyJump、ProxyCommand、IPv6 和域名目标不在支持范围内。
 - 用户自己的 Cloudflare Realtime TURN Key；流量费用由该账户承担。插件不提供共享凭据，不读取浏览器登录状态，也不提供 OAuth 登录。
 
 ## 安装与首次配置
@@ -24,7 +30,9 @@ github.com/jiwangyihao/tern-turn-relay
 tern plugin install github.com/jiwangyihao/tern-turn-relay
 ```
 
-安装只注册插件。插件加载不下载程序、不访问 Cloudflare、不部署网关、不自动选择服务器。没有 Git 时，从 [Releases](https://github.com/jiwangyihao/tern-turn-relay/releases) 下载源码归档，核验 SHA-256，解压后在 Install… 选择含 `plugin.toml` 的目录。
+未配置的新安装只注册插件，不下载程序、不访问 Cloudflare、不部署网关、不选择服务器。已有安装保留原来的持久恢复语义：仅当用户此前显式连接并保存了恢复意图、配置精确匹配、同一 loopback Host 仍存在时，才可恢复已授权的后台；不会自动添加或切换原生 Host。显式 Stop 会撤销该恢复意图。
+
+没有 Git 时，从 [Releases](https://github.com/jiwangyihao/tern-turn-relay/releases) 下载源码归档，核验 SHA-256，解压后在 Install… 选择含 `plugin.toml` 的目录。
 
 1. 打开 **TURN → Settings: server, Cloudflare Key and private runtime**。首次显式打开设置时，下载与插件版本一致的 Rust 程序，验证固定 SHA-256 和大小，存入私有目录；需要至少 256 MiB 空闲空间。
 2. 选择 **配置 Cloudflare TURN Key**。先在 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls) 创建自己的 TURN Key，再通过系统隐藏输入窗口填写 Key ID 和 **TURN-key API token**，不要填写账户级 API Token。验证成功后保存；取消或验证失败保留原凭据。
@@ -33,6 +41,12 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 5. 选择 **连接 TURN TLS**。允许从本机 Host 或对应服务器 Host 发起；拒绝切换无关远端 Host，不自动回退直连。
 
 默认本机 UDP/TCP 端口为 `18377`。确有冲突时在 **高级：自定义本机端口** 修改，新端口会显示在确认页。更改运行中的配置前必须显式 Stop，向导不会擅自中断连接。
+
+Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 known_hosts，不要把 Git Bash/WSL 的 SSH 配置误当原生配置。路径含空格或中文可用；向导按 argv 元素传参，不拼接 shell 命令。默认本机入口只绑定 `127.0.0.1`，不要开放到公网。下载不使用系统 HTTP 代理；企业网络需要能直接访问 GitHub HTTPS 发行资产、Cloudflare TURN TLS/UDP 与原 SSH 服务。不要通过关闭证书或身份验证绕过网络限制。
+
+## 从 0.4.x 升级到 0.5.0
+
+先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.0/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
 
 ## 从 0.3.x 升级
 
@@ -62,7 +76,7 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 
 - 专用 frontend 使用独立身份，关闭 Iroh、relay 和 pkarr。原服务身份保留，只有明确 Restore 才走原地址。
 - 公网网关验证每次 SSH 控制会话的密钥、方向、flow 和重放窗口；拒绝裸 QUIC。控制通道失效后销毁旧代流量与密钥，旧数据不会跨代转发。
-- 始终核验 UNIX socket、SO_PEERCRED、daemon PID、进程启动时间、系统启动标识、可执行文件路径、参数、所有权与权限。同一进程/socket 上的 Tern 就地升级允许可执行文件 inode 改变；其他身份变化拒绝自动改绑。
+- Linux 远端始终核验 UNIX socket、SO_PEERCRED、daemon PID、进程启动时间、系统启动标识、可执行文件路径、参数、所有权与权限。同一进程/socket 上的 Tern 就地升级允许可执行文件 inode 改变；其他身份变化拒绝自动改绑。Windows 本机控制使用私有 ACL 与实时进程身份，不把旧状态文件或陈旧 PID 当作停止授权。
 - TLS 验证证书和主机名。证书、授权、未知协议及身份错误失败关闭，不作为网络抖动无限重试。
 - 已建立的 TURN 分配按有效期续期，以单调时钟约束真实到期时间；过期分配不继续转发。可恢复故障只重建受影响 flow；网关恢复单独处理，并重新核验原工作区。
 - 单 flow 上行队列最多 64 包 / 256 KiB，最多 16 条 flow；记录丢弃并保留健康连接。重试、冷却、闲置回收和 Stop 取消均有界。
@@ -72,22 +86,29 @@ TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体�
 
 ## 私有数据
 
-默认插件数据目录：
+以 Settings 检查和 Status 详情实际显示的插件数据路径为准；默认 profile 常见位置如下（自定义 profile 不共用数据）：
 
-```text
-~/Library/Application Support/Tern/plugin-data/tern-turn-relay/
-```
+| 系统 | 路径 |
+|---|---|
+| macOS | `~/Library/Application Support/Tern/plugin-data/tern-turn-relay/` |
+| Windows | 默认数据目录为 `%LOCALAPPDATA%\Tern\plugin-data\tern-turn-relay\`；插件代码位于 `%APPDATA%\Tern\plugins\tern-turn-relay\`，两者不是同一个目录。自定义 profile 以 Tern 实际传入并经核验的路径为准 |
 
-- `credentials/cloudflare.json`：Cloudflare Key，目录 0700、文件 0600，原子更新，拒绝符号链接与硬链接。**这是权限保护文件，不是 Keychain 加密存储。**
-- `native-runtime/0.4.0/`：经校验的本机 Rust 程序、发行清单，以及按需下载的 Linux helper。
+- `credentials/cloudflare.json`：Unix 使用目录 0700、文件 0600 的私有明文文件；Windows 保存用户级 DPAPI 密文，同时保留私有文件 DACL。Windows 密文不能直接复制给另一用户使用；旧明文文件不会静默加载，需在 Settings 显式重新配置，取消时保留原文件。输入文件仍须满足私有文件要求。
+- `native-runtime/0.5.0/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
 - `config.json`、`installation.json`：非秘密配置及安装归属。
-- `runtime/`：生命周期锁、控制 socket、状态和恢复意图。
+- `runtime/`：生命周期锁、原生控制入口、状态和恢复意图。不要自行删除锁或按 PID/进程名杀进程来绕过检查。
+- Windows 私有资源在创建时使用当前用户、SYSTEM 与 Administrators 的受保护 DACL；本机仅接受规范的盘符绝对路径，远端路径仍为 POSIX。原子比较并替换使用 TxF 内核事务写锁、事务内私有暂存文件、`MoveFileTransacted` 与提交，避免检查后同名替换造成丢失更新；不采用「检查后 rename」或「先删除再重写」降级。
+- Windows 采用局部保护：信任当前用户的 Tern 与插件安装环境，宿主、普通数据目录及祖先目录不因额外写权限而硬失败，也不自动修改这些目录的 ACL。专用运行时、凭据目录和控制通道仍使用局部访问控制；路径类型、对象身份、内容校验及审核后更改检测继续保留。**DPAPI 不能抵御当前用户权限被攻陷，或能修改 Tern 插件代码的本机进程。** Settings 会明确提示这一信任边界。
+- Windows 系统组件存在严格限定的硬链接例外：仅限 `GetSystemDirectoryW` 返回的 System32 子树内 `.exe` / `.com`，所有者必须为 SYSTEM、Administrators 或 TrustedInstaller，DACL 禁止包括当前用户在内的非系统主体写入，祖先仍固定并拒绝 reparse point。所有私有文件及用户目录中的程序仍拒绝硬链接。
+- TxF 及其支持的文件系统是上述写入保证的必要前提；不支持时失败关闭。普通读取、锁和程序校验仍保留各自的句柄保护。兼容限制与弃用状态参见微软的 [TxF 编程注意事项](https://learn.microsoft.com/en-us/windows/win32/fileio/programming-considerations-for-transacted-fileio-) 和 [TxF 弃用说明](https://learn.microsoft.com/en-us/windows/win32/fileio/deprecation-of-txf)。
 
 凭据不进入 Luau、命令参数、环境变量、日志或公开 JSON。临时 TURN 凭据和网关会话密钥只存在于可信进程内存及匿名管道。自定义 Tern profile 默认使用自己的 SSH 规则文件；已有安装保留记录中的规则归属。
 
 ## 更新、卸载与自动化
 
 在 Settings → 插件管理明确确认更新或卸载；两者都要求后台已停止。更新仅使用固定项目仓库。卸载先核验文件与 SSH 标记规则的所有权，用户修改过的资源不会被静默删除；保留配置、凭据、旧运行环境、远端网关身份和原 daemon。
+
+Windows 更新/卸载以文件身份校验后的注册目录移动完成。卸载解除注册并撤销自有 SSH 标记块，但将完整安装包保留到插件数据目录的 `retained-packages/`；返回 `installed_package_preserved`，不递归删除未知内容。保留包不是仍启用的插件；确认没有回退或归属需求前不要手工清除。
 
 Tern 自带删除插件仅移除插件目录，不执行本项目的 SSH 规则清理。删除本地凭据与在 Cloudflare 撤销 Key 是独立操作，不包含在卸载中。
 
@@ -102,4 +123,17 @@ cargo test --locked --manifest-path native/Cargo.toml
 cargo build --release --locked --manifest-path native/Cargo.toml
 ```
 
-CI 构建 macOS arm64/x86_64 和静态 Linux arm64/x86_64。`tools/release.py` 生成依赖许可、固定资产清单和可复现源码归档；构建工具不会自行上传或发布。源码归档包含 Rust 源码、Cargo.lock、Luau UI、许可和打包工具，不包含私有配置、凭据、运行目录、依赖缓存或验收截图。
+CI 在各自原生 runner 执行 macOS arm64/x86_64、静态 Linux arm64/x86_64、Windows x86_64 MSVC 的 Rust 行为测试和发行程序 `--version`、`--help`、smoke。每个平台的 `collect` 会执行实际程序核验版本与架构，并生成绑定目标、版本、大小和 SHA-256 的 `.receipt.json`。汇总清单和源码打包都重新核对五份记录及最终资产，拒绝旧版本、缺失记录或收集后被修改的文件。
+
+将五个平台产物与对应收集记录汇总到同一目录后执行：
+
+```sh
+python tools/release.py manifest .artifacts/release release.json
+python tools/release.py package dist --assets .artifacts/release
+```
+
+打包工具不自行上传或发布。源码归档包含 Rust 源码、Cargo.lock、Luau UI、两种 bootstrap、测试、许可和打包工具，不包含私有配置、凭据、运行目录、依赖缓存或验收截图。
+
+### 验收边界
+
+自动化测试不等于真实 Cloudflare/Tern 连接验收。本版本的发布记录应分别列出五平台 CI、Windows 原生安装/Settings/隐藏输入/ACL、TLS 与 UDP 真实 Host 连接、Stop/Restore/升级卸载、原远端 daemon 与会话保留证据。没有对应记录的场景不能视为已通过；Windows ARM64 不在本次覆盖范围。维护者不能仅凭后台 `ready` 宣称原生 Host 已连接，也不能用 macOS 或 Linux 编译代替 Windows 真机验收。

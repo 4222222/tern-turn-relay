@@ -1,49 +1,63 @@
-# Changelog
+# 更新记录
+
+## 0.5.0
+
+- 新增 Windows 10/11 x64 原生客户端与 `tern-turn-relay-windows-x86_64.exe`，保留 macOS arm64/x86_64 和 Linux arm64/x86_64；不声明支持 Windows ARM64。
+- 共用 Luau 平台边界选择私有可执行文件与系统启动器，路径含空格、中文时仍以独立参数传递。Windows 不依赖 WSL、Git Bash、Python 或 Cargo。
+- 新增短命 PowerShell 准备器：固定版本 HTTPS 下载、版本/大小/SHA-256 校验、流式上限、私有 DACL、拒绝 reparse point/硬链接/危险路径、内核互斥与同卷原子发布；失败保留旧运行时、配置和凭据。
+- Windows `--exec` 在启动已验证程序前释放注册包的校验句柄，允许更新/卸载移动注册目录；私有运行时、程序与副本清单的完整性保护持续到子进程退出。
+- Windows 原子 CAS 采用 TxF 内核事务以拒绝同名替换的丢失更新；要求启用事务的本地 NTFS，其他文件系统、EFS 或 TxF 不可用时失败关闭，不降级为检查后 rename。TxF 已被微软弃用且未来可能移除，兼容限制在支持范围中明确列出。
+- Settings 和显式旧版 Stop 可以准备缺失的控制程序；插件加载、Status 和 report 不下载。Stop 准备失败不假报停止、不修改 Host；Restore 不停止其他窗口共享后台。
+- 保持同一 Rust CLI 的发现、审核、应用、迁移、凭据、连接和安装管理接口；继续严格区分后台 ready 与精确原生 Host 已连接，不增加直连兜底。
+- 插件的所有原生命令统一经过 `--exec` 复验；周期状态改为有界、去重的实时查询，保存的状态文件不再充当存活或 Host 转换依据。
+- 保留严格限定的既有持久恢复授权：配置和精确 loopback Host 必须匹配，Stop 撤销意图，不新增自动 Host 连接。
+- Windows 隐藏终端输入使用原生按键事件；成功、取消、控制字符拒绝和超长输入都先清除未消费的粘贴尾部再恢复回显，清理失败不重新开启回显。
+- Windows 改为局部保护：普通宿主和祖先目录不因额外 ACL 被整体拒绝，不修改现有 Tern 目录权限；专用运行时与 IPC 仍受保护。长期凭据采用用户级 DPAPI，旧明文需明确重新配置，篡改或解密失败不回退明文；Settings 明示宿主信任边界。
+- Windows 服务锁交接容忍只读状态探测的短暂占锁；新增确定性交错和 Job 子孙进程作用范围回归。
+- 发行收集记录绑定实际程序版本、平台、大小与 SHA-256，汇总及打包再次检查最终文件，拒绝旧资产或收集后的篡改。
+- 扩展五平台原生 CI、Windows 准备器与 Luau/发布工具行为测试、真实五资产散列及目标依赖许可收集。测试覆盖不等于真实 TURN 验收；实际结果以发行记录为准。
 
 ## 0.4.0
 
-- Replace the shipped Python runtime and helper scripts with native Rust executables on macOS arm64/x86_64 and Linux arm64/x86_64; retain the native Luau configuration UI.
-- Verify version-pinned executable sizes and SHA-256 before activation; acquire the Linux helper through the same private release manifest rather than requiring remote Python.
-- Reuse a verified content-addressed remote helper without retransmitting its executable; upload only on a cache miss, retaining ownership, permission and SHA-256 checks.
-- Preserve the authenticated gateway, original session daemon identity, independent SSH TCP forwarding, bounded queues, allocation renewal and classified recovery contracts.
-- Add explicit stopped-state schema-3 migration to schema 4, preserving credentials, gateway pins, workspace binding and managed SSH-rule ownership. Old private runtimes are retained, not executed or blindly deleted.
-- Keep credential input and issuance in the native helper, reject duplicate JSON keys, and retain private-file, no-redirect, no-proxy and redacted-error boundaries.
-- Publish source, native assets, fixed checksums and third-party license notices. Rust reduces runtime overhead; no latency or throughput improvement is guaranteed.
+- 将随包 Python 运行时及 helper 替换为 macOS arm64/x86_64 与 Linux arm64/x86_64 原生 Rust 程序，保留原生 Luau 设置界面。
+- 激活前校验固定版本程序大小和 SHA-256；Linux helper 使用同一私有发行清单，不要求远端 Python。
+- 复用内容寻址的远端 helper，仅缓存缺失时上传，并保留归属、权限和散列检查。
+- 保留认证网关、原 session daemon 身份、独立 SSH TCP 转发、有界队列、分配续期及分类恢复。
+- 新增停止状态下的 schema 3→4 显式迁移，保留凭据、网关指纹、工作区绑定及 SSH 规则归属；旧私有运行时保留，不执行或盲目删除。
+- 凭据输入与签发留在原生 helper，拒绝重复 JSON 键，保留私有文件、禁止重定向/代理和脱敏错误边界。
+- 发布源码、原生资产、固定散列和第三方许可；不保证延迟或吞吐提升。
 
 ## 0.3.0
 
-- Install through Tern's native Preferences or `tern plugin install`; load safely before configuration without starting Python or network work.
-- Add a native settings wizard for private runtime preparation, hidden credential input, verified server/workspace selection, explicit configuration review, connection, update and uninstall.
-- Prepare a private pinned CPython 3.13.9 on macOS arm64/x86_64 with publisher SHA-256 verification, bounded downloads and extraction, and no system Python installation.
-- Discover actual service-owned UDP listeners and daemon relationships; preserve process/socket identity and reject changed reviews before applying.
-- Support native package configuration and ownership-checked legacy-link migration with independent rollback; preserve private data during native removal.
-- Keep secrets out of Luau, arguments, environment variables and public results; cancellation and failed validation leave existing credentials unchanged.
-- Keep automation available through a bounded JSON onboarding interface. Remote Linux Python 3.9+ remains required.
+- 支持 Tern Preferences 与 `tern plugin install` 原生安装；未配置时安全加载，不启动 Python 或网络任务。
+- 新增私有运行时准备、隐藏凭据输入、服务器/工作区核验、显式审核、连接、更新和卸载向导。
+- 在 macOS arm64/x86_64 准备固定 CPython 3.13.9，验证发布者散列并限制下载与解压，不安装系统 Python。
+- 发现原服务的实际 UDP 监听与 daemon 关系，保留进程/socket 身份，拒绝变化后的旧审核对象。
+- 支持归属校验的旧链接迁移与独立回滚，原生卸载保留私有数据。
+- 秘密不进入 Luau、参数、环境变量或公开结果；取消与验证失败保留原凭据。
+- 提供有界 JSON 自动化接口；本版本仍要求远端 Linux Python 3.9+。
 
 ## 0.2.2
 
-- Fix false daemon-identity rejection during in-place Tern upgrades: pin the process incarnation and socket, validate executable path/role/ownership, and migrate legacy executable-inode records only after stable identity checks pass.
-- Classify gateway control failures with sanitized reasons instead of collapsing heartbeat, EOF and protocol errors into one message.
-- Recover verified transient control failures with bounded backoff and fresh gateway authentication; discard all old-generation flows and session keys before forwarding resumes.
-- Recheck original daemon and gateway identity on reconnect, preserve independent SSH TCP sessions, and cancel pending recovery on Stop.
-- Surface gateway recovery progress and failure classification in connection details; keep unknown and security failures fail-closed.
+- 修复 Tern 就地升级时的错误 daemon 身份拒绝，固定进程实例并核验路径、角色、所有权和权限。
+- 网关控制故障按脱敏原因分类；已验证的瞬态故障采用有界退避与重新认证，旧代数据和密钥不跨代复用。
+- 重连时重新核验原工作区和网关身份，保留独立 SSH TCP；Stop 取消待处理恢复。
+- 在连接详情显示恢复进展；未知和安全错误继续失败关闭。
 
 ## 0.2.1
 
-- Refresh TURN allocations at half-life with monotonic expiry checks and bounded transient retries; never forward using an expired allocation.
-- Rebuild failed flow transports against the same authenticated gateway while preserving flow identity, sequence and replay state. Healthy sibling flows continue forwarding.
-- Bound demand-driven recovery with shared cooldown, keep active demand out of the idle-exit path, and cancel recovery on Stop or gateway loss.
-- Expose recovery state and cumulative successful allocation refreshes; clear resolved backend error indicators without hiding unrelated UI errors.
-- Cover renewal loss, authorization denial, expiry, transport migration and recovery cancellation with deterministic regression scenarios.
+- 按有效期中点续期 TURN 分配，以单调时钟约束实际到期；过期后不再转发。
+- 仅重建故障 flow，保留其身份、序列和重放状态，健康 flow 继续运行。
+- 使用共享冷却、有界恢复和闲置回收；Stop 或网关丢失取消恢复。
+- 展示恢复 flow 与续期计数，明确区分已恢复故障与其他错误。
+- 增加续期丢失、授权拒绝、过期、迁移和取消的确定性回归场景。
 
 ## 0.2.0
 
-- Add private Cloudflare TURN-key configuration, local status, remote credential checks and explicit local removal for terminal users and agents.
-- Discover existing remote Tern identity and daemon through strictly authenticated SSH; remove personal host aliases, paths and fingerprints from distributable defaults.
-- Install durable content-addressed packages, reuse compatible dependencies, preserve configuration on upgrade and validate ownership on uninstall.
-- Produce deterministic allowlisted release archives with SHA-256 checksums and MPL-2.0 licensing.
-- Retry transient network failures when allocating a new TURN flow at most twice after the initial attempt; certificate, authorization and identity failures remain fail-closed.
-- Treat flow-capacity exhaustion as bounded admission loss rather than permanently poisoning the relay; existing flows remain usable and new admission resumes after capacity is released.
-- Keep the independent authenticated gateway, existing daemon/session identity and explicit-only direct restoration.
-- Show compact binary-unit status summaries and persistent, reusable connection details instead of truncated diagnostic toasts.
-- Document human-confirmed Cloudflare Key creation and secret-safe agent-assisted configuration. OAuth login is not included in this release.
+- 提供私有 Cloudflare TURN Key 配置、本机状态、远端凭据验证及明确授权的删除。
+- 通过严格认证 SSH 发现原 Tern 身份和 daemon，发行默认值不包含个人主机、路径和指纹。
+- 内容寻址安装包、复用依赖、升级保留配置、卸载校验归属，发布可复现白名单归档与 MPL-2.0 许可。
+- 新分配瞬态故障最多额外重试两次；证书、授权和身份错误失败关闭。
+- flow 容量耗尽按有界准入丢弃处理，不影响健康连接；容量释放后恢复准入。
+- 保留独立认证网关、原 daemon/session 身份及仅显式 Restore 的直连恢复。
+- 显示二进制单位摘要与可复用完整详情；记录人工创建 Cloudflare Key 与秘密安全的自动化方式，不提供 OAuth。

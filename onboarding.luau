@@ -6,11 +6,13 @@ local function plain(value)
     return tostring(value or "—"):gsub("[%c]", " "):gsub("[\\`*_<>|%[%]]", "\\%0")
 end
 
-function M.new(api)
+function M.new(api, host)
+    local tern = host or tern
     local self = { active = false }
     local epoch = 0
     local menu, inspect, chooseServer, discover, review
-    local binary = tern.plugin.data .. "/native-runtime/0.4.0/tern-turn-relay"
+    local platform = require('./platform').new(tern.runtime, tern.plugin, tern.getenv)
+    local binary = platform.binary
     local queue = require('./work-queue').new({ now = tern.now, timer = tern.timer },
         function(token) return token == epoch end,
         function(cx)
@@ -77,15 +79,15 @@ function M.new(api)
         if not ok then receipt({ launchFailed = true }); queue:wake() end
     end
     local function backend(cx, action, input, callback)
-        local argv = { binary, "onboarding", action,
+        local argv = { "onboarding", action,
             "--data-dir", tern.plugin.data, "--package-dir", tern.plugin.dir }
-        run(cx, argv, input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update" or action == "migrate" or action == "discover") and 240000 or 60000), callback)
+        run(cx, platform.bootstrap("--exec", argv), input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update" or action == "migrate" or action == "discover") and 240000 or 60000), callback)
     end
     local function credentials(cx, snapshot)
-        local replacing = snapshot.credential_configured == true
+        local replacing = snapshot.credential_present == true or snapshot.credential_configured == true
         pick(cx, replacing and "替换现有 Cloudflare TURN Key？" or "配置自己的 Cloudflare TURN Key", {
             { label = replacing and "验证后替换" or "输入并验证", value = "configure",
-                detail = "系统隐藏输入；本机私有文件保存；将向 Cloudflare 签发短期凭据验证，流量费用由自己的账户承担" },
+                detail = platform.windows and "系统隐藏输入；Windows 用户级 DPAPI 加密保存；将向 Cloudflare 验证，费用由自己的账户承担" or "系统隐藏输入；本机私有文件保存；将向 Cloudflare 签发短期凭据验证，流量费用由自己的账户承担" },
             { label = "返回", value = "back" },
         }, function(answer, fresh)
             if answer.value == "back" then menu(snapshot, fresh); return end
@@ -204,7 +206,7 @@ function M.new(api)
     local function manage(snapshot, cx)
         pick(cx, "TURN 插件管理 · 配置和凭据保留", {
             { label = "更新插件", value = "update", detail = "从 github.com/jiwangyihao/tern-turn-relay 重新安装最新默认分支；会重载插件" },
-            { label = "卸载插件", value = "uninstall", detail = "移除本机插件和本插件管理的 SSH 规则；保留凭据、配置、远端服务及工作区" },
+            { label = "卸载插件", value = "uninstall", detail = platform.windows and "解除注册并撤销自有 SSH 规则；完整包保留至 retained-packages，配置和凭据保留" or "移除本机插件和本插件管理的 SSH 规则；保留凭据、配置、远端服务及工作区" },
             { label = "返回", value = "back" },
         }, function(answer, fresh)
             if answer.value == "back" then menu(snapshot, fresh); return end
@@ -219,9 +221,9 @@ function M.new(api)
             }, function(consent, current)
                 if consent.value ~= "confirm" then menu(snapshot, current); return end
                 current:toast("info", removing and "正在卸载 TURN 插件" or "正在更新 TURN 插件", "成功后插件将重载或移除，当前设置窗口可能关闭；配置与凭据保留。")
-                backend(current, answer.value, { confirm = true }, function(_result, completed)
+                backend(current, answer.value, { confirm = true }, function(result, completed)
                     finish()
-                    completed:toast("success", "TURN 插件管理完成", "配置、凭据和远端原服务均保留。")
+                    completed:toast("success", "TURN 插件管理完成", result.installed_package_preserved and "已解除注册；完整安装包保留在私有 retained-packages。配置、凭据和远端服务均保留。" or "配置、凭据和远端原服务均保留。")
                 end)
             end)
         end)
@@ -233,7 +235,7 @@ function M.new(api)
             { label = configured and "重新选择服务器" or "选择服务器并配置", value = "server",
                 detail = type(target) == "table" and (target.name or target.host or "已有配置") or "自动发现原服务、工作区与监听端口" },
             { label = snapshot.credential_configured and "更换 Cloudflare TURN Key" or "配置 Cloudflare TURN Key", value = "credentials",
-                detail = snapshot.credential_configured and "已有私有凭据；不会显示其内容" or "系统隐藏输入、验证成功后保存" },
+                detail = snapshot.credential_reconfigure_required and "已有凭据需重新配置为当前 Windows 用户的加密存储；原文件保留，替换需确认" or (snapshot.credential_configured and "已有私有凭据；不会显示其内容" or "系统隐藏输入、验证成功后保存") },
         }
         if snapshot.migration_required then
             table.insert(items, 1, { label = "迁移到 Rust 后端", value = "migrate", detail = "先 Stop；保留 Key、服务器身份、原 daemon 和 SSH 规则；不自动连接" })
@@ -283,16 +285,19 @@ function M.new(api)
     end
     function self.open(cx)
         if self.active then cx:toast("info", "TURN 设置已打开", "请完成当前选择或按 Esc 取消。"); return end
-        if tern.runtime.os ~= "macos" then cx:toast("error", "当前配置向导仅支持 macOS"); return end
+        if not platform.supported then cx:toast("error", "当前向导支持 macOS 与 Windows 10/11 x64"); return end
         if not api.available() then cx:toast("info", "连接操作仍在进行", "请等待结果后再打开设置。"); return end
         self.active = true
         epoch += 1
+        if platform.windows then
+            cx:toast("info", "Windows 局部保护", "信任当前 Tern 插件环境，不修改宿主目录权限；凭据使用用户级加密。能改写插件代码的本机程序仍可获取凭据。")
+        end
         if self.reviewed then confirmReview(cx); return end
         -- Only an explicit setup action can acquire a runtime; plugin loading never downloads.
         cx:toast("info", "正在准备 TURN 设置", "首次使用将下载并校验插件私有 Rust 程序；无需 Python 或本机编译。")
-        run(cx, { "/bin/sh", tern.plugin.dir .. "/bootstrap-runtime.sh", tern.plugin.data, "--prepare" }, {}, 320000,
+        run(cx, platform.bootstrap("--prepare"), {}, 320000,
             function(value, fresh)
-                if value.binary ~= binary then fail(fresh, "运行环境路径不符合插件私有目录约束。"); return end
+                if not platform.ready(value) then fail(fresh, "运行环境版本、状态或路径不符合插件私有目录约束。"); return end
                 api.runtimeReady(binary)
                 inspect(fresh)
             end)

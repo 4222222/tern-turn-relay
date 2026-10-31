@@ -93,7 +93,7 @@ pub async fn resolve(config: &Value) -> Result<Endpoint> {
         .ok_or_else(|| Error::new("ssh_resolution", "Missing SSH destination."))?;
     common::safe_alias(alias)?;
     let output = common::run(
-        "/usr/bin/ssh",
+        &common::ssh_executable()?,
         &["-G".into(), alias.into()],
         None,
         Duration::from_secs(5),

@@ -12,6 +12,14 @@ mod remote;
 mod ssh;
 mod ssh_config;
 mod transport;
+#[cfg(windows)]
+mod windows_process;
+#[cfg(windows)]
+mod windows_security;
+#[cfg(windows)]
+mod windows_ipc;
+#[cfg(windows)]
+mod windows_credentials;
 
 use common::{Error, Result};
 use serde_json::{json, Value};
@@ -50,6 +58,7 @@ async fn dispatch(args: &[String]) -> Result<Option<Value>> {
     }
 }
 fn main() {
+    #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
     }

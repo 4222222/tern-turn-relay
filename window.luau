@@ -1,7 +1,8 @@
+local function install(tern)
 -- Window-only: startup may resume an explicitly selected backend, never a native connection.
+local platform = require('./platform').new(tern.runtime, tern.plugin, tern.getenv)
 local configPath = tern.plugin.data .. "/config.json"
 local stateDir = tern.plugin.data .. "/runtime"
-local statePath = stateDir .. "/status.json"
 local MAX_JSON = 16384
 local POLL_MS = 3000
 local CONNECT_MS = 45000
@@ -31,7 +32,7 @@ local stepNative
 local helperRequests = {}
 local onboarding
 local setupError
-local nativeBinary = tern.plugin.data .. "/native-runtime/0.4.0/tern-turn-relay"
+local nativeBinary = platform.binary
 local helperReady = false
 local hasConfig = false
 do
@@ -39,6 +40,7 @@ do
     hasConfig = ok and exists
     local ready, installed = pcall(tern.fs.exists, nativeBinary)
     helperReady = ready and installed
+    -- Existence is only a UI/preparation hint; every execution revalidates via bootstrap.
     if not hasConfig then statusText = "TURN · 待配置" elseif not helperReady then statusText = "TURN · 待升级" end
 end
 
@@ -152,18 +154,10 @@ local function accept(value)
     elseif previousError and lastError == previousError:gsub("[%c]", " ") then lastError = nil end
 end
 
-local function readState()
-    local ok, raw = pcall(tern.fs.read, statePath, MAX_JSON)
-    if not ok then return false, "Cannot read bounded TURN status file; run TURN: Status for diagnostics." end
-    local value, err = decode(raw)
-    if not value then return false, err end
-    accept(value)
-    return true, nil
-end
 
 local function supported(cx)
-    if tern.runtime.os ~= "macos" then
-        report(cx, "This plugin currently supports macOS. Open TURN: Settings to prepare its private runtime.")
+    if not platform.supported then
+        report(cx, "当前客户端支持 macOS 与 Windows 10/11 x64；请从 Settings 显式准备私有运行时。")
         return false
     end
     return true
@@ -197,7 +191,7 @@ local function helper(command, mode, token, _cx, callback)
             callback(nil, "Open TURN Settings to prepare the verified native controller; no connection was changed.", _cx)
             return
         end
-        if _cx then _cx:toast("info", "正在准备原生 Stop 控制程序", "旧版后台仍在运行；程序校验完成后才执行 Stop。准备失败不会假报已停止。") end
+        if _cx then _cx:toast("info", "正在准备原生 Stop 控制程序", "仅此显式停止操作会准备缺失程序；校验失败会明确报告 Stop 未执行。") end
         local prepareTimeout = 320000
         local request = { token = token, deadline = tern.now() + prepareTimeout + HELPER_GRACE_MS }
         local function prepared(result, fresh, timedOut)
@@ -206,7 +200,7 @@ local function helper(command, mode, token, _cx, callback)
             helperRequests[request] = nil
             local parsed, value = false, nil
             if result and type(result.stdout) == "string" and #result.stdout <= MAX_JSON then parsed, value = pcall(tern.json.decode, result.stdout) end
-            if timedOut or not result or result.timed_out or result.status ~= 0 or not parsed or type(value) ~= "table" or value.ok ~= true or value.runtime_ready ~= true or value.binary ~= nativeBinary then
+            if timedOut or not result or result.timed_out or result.status ~= 0 or not parsed or not platform.ready(value) then
                 callback(nil, "Stop was NOT performed: native controller preparation failed or timed out. The existing backend may still be running; retry Settings before Stop.", fresh)
                 return
             end
@@ -217,7 +211,7 @@ local function helper(command, mode, token, _cx, callback)
         helperRequests[request] = true
         local receipt = runner:wait(token, prepareTimeout + HELPER_GRACE_MS, prepared)
         local ok = pcall(function()
-            tern.process.run({ "/bin/sh", tern.plugin.dir .. "/bootstrap-runtime.sh", tern.plugin.data, "--prepare" }, { timeout_ms = prepareTimeout }, function(result, _fresh)
+            tern.process.run(platform.bootstrap("--prepare"), { timeout_ms = prepareTimeout }, function(result, _fresh)
                 receipt(result)
                 runner:wake()
             end)
@@ -225,7 +219,7 @@ local function helper(command, mode, token, _cx, callback)
         if not ok then receipt({ launchFailed = true }); runner:wake() end
         return
     end
-    local argv = { nativeBinary, "relay", command,
+    local argv = { "relay", command,
         "--config", configPath, "--state-dir", stateDir }
     if mode then table.insert(argv, "--mode"); table.insert(argv, mode) end
     local timeout = (command == "start" or command == "resume") and 120000 or (command == "stop" and 20000 or 15000)
@@ -259,7 +253,7 @@ local function helper(command, mode, token, _cx, callback)
     helperRequests[request] = true
     local receipt = runner:wait(token, timeout + HELPER_GRACE_MS, consume)
     local ok = pcall(function()
-        tern.process.run(argv, { timeout_ms = timeout }, function(result, _fresh)
+        tern.process.run(platform.bootstrap("--exec", argv), { stdin = "", timeout_ms = timeout }, function(result, _fresh)
             receipt(result)
             runner:wake()
         end)
@@ -268,6 +262,38 @@ local function helper(command, mode, token, _cx, callback)
         receipt({ launchFailed = true })
         runner:wake()
     end
+end
+
+-- One live status request per generation, shared by polling, traffic and commands.
+-- Saved status.json is never read into the live cache or used as a Host gate.
+local function queryStatus(token, cx, callback, subscriber)
+    if statusInFlight and statusInFlight.token == token then
+        if subscriber and statusInFlight.subscribers[subscriber] then return end
+        if subscriber then statusInFlight.subscribers[subscriber] = true end
+        table.insert(statusInFlight.callbacks, callback)
+        return
+    end
+    local request = { token = token, callbacks = { callback }, subscribers = {} }
+    if subscriber then request.subscribers[subscriber] = true end
+    statusInFlight = request
+    helper("status", nil, token, cx, function(value, err, _fresh)
+        if statusInFlight ~= request then return end
+        statusInFlight = false
+        if err then
+            cache.state = "error"
+            cache.ok = false
+            cache.gateway_recovering = false
+            cache.recovering_flows = 0
+            cache.resume_mode = nil
+            cache.error = err
+            value = nil
+        elseif value then
+            accept(value)
+        end
+        for _, consume in ipairs(request.callbacks) do
+            runner:post(token, function(current) consume(value, err, current) end)
+        end
+    end)
 end
 
 local function exactHost(cx, address)
@@ -392,7 +418,6 @@ failNative = function(cx, message)
     report(cx, message)
     schedule()
 end
-local cancelConnect = failNative
 
 inspectNative = function(cx)
     if not cx then return end
@@ -418,15 +443,20 @@ schedule = function()
         timer = nil
         if token ~= generation then schedule(); return end
         runner:post(token, function(fresh)
-            if not pending or pending.action ~= "restore" then
-                local ok, err = readState()
-                if not ok then
-                    if pending then failNative(fresh, err) else report(fresh, err) end
-                end
+            if busy or (pending and pending.action == "restore") then
+                inspectNative(fresh)
+                refresh()
+                schedule()
+                return
             end
-            inspectNative(fresh)
-            refresh()
-            schedule()
+            queryStatus(token, fresh, function(_value, err, current)
+                if err then
+                    if pending then failNative(current, err) else report(current, err) end
+                end
+                inspectNative(current)
+                refresh()
+                schedule()
+            end)
         end)
     end)
 end
@@ -535,7 +565,7 @@ stepNative = function(cx, request)
     elseif phase == "traffic" then
         queueNative(request, "wait-traffic", 100)
         -- Live counters, not the periodically published file, gate old-Host removal.
-        helper("status", nil, request.token, cx, function(value, err, fresh)
+        queryStatus(request.token, cx, function(value, err, fresh)
             if pending ~= request or request.phase ~= "wait-traffic" then return end
             if value then accept(value) end
             if err then failNative(fresh, err); return end
@@ -657,7 +687,7 @@ local function discoverStartup(cx, request, authoritative)
     if not authoritative then
         -- Hosts may arrive after the first status. Recheck the helper before acting;
         -- another window may have stopped the backend and cleared its intent.
-        helper("status", nil, request.token, cx, function(value, err, fresh)
+        queryStatus(request.token, cx, function(value, err, fresh)
             if startup ~= request then return end
             if value then accept(value) end
             if err or not sameTarget(value, request.config) then
@@ -794,6 +824,8 @@ local function showDetails(cx)
     row("传输", cache.mode and string.upper(cache.mode))
     row("入口", cache.address or alias)
     row("当前操作", busy or (pending and pending.phase) or (statusInFlight and "查询中") or "无")
+    row("原生程序", nativeBinary)
+    row("私有数据", tern.plugin.data)
     row("自动恢复模式", cache.resume_mode)
     table.insert(rows, "\n## 流量与队列\n\n| 项目 | 数值 |\n| --- | --- |")
     row("上传 / 下载", bytes(cache.bytes_up) .. " / " .. bytes(cache.bytes_down))
@@ -837,7 +869,7 @@ end
 
 local function status(cx)
     cancelStartup()
-    if not hasConfig then onboarding.open(cx); return end
+    if not hasConfig then report(cx, "尚未配置；请显式打开 TURN Settings。查询状态不会下载运行时。"); showDetails(cx); return end
     if not supported(cx) then return end
     -- Status also recovers expired receipts if a timer was paused or interrupted.
     for request in pairs(helperRequests) do
@@ -854,32 +886,16 @@ local function status(cx)
         showDetails(cx)
         return
     end
-    if statusInFlight then
-        inspectNative(cx)
-        refresh()
-        showDetails(cx)
-        return
-    end
-    -- Inspection runs in this command's fresh queued tick, never in a process callback.
-    if pending then
-        if pending.action == "restore" then
-            inspectNative(cx)
-        else
-            local ok, err = readState()
-            if ok then inspectNative(cx) else cancelConnect(cx, err) end
-        end
-    end
     local token = generation
-    statusInFlight = true
-    helper("status", nil, token, cx, function(value, err, fresh)
-        statusInFlight = false
-        if value then accept(value) end
-        if err then report(fresh, err) end
+    queryStatus(token, cx, function(_value, err, fresh)
+        if err then
+            if pending and pending.action ~= "restore" then failNative(fresh, err) else report(fresh, err) end
+        end
         inspectNative(fresh)
         refresh()
         showDetails(fresh)
         schedule()
-    end)
+    end, "details")
 end
 
 disconnect = function(cx)
@@ -960,14 +976,14 @@ onboarding = require('./onboarding').new({
     end,
     connect = function(cx) convert("tls", cx, true) end,
     status = status,
-})
+}, tern)
 tern.command({ id = "setup", title = "Settings: server, Cloudflare Key and private runtime", group = "TURN",
     run = commandTick(function(cx) onboarding.open(cx) end) })
 
 tern.command({ id = "convert-tls", title = "Connect configured Host via TURN TLS", group = "TURN",
-    run = commandTick(function(cx) if hasConfig then convert("tls", cx, true) else onboarding.open(cx) end end) })
+    run = commandTick(function(cx) if hasConfig then convert("tls", cx, true) else report(cx, "请先显式打开 TURN Settings 完成配置；未改变 Host。") end end) })
 tern.command({ id = "convert-udp", title = "Connect configured Host via TURN UDP", group = "TURN",
-    run = commandTick(function(cx) if hasConfig then convert("udp", cx, true) else onboarding.open(cx) end end) })
+    run = commandTick(function(cx) if hasConfig then convert("udp", cx, true) else report(cx, "请先显式打开 TURN Settings 完成配置；未改变 Host。") end end) })
 tern.command({ id = "restore-direct", title = "Restore configured Host to direct (keep relay and SSH)", group = "TURN", run = commandTick(restore) })
 tern.command({ id = "disconnect", title = "Stop TURN for ALL windows and SSH TCP sessions (interrupts TCP)", group = "TURN", run = commandTick(disconnect) })
 tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, bytes and errors", group = "TURN", run = commandTick(status) })
@@ -981,7 +997,7 @@ end)
 -- A plugin reload need not emit window_start, and headless timer clocks may be
 -- paused. One asynchronous status query supplies the fresh owner context on load.
 if hasConfig and helperReady then
-helper("status", nil, generation, nil, function(value, err, cx)
+queryStatus(generation, nil, function(value, err, cx)
     if startupSeen then return end
     startupSeen = true
     if not cx then report(nil, "Startup status did not supply a fresh window context."); return end
@@ -999,3 +1015,8 @@ helper("status", nil, generation, nil, function(value, err, cx)
     discoverStartup(cx, request, true)
 end)
 end
+end
+
+-- Tern 直接加载窗口脚本；测试可注入同一接口而不复制状态机。
+if tern then install(tern) end
+return install

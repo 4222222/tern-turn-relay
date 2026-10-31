@@ -72,7 +72,7 @@ pub async fn resolve(alias: &str) -> Result<Value> {
     let mut args = common::ssh_args(alias, "");
     args.pop();
     args.insert(0, "-G".into());
-    let output = common::run("/usr/bin/ssh", &args, None, Duration::from_secs(15))
+    let output = common::run(&common::ssh_executable()?, &args, None, Duration::from_secs(15))
         .await
         .map_err(|_| failure("security_error"))?;
     if !output.status.success() {
@@ -166,7 +166,7 @@ pub async fn discover(
     let input = serde_json::to_vec(&request).map_err(|_| failure("protocol_error"))?;
     let command = format!("{} remote discover", common::shell_quote(&helper));
     let output = common::run(
-        "/usr/bin/ssh",
+        &common::ssh_executable()?,
         &common::ssh_args(alias, &command),
         Some(&input),
         Duration::from_secs(40),

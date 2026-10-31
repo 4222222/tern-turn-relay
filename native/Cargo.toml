@@ -1,6 +1,6 @@
 [package]
 name = "tern-turn-relay"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MPL-2.0"
 publish = false
@@ -25,6 +25,9 @@ webpki-roots = "=1.0.4"
 turn = "=0.17.2"
 stun = "=0.17.0"
 util = { package = "webrtc-util", version = "=0.17.1", default-features = false, features = ["conn", "vnet"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = 3

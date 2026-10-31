@@ -2,11 +2,14 @@
 use crate::common::{self, Error, Options, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::future::Future;
+use std::io::IsTerminal;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -54,7 +57,22 @@ fn load(path: &Path) -> Result<Value> {
             3,
         ));
     }
-    validate(common::read_json(path, true)?)
+    let stored = common::read_json(path, true)?;
+    #[cfg(windows)]
+    {
+        if stored.get("storage").and_then(Value::as_str) != Some("windows-dpapi-user")
+            || stored.get("schema").and_then(Value::as_u64) != Some(1)
+        {
+            return Err(Error::with_exit("credential-reconfigure-required", "Windows 凭据必须使用用户级加密存储；请显式重新配置，原文件已保留。", 4));
+        }
+        let ciphertext = hex::decode(stored.get("ciphertext").and_then(Value::as_str).ok_or_else(invalid)?).map_err(|_| invalid())?;
+        let mut plaintext = crate::windows_credentials::unprotect_storage(&ciphertext)?;
+        let parsed = serde_json::from_slice(&plaintext).map_err(|_| invalid());
+        for byte in &mut plaintext { unsafe { std::ptr::write_volatile(byte, 0); } }
+        return validate(parsed?);
+    }
+    #[cfg(unix)]
+    validate(stored)
 }
 pub fn configured(path: &Path) -> Result<bool> {
     if crate::install::snapshot(path, 65536)?.is_none() {
@@ -64,6 +82,11 @@ pub fn configured(path: &Path) -> Result<bool> {
     Ok(true)
 }
 pub fn default_path() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        return Ok(crate::windows_security::state_dir()?.join("plugin-data/tern-turn-relay/credentials/cloudflare.json"));
+    }
+    #[cfg(unix)]
     Ok(crate::install::home()?.join(
         "Library/Application Support/Tern/plugin-data/tern-turn-relay/credentials/cloudflare.json",
     ))
@@ -171,6 +194,7 @@ pub async fn issue(path: &Path, ttl: u64) -> Result<Value> {
     issue_key(&load(path)?, ttl).await
 }
 
+#[cfg(unix)]
 const DIALOG: &str = r#"try
     set keyID to text returned of (display dialog "Cloudflare TURN key ID" default answer "" with hidden answer buttons {"Cancel", "Continue"} default button "Continue" cancel button "Cancel" with title "Tern TURN setup")
     set apiToken to text returned of (display dialog "Cloudflare TURN-key API token (not an account token). Continue validates it with Cloudflare and saves it privately on this Mac." default answer "" with hidden answer buttons {"Cancel", "Validate and Save"} default button "Validate and Save" cancel button "Cancel" with title "Tern TURN setup")
@@ -193,10 +217,12 @@ fn parse_native(raw: &[u8]) -> Result<Value> {
     validate(json!({"provider":"cloudflare","turn_key_id":key,"api_token":token}))
 }
 
+#[cfg(unix)]
 struct TerminalMode<'a> {
     terminal: &'a std::fs::File,
     original: libc::termios,
 }
+#[cfg(unix)]
 impl Drop for TerminalMode<'_> {
     fn drop(&mut self) {
         unsafe {
@@ -204,6 +230,7 @@ impl Drop for TerminalMode<'_> {
         }
     }
 }
+#[cfg(unix)]
 fn hidden_line(terminal: &mut std::fs::File, prompt: &[u8], limit: usize) -> Result<String> {
     let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
     if unsafe { libc::tcgetattr(terminal.as_raw_fd(), original.as_mut_ptr()) } != 0 {
@@ -247,6 +274,13 @@ fn hidden_line(terminal: &mut std::fs::File, prompt: &[u8], limit: usize) -> Res
     io.write_all(b"\n").map_err(|_| invalid())?;
     String::from_utf8(bytes).map_err(|_| invalid())
 }
+#[cfg(windows)]
+fn terminal_key() -> Result<Value> {
+    let (id, token) = crate::windows_credentials::terminal_key()?;
+    validate(json!({"provider":"cloudflare","turn_key_id":id,"api_token":token}))
+}
+
+#[cfg(unix)]
 fn terminal_key() -> Result<Value> {
     let mut terminal = std::fs::OpenOptions::new()
         .read(true)
@@ -261,6 +295,12 @@ fn terminal_key() -> Result<Value> {
     )?;
     validate(json!({"provider":"cloudflare","turn_key_id":id,"api_token":token}))
 }
+#[cfg(windows)]
+async fn native_key() -> Result<Value> {
+    parse_native(&crate::windows_credentials::native_input().await?)
+}
+
+#[cfg(unix)]
 async fn native_key() -> Result<Value> {
     if cfg!(target_os = "macos") {
         let output = common::run(
@@ -286,13 +326,19 @@ async fn native_key() -> Result<Value> {
     }
 }
 fn confirm(authorized: bool, prompt: &[u8]) -> Result<()> {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-        let mut terminal = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .map_err(|_| invalid())?;
-        if hidden_line(&mut terminal, prompt, 16)? != "yes" {
+    if std::io::stdin().is_terminal() {
+        #[cfg(unix)]
+        let answer = {
+            let mut terminal = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .map_err(|_| invalid())?;
+            hidden_line(&mut terminal, prompt, 16)?
+        };
+        #[cfg(windows)]
+        let answer = crate::windows_credentials::hidden_line(prompt, 16)?;
+        if answer != "yes" {
             return Err(cancelled());
         }
     } else if !authorized {
@@ -304,20 +350,48 @@ fn confirm(authorized: bool, prompt: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+fn storage_kind() -> &'static str {
+    if cfg!(windows) { "windows-dpapi-user" } else { "private-file" }
+}
+
+fn storage_bytes(key: &Value) -> Result<Vec<u8>> {
+    let mut raw = serde_json::to_vec(key).map_err(|_| invalid())?;
+    #[cfg(windows)]
+    {
+        let protected = crate::windows_credentials::protect_storage(&raw);
+        for byte in &mut raw { unsafe { std::ptr::write_volatile(byte, 0); } }
+        return serde_json::to_vec(&json!({"schema":1,"storage":storage_kind(),"ciphertext":hex::encode(protected?)})).map_err(|_| invalid());
+    }
+    #[cfg(unix)]
+    {
+        raw.push(b'\n');
+        Ok(raw)
+    }
+}
+
 async fn save(path: &Path, before: &Option<crate::install::Snapshot>, key: Value) -> Result<Value> {
     issue_key(&key, 60).await?;
-    let mut raw = serde_json::to_vec(&key).map_err(|_| invalid())?;
-    raw.push(b'\n');
+    let raw = storage_bytes(&key)?;
     crate::install::replace(path, before.as_ref(), Some(&raw), 0o600)?;
     Ok(
-        json!({"configured":true,"validated":true,"replaced":before.is_some(),"provider":"cloudflare","storage":"private-file"}),
+        json!({"configured":true,"validated":true,"replaced":before.is_some(),"provider":"cloudflare","storage":storage_kind()}),
     )
 }
+#[cfg(windows)]
+fn mutation_lock_path(path: &Path) -> Result<PathBuf> {
+    const LOCK_NAME: &str = ".tern-credential-mutation.lock";
+    let filename = path.file_name().and_then(|name| name.to_str()).ok_or_else(invalid)?;
+    if filename.eq_ignore_ascii_case(LOCK_NAME) { return Err(invalid()); }
+    // Serialize the private credential directory so case aliases cannot bypass the lock.
+    Ok(path.parent().ok_or_else(invalid)?.join(LOCK_NAME))
+}
+
+#[cfg(unix)]
 fn mutation_lock_path(path: &Path) -> Result<PathBuf> {
     let filename = path.file_name().ok_or_else(invalid)?;
     let mut name = format!(
         ".tern-credential-{}.lock",
-        hex::encode(Sha256::digest(filename.as_bytes()))
+        hex::encode(Sha256::digest(filename.as_encoded_bytes()))
     );
     // Include the complete filename, not only its stem. Even a target deliberately
     // named like a generated lock must never become its own mutation lock.
@@ -380,14 +454,14 @@ pub async fn run(args: &[String]) -> Result<Value> {
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(default_path)?;
-    common::safe_absolute(path.to_str().ok_or_else(invalid)?)?;
+    common::safe_local_absolute(path.to_str().ok_or_else(invalid)?)?;
     let mut result = match action {
         "status" | "check" => {
             let key = load(&path)?;
             if action == "check" {
                 issue_key(&key, 60).await?;
             }
-            let mut summary = json!({"configured":true,"storage":"private-file","network_checked":action == "check"});
+            let mut summary = json!({"configured":true,"storage":storage_kind(),"network_checked":action == "check"});
             if action == "check" {
                 summary["validated"] = json!(true);
                 summary["probe_ttl_seconds"] = json!(60);
@@ -409,14 +483,14 @@ pub async fn run(args: &[String]) -> Result<Value> {
                 )?;
             }
             let key = if let Some(source) = opts.get("--input-file") {
-                load(Path::new(source))?
+                validate(common::read_json(Path::new(source), true)?)?
             } else if opts.flag("--stdin") {
-                if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+                if std::io::stdin().is_terminal() {
                     return Err(invalid());
                 }
                 validate(common::read_json_stdin(65536)?)?
             } else {
-                if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+                if !std::io::stdin().is_terminal() {
                     return Err(Error::with_exit(
                         "invalid-request",
                         "Use --stdin or --input-file for noninteractive configuration.",
@@ -526,12 +600,10 @@ mod tests {
         }
     }
     fn temporary_credentials() -> PathBuf {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!(
-                "tern-credential-lock-test-{:032x}",
-                rand::random::<u128>()
-            ));
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        #[cfg(windows)]
+        let root = crate::windows_security::normalize_system_path(&root).unwrap();
+        let root = root.join(format!("tern-credential-lock-test-{:032x}", rand::random::<u128>()));
         common::private_dir(&root, true).unwrap();
         root
     }
@@ -578,6 +650,7 @@ mod tests {
         assert!(!target.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn credential_mutation_lock_survives_atomic_target_replacement() {
         use std::{os::fd::AsRawFd, os::unix::fs::MetadataExt};
@@ -632,6 +705,7 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn lock_names_include_the_complete_filename_and_are_distinct_from_targets() {
         let first = Path::new("/private/credentials.json");
@@ -650,5 +724,55 @@ mod tests {
             assert_eq!(lock.parent(), target.parent());
             assert_ne!(mutation_lock_path(&lock).unwrap(), lock);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_aliases_cannot_bypass_credential_mutation_lock() {
+        let root = temporary_credentials();
+        let target = root.join("cloudflare.json");
+        let alias = root.join("CLOUDFLARE.JSON");
+        let held = mutation_lock(&target).unwrap();
+        assert_eq!(mutation_lock(&alias).unwrap_err().code, "lock-busy");
+        assert!(mutation_lock_path(&root.join(".tern-credential-mutation.lock")).is_err());
+        drop(held);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_storage_encrypts_and_rejects_tampering_and_plaintext() {
+        let root = temporary_credentials();
+        let path = root.join("cloudflare.json");
+        let key = json!({"provider":"cloudflare","turn_key_id":"test-key","api_token":"test-secret-not-for-production"});
+        let bytes = storage_bytes(&key).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-secret-not-for-production"));
+        crate::install::replace(&path, None, Some(&bytes), 0o600).unwrap();
+        assert_eq!(load(&path).unwrap(), key);
+        let mut stored: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut ciphertext = hex::decode(stored["ciphertext"].as_str().unwrap()).unwrap();
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 1;
+        stored["ciphertext"] = json!(hex::encode(ciphertext));
+        common::atomic_json(&path, &stored).unwrap();
+        assert!(load(&path).is_err());
+        common::atomic_json(&path, &key).unwrap();
+        assert_eq!(load(&path).unwrap_err().code, "credential-reconfigure-required");
+        assert_eq!(common::read_json(&path, true).unwrap(), key);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelled_windows_replacement_preserves_existing_credentials() {
+        let root = temporary_credentials();
+        let target = root.join("cloudflare.json");
+        let previous = json!({"provider":"cloudflare","turn_key_id":"test-key","api_token":"test-token"});
+        common::atomic_json(&target, &previous).unwrap();
+        let error = configure_native_input(&target, true, std::future::ready(Err(cancelled())))
+            .await.unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(common::read_json(&target, true).unwrap(), previous);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

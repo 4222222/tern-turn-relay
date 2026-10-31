@@ -64,6 +64,17 @@ fn candidate(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+#[cfg(windows)]
+fn machine_name() -> Result<String> {
+    let mut name = [0u16; 256];
+    let mut length = name.len() as u32;
+    if unsafe { windows_sys::Win32::System::WindowsProgramming::GetComputerNameW(name.as_mut_ptr(), &mut length) } == 0 {
+        return Err(request_error());
+    }
+    String::from_utf16(&name[..length as usize]).map_err(|_| request_error())
+}
+
+#[cfg(unix)]
 fn machine_name() -> Result<String> {
     let mut raw = [0u8; 256];
     if unsafe { libc::gethostname(raw.as_mut_ptr().cast(), raw.len()) } != 0 {
@@ -94,14 +105,19 @@ fn inspect(paths: &Paths) -> Result<Value> {
         .map(Path::new)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| paths.credential());
-    let credential_ready = crate::credentials::configured(&credential)?;
+    let credential_present = install::snapshot(&credential, 65536)?.is_some();
+    let (credential_ready, credential_reconfigure_required) = match crate::credentials::configured(&credential) {
+        Ok(ready) => (ready, false),
+        Err(error) if cfg!(windows) && matches!(error.code, "credential-reconfigure-required" | "credential-protection") => (false, true),
+        Err(error) => return Err(error),
+    };
     let runtime_ready = install::runtime_ready();
     let migration = migration_required(paths)?;
     let registration = install::registration(&paths.plugins())?
         .map(|r| r.kind)
         .unwrap_or("unregistered");
     Ok(
-        json!({"credential_configured":credential_ready,"configured":config.is_some(),
+        json!({"credential_configured":credential_ready,"credential_present":credential_present,"credential_reconfigure_required":credential_reconfigure_required,"configured":config.is_some(),
         "running":common::is_locked(&paths.runtime().join("service.lock"))?,
         "ssh_aliases":crate::ssh_config::aliases(&paths.aliases)?,"current_target":config.as_ref().map(|c| &c["target"]),
         "paths":paths.json(),"registration":registration,"migration_required":migration,
@@ -412,9 +428,10 @@ mod tests {
     use super::*;
     #[test]
     fn inspection_of_absent_profile_creates_nothing() {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("tern-inspect-test-{:032x}", rand::random::<u128>()));
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        #[cfg(windows)]
+        let base = crate::windows_security::normalize_system_path(&base).unwrap();
+        let root = base.join(format!("tern-inspect-test-{:032x}", rand::random::<u128>()));
         let paths = Paths {
             data: root.join("plugin-data").join(install::PLUGIN),
             package: root.join("plugins").join(install::PLUGIN),
@@ -431,12 +448,18 @@ mod tests {
         assert!(!root.exists());
     }
     fn paths() -> Paths {
+        #[cfg(windows)]
+        let home = std::path::PathBuf::from(r"C:\Users\example");
+        #[cfg(unix)]
+        let home = std::path::PathBuf::from("/home/example");
+        let profile = home.join("profile");
+        let data = profile.join("plugin-data").join(install::PLUGIN);
         Paths {
-            data: "/home/example/profile/plugin-data/tern-turn-relay".into(),
-            package: "/home/example/profile/plugins/tern-turn-relay".into(),
-            profile: "/home/example/profile".into(),
-            ssh: "/home/example/profile/plugin-data/tern-turn-relay/ssh-config".into(),
-            aliases: "/home/example/.ssh/config".into(),
+            ssh: data.join("ssh-config"),
+            data,
+            package: profile.join("plugins").join(install::PLUGIN),
+            profile,
+            aliases: home.join(".ssh/config"),
             tern: None,
         }
     }
@@ -480,7 +503,7 @@ mod tests {
         assert_eq!(first["schema"], 4);
         assert!(first.get("dependency_dir").is_none());
         let mut other = paths();
-        other.data = "/home/example/other/plugin-data/tern-turn-relay".into();
+        other.data = other.profile.join("other-plugin-data").join(install::PLUGIN);
         let distinct = configuration(&other, None, "server", 18377, &remote(), "machine")
             .unwrap()
             .0;

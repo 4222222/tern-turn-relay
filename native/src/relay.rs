@@ -14,10 +14,6 @@ use std::{
     fs::{self, File},
     io,
     net::{Ipv4Addr, SocketAddr},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
-    },
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -28,13 +24,19 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{UdpSocket, UnixListener, UnixStream},
+    net::UdpSocket,
     process::Command,
     sync::{mpsc, Mutex, Notify},
     task::{JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(unix)]
+use std::os::{fd::{AsRawFd, FromRawFd}, unix::fs::{FileTypeExt, MetadataExt, PermissionsExt}};
+#[cfg(unix)]
+use tokio::net::{UnixListener as ControlListener, UnixStream as ControlStream};
+#[cfg(windows)]
+use crate::windows_ipc::{Listener as ControlListener, Stream as ControlStream};
 
 const MAX_FLOWS: usize = 16;
 const MAX_PACKETS: usize = 64;
@@ -751,7 +753,7 @@ async fn read_line<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> Result
     }
 }
 
-async fn control_client(mut stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
+async fn control_client(mut stream: ControlStream, shared: Arc<Shared>) -> Result<()> {
     let request = common::parse_json(&read_line(&mut stream, 1024).await?)?;
     let result = match request["command"].as_str() {
         Some("status") => shared.snapshot(),
@@ -779,7 +781,8 @@ async fn control_client(mut stream: UnixStream, shared: Arc<Shared>) -> Result<(
         .map_err(|_| Error::new("control_ipc", "Local control socket could not close."))
 }
 
-async fn control_listener(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
+#[allow(unused_mut)]
+async fn control_listener(mut listener: ControlListener, shared: Arc<Shared>) -> Result<()> {
     let mut clients = JoinSet::new();
     loop {
         tokio::select! {
@@ -804,6 +807,7 @@ async fn control_listener(listener: UnixListener, shared: Arc<Shared>) -> Result
     Ok(())
 }
 
+#[cfg(unix)]
 fn remove_runtime(path: &Path, socket: bool) -> Result<()> {
     let info = match fs::symlink_metadata(path) {
         Ok(info) => info,
@@ -823,6 +827,37 @@ fn remove_runtime(path: &Path, socket: bool) -> Result<()> {
     fs::remove_file(path).map_err(|_| runtime_error())
 }
 
+#[cfg(windows)]
+fn remove_runtime(path: &Path, socket: bool) -> Result<()> {
+    if socket {
+        // Named pipes have no disk entry. Never delete an unrelated file with the old socket name.
+        return match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            _ => Err(runtime_error()),
+        };
+    }
+    let Some(before) = crate::install::snapshot(path, 16384)? else { return Ok(()); };
+    before.require_private()?;
+    crate::install::replace(path, Some(&before), None, 0o600)
+}
+
+#[cfg(windows)]
+async fn ipc(directory: &Path, command: &str, identity: Option<&str>) -> Result<Value> {
+    timeout(Duration::from_secs(2), async {
+        let (mut stream, expected_identity) = crate::windows_ipc::connect(directory).await?;
+        let mut request = serde_json::to_vec(&json!({"command":command,"service_id":identity}))
+            .map_err(|_| invalid())?;
+        request.push(b'\n');
+        stream.write_all(&request).await.map_err(|_| runtime_error())?;
+        let result = common::parse_json(&read_line(&mut stream, 16384).await?)?;
+        if result["service_id"].as_str() != Some(expected_identity.as_str()) {
+            return Err(Error::new("control_identity", "The live Windows relay identity does not match its private record."));
+        }
+        Ok(result)
+    }).await.map_err(|_| Error::new("control_timeout", "Local relay control pipe timed out."))?
+}
+
+#[cfg(unix)]
 async fn ipc(directory: &Path, command: &str, identity: Option<&str>) -> Result<Value> {
     let path = directory.join("control.sock");
     let info = fs::symlink_metadata(&path).map_err(|_| runtime_error())?;
@@ -833,7 +868,7 @@ async fn ipc(directory: &Path, command: &str, identity: Option<&str>) -> Result<
         return Err(runtime_error());
     }
     timeout(Duration::from_secs(2), async {
-        let mut stream = UnixStream::connect(path).await.map_err(|_| {
+        let mut stream = ControlStream::connect(path).await.map_err(|_| {
             Error::new("control_ipc", "Cannot reach the live relay control socket.")
         })?;
         let mut request = serde_json::to_vec(&json!({"command":command,"service_id":identity}))
@@ -918,6 +953,7 @@ fn same_service(
 
 async fn terminate_child(child: &mut tokio::process::Child) {
     if matches!(child.try_wait(), Ok(None)) {
+        #[cfg(unix)]
         if let Some(pid) = child.id() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
@@ -962,7 +998,12 @@ async fn start(config: &Value, config_path: &Path, directory: &Path, mode: Mode)
         ));
     }
     let lock = common::lock(&directory.join("service.lock"), true)?;
+    #[cfg(unix)]
     let fd = lock.as_raw_fd();
+    #[cfg(unix)]
+    let lock_argument = fd.to_string();
+    #[cfg(windows)]
+    let lock_argument = "acquire";
     let identity = hex::encode(rand::random::<[u8; 16]>());
     let executable = std::env::current_exe().map_err(|_| {
         Error::new(
@@ -970,6 +1011,8 @@ async fn start(config: &Value, config_path: &Path, directory: &Path, mode: Mode)
             "Cannot locate the native relay executable.",
         )
     })?;
+    #[cfg(windows)]
+    let executable = crate::windows_security::normalize_system_path(&executable)?;
     let mut command = Command::new(executable);
     command
         .arg("relay")
@@ -981,12 +1024,13 @@ async fn start(config: &Value, config_path: &Path, directory: &Path, mode: Mode)
         .arg("--mode")
         .arg(mode.name())
         .arg("--lock-fd")
-        .arg(fd.to_string())
+        .arg(lock_argument)
         .arg("--service-id")
         .arg(&identity)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 || libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
@@ -995,10 +1039,18 @@ async fn start(config: &Value, config_path: &Path, directory: &Path, mode: Mode)
             Ok(())
         });
     }
+    #[cfg(unix)]
     let mut child = command
         .spawn()
         .map_err(|_| Error::new("relay_spawn", "Unable to start the native relay daemon."))?;
+    #[cfg(unix)]
     drop(lock); // Child inherited the same flock open-file description.
+    #[cfg(windows)]
+    let (mut child, owned_job) = {
+        // command.lock serializes lifecycle changes until the child owns service.lock.
+        drop(lock);
+        crate::windows_process::spawn(&mut command, true)?
+    };
     let outcome = async {
         let until = Instant::now() + Duration::from_secs(90);
         while Instant::now() < until {
@@ -1028,15 +1080,53 @@ async fn start(config: &Value, config_path: &Path, directory: &Path, mode: Mode)
         .as_ref()
         .is_ok_and(|status| status["state"] == "ready")
     {
+        #[cfg(windows)]
+        let _ = owned_job.terminate();
         terminate_child(&mut child).await;
         if !common::is_locked(&directory.join("service.lock"))? {
             remove_runtime(&directory.join("control.sock"), true)?;
             remove_runtime(&directory.join("pid.json"), false)?;
         }
     }
+    #[cfg(windows)]
+    if outcome.as_ref().is_ok_and(|value| value["state"] == "ready") {
+        owned_job.release()?;
+    }
     outcome
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    static SERVICE_LOCK_BUSY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn acquire_service_lock(directory: &Path, deadline: Instant) -> Result<File> {
+    let path = directory.join("service.lock");
+    loop {
+        match common::lock(&path, true) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if error.code == "lock-busy" && Instant::now() < deadline => {
+                #[cfg(test)]
+                SERVICE_LOCK_BUSY_HOOK.with(|slot| {
+                    let hook = slot.borrow_mut().take();
+                    if let Some(hook) = hook { hook(); }
+                });
+                // Read-only status probes may briefly acquire this lock during handoff.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn inherited_lock(directory: &Path, raw: &str) -> Result<File> {
+    if raw != "acquire" { return Err(invalid()); }
+    acquire_service_lock(directory, Instant::now() + Duration::from_secs(5))
+}
+
+#[cfg(unix)]
 fn inherited_lock(directory: &Path, raw: &str) -> Result<File> {
     let fd = raw
         .parse::<i32>()
@@ -1129,17 +1219,21 @@ async fn serve(
         &json!({"pid":std::process::id(),"service_id":identity}),
     )?;
     common::atomic_json(&directory.join("status.json"), &shared.snapshot())?;
-    let listener = UnixListener::bind(directory.join("control.sock")).map_err(|_| {
+    #[cfg(unix)]
+    let listener = ControlListener::bind(directory.join("control.sock")).map_err(|_| {
         Error::new(
             "control_bind",
             "Cannot bind the private relay control socket.",
         )
     })?;
+    #[cfg(unix)]
     fs::set_permissions(
         directory.join("control.sock"),
         fs::Permissions::from_mode(0o600),
     )
     .map_err(|_| runtime_error())?;
+    #[cfg(windows)]
+    let listener = ControlListener::bind(&directory)?;
     let control_shared = shared.clone();
     let control = tokio::spawn(async move {
         if let Err(error) = control_listener(listener, control_shared.clone()).await {
@@ -1147,13 +1241,26 @@ async fn serve(
             control_shared.stop.cancel();
         }
     });
+    #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| runtime_error())?;
+    #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|_| runtime_error())?;
     let stop_signal = shared.stop.clone();
+    #[cfg(unix)]
     let signal_task = tokio::spawn(async move {
         tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {}, _ = stop_signal.cancelled() => {} }
+        stop_signal.cancel();
+    });
+    #[cfg(windows)]
+    let signal_task = tokio::spawn(async move {
+        let interrupt = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! { _ = interrupt => {}, _ = stop_signal.cancelled() => {} }
         stop_signal.cancel();
     });
     let (failures, mut failed) = mpsc::channel(32);
@@ -1330,8 +1437,8 @@ pub async fn run(args: &[String]) -> Result<Value> {
     }
     let config_path = PathBuf::from(options.required("--config")?);
     let directory = PathBuf::from(options.required("--state-dir")?);
-    common::safe_absolute(config_path.to_str().ok_or_else(invalid)?)?;
-    common::safe_absolute(directory.to_str().ok_or_else(invalid)?)?;
+    common::safe_local_absolute(config_path.to_str().ok_or_else(invalid)?)?;
+    common::safe_local_absolute(directory.to_str().ok_or_else(invalid)?)?;
     common::private_dir(&directory, true)?;
     let config = match common::load_config(&config_path, false) {
         Ok(config) => Some(config),
@@ -1503,14 +1610,18 @@ mod tests {
         assert!(read_line(&mut receiver, 8).await.is_err());
     }
 
+    fn private_test_directory(prefix: &str) -> PathBuf {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = crate::windows_security::normalize_system_path(&base).unwrap();
+        let directory = base.join(format!("{prefix}-{:032x}", rand::random::<u128>()));
+        common::private_dir(&directory, true).unwrap();
+        directory
+    }
+
     #[tokio::test]
     async fn stale_pid_and_status_are_not_liveness_or_stop_authority() {
-        let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "ttr-lifecycle-{}",
-            hex::encode(rand::random::<[u8; 16]>())
-        ));
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = private_test_directory("ttr-lifecycle");
         common::atomic_json(
             &directory.join("pid.json"),
             &json!({"pid":std::process::id(),"service_id":"stale"}),
@@ -1532,6 +1643,7 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn inherited_lock_must_match_private_service_lock_and_remain_exclusive() {
         use std::os::fd::IntoRawFd;
@@ -1560,5 +1672,48 @@ mod tests {
         fs::remove_file(path).unwrap();
         fs::remove_file(directory.join("other.lock")).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_lock_is_exclusive_and_rejects_foreign_transfer_modes() {
+        let directory = private_test_directory("ttr-lock");
+        assert!(inherited_lock(&directory, "123").is_err());
+        let owned = inherited_lock(&directory, "acquire").unwrap();
+        assert!(common::is_locked(&directory.join("service.lock")).unwrap());
+        assert!(common::lock(&directory.join("service.lock"), true).is_err());
+        drop(owned);
+        assert!(!common::is_locked(&directory.join("service.lock")).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_tolerates_a_read_only_status_probe() {
+        let directory = private_test_directory("ttr-lock-handoff");
+        let probe = common::lock(&directory.join("service.lock"), true).unwrap();
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let child_directory = directory.clone();
+        let child_reached = reached.clone();
+        let child_release = release.clone();
+        let child = std::thread::spawn(move || {
+            SERVICE_LOCK_BUSY_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    child_reached.wait();
+                    child_release.wait();
+                }));
+            });
+            inherited_lock(&child_directory, "acquire")
+        });
+        reached.wait();
+        drop(probe);
+        release.wait();
+        let owned = child.join().unwrap().unwrap();
+        assert!(common::is_locked(&directory.join("service.lock")).unwrap());
+        assert_eq!(acquire_service_lock(&directory, Instant::now()).unwrap_err().code, "lock-busy");
+        drop(owned);
+        assert!(!common::is_locked(&directory.join("service.lock")).unwrap());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

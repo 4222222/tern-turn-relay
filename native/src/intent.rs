@@ -89,6 +89,7 @@ mod tests {
         assert!(validate(&original, &bad).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_revokes_invalid_symlink_intent_without_touching_target() {
         use std::os::unix::fs::PermissionsExt;
@@ -111,5 +112,23 @@ mod tests {
         clear(&directory).unwrap();
         fs::remove_file(target).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn stop_revokes_invalid_json_before_a_new_resume_selection() {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = crate::windows_security::normalize_system_path(&base).unwrap();
+        let directory = base.join(format!("ttr-intent-{:032x}", rand::random::<u128>()));
+        common::private_dir(&directory, true).unwrap();
+        common::atomic_json(&directory.join("intent.json"), &json!({"invalid":true})).unwrap();
+        assert!(load(&config(), &directory).is_err());
+        clear(&directory).unwrap();
+        assert!(load(&config(), &directory).unwrap().is_none());
+        save(&config(), &directory, "tls").unwrap();
+        assert_eq!(load(&config(), &directory).unwrap().as_deref(), Some("tls"));
+        clear(&directory).unwrap();
+        clear(&directory).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 }
