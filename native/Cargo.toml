@@ -1,0 +1,33 @@
+[package]
+name = "tern-turn-relay"
+version = "0.4.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+libc = "0.2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.4"
+turn = "=0.17.2"
+stun = "=0.17.0"
+util = { package = "webrtc-util", version = "=0.17.1", default-features = false, features = ["conn", "vnet"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

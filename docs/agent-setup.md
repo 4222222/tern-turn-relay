@@ -1,84 +1,51 @@
-# 让 Agent 帮助创建和配置 Cloudflare TURN Key
+# Agent 原生配置与迁移指南
 
-适用场景：原生插件安装、已有 Key 导入、凭据失效检查、凭据替换及旧版迁移。普通用户优先使用 README 的原生设置向导；本页保留 agent／自动化接口。本版采用用户自有 Key，不提供 OAuth 登录，也不共享发布方的长期令牌。
+普通用户走 README 的 Tern 原生安装与设置向导。本指南用于获授权的自动化；不读取浏览器凭据，不创建或共享 Cloudflare Key。执行前检查磁盘、内存与现有连接，复用现有安装。
 
-## 用户可以直接发送给 Agent
+## 入口与秘密边界
 
-> 请按这个仓库的 docs/agent-setup.md 帮我配置 Tern TURN Relay。先检查本机和已有 SSH 别名；如果我还没有 Cloudflare TURN Key，指导我在自己的账户创建，或在我明确授权后通过官方 API 创建。秘密只通过隐藏输入或私有文件进入程序，不进入聊天、命令参数和日志。使用已有 daemon，不另建工作区。验证完整连接后告诉我保存了什么、如何撤销和卸载。
+新版唯一运行入口是经固定 SHA-256 校验的 `tern-turn-relay` 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.4.0/tern-turn-relay`。
 
-## 1. 只读预检
-
-先通过 Tern 原生安装入口注册插件。需要自动化时，在已安装的插件目录执行 `/bin/sh bootstrap-runtime.sh <该 profile 的插件数据目录> --prepare`，从成功 JSON 中取得私有 Python 路径；无需安装系统 Python。脚本仅在显式准备时下载固定版本，先核查平台、空间及用户授权。
-
-用该解释器运行 `onboarding.py inspect --data-dir <数据目录> --package-dir <安装目录>`，stdin 为 `{}`。该操作只读、不会请求 Cloudflare 或连接 SSH；返回凭据是否存在、当前目标、运行状态及 SSH 别名建议，绝不返回秘密。检查已有配置时保留其路径和所有权记录，不另造默认配置。
-
-`onboarding.py discover` 的 stdin 为 `{"ssh_destination":"my-server"}`。若返回 `code:"choose"`，展示候选工作区，再把用户所选 `candidate_id` 传回；可选 `listen_port` 必须显式指定并在后续选择时保留。SSH 主机密钥必须已核验，不自动接受未知身份。该发现接口从实际进程、socket 和监听端口生成配置，不需要猜目录或端口。
-
-完成标准：确认支持的平台、目标账户／服务器和已有 daemon；缺少 Key 时进入第 2 步，有 Key 时进入第 3 步。配置错误时不启动服务、不修改账户。
-
-## 2. 创建 Key：两条受控路径
-
-### 控制台路径（默认）
-
-1. 打开 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls)。用户自行完成登录和 MFA。
-2. 确认所选账户、Key 名称、用途以及账户可能承担的 TURN 流量费用。**创建前取得用户对该账户和操作的明确确认。** 不代替用户接受条款、开通付费功能或修改账单。
-3. 在该账户的 TURN 管理页面创建专用 Key。界面名称可能变化；以当前官方界面和 [官方创建说明](https://developers.cloudflare.com/realtime/turn/generate-credentials/) 为准。
-4. 用户在插件设置的系统隐藏输入窗口填写 Key ID 和 TURN-key API token；自动化可调用 `onboarding.py configure-credentials`，stdin 为 `{"replace":false}`。该动作需要可交互的 macOS 桌面。不要复制到聊天或保存含秘密的屏幕截图。
-
-### 官方 API 路径（用户明确授权时）
-
-创建接口为 `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/calls/turn_keys`，JSON 请求体可为 `{"name":"tern-turn-relay"}`。需要该账户范围的 **Calls Write** API Token。权限名和返回结构以 [官方 API](https://developers.cloudflare.com/api/resources/calls/subresources/turn/methods/create/) 为准。
-
-账户 API Token 只用于创建；成功响应中的 `result.uid` 是 TURN Key ID，`result.key` 是之后签发临时凭据所需的 TURN-key token。两者不能混淆。
-
-由 agent 编排 API 请求时，必须满足：
-
-- 创建前向用户展示账户标识、Key 名称、操作和费用归属，获得确认；只使用用户授权的账户级 token。
-- 账户 token 用进程内隐藏输入或用户指定的私有文件读取。禁止把秘密插值进 shell 命令、环境转储、工具调用参数、HTTP 调试日志或模型上下文。
-- 固定官方 HTTPS 主机并验证 TLS，禁用重定向；响应有大小和时间上限。捕获响应后直接在进程内映射为下述 legacy JSON，通过子进程 stdin 交给 `credentials.py configure --stdin`；禁止先输出整个创建响应。
-- 创建请求超时或连接丢失时，结果未知，先核查账户中的 Key，不盲目重试创建。
-- 如果云端已创建、但本地验证／保存失败，报告这个事实及非秘密的 Key 标识。不要继续创建更多 Key，也不要未经确认自动撤销。
-- 本版没有 `create-key` CLI。agent 可以用有凭据保护能力的官方集成执行上述 API，或指导用户使用控制台；不能声称仓库中存在该命令。
-
-完成标准：成功创建用户账户中的专用 Key，或明确确认使用其已有 Key。没有权限时说明缺少哪项授权，不尝试读取浏览器 Cookie 或其他应用的 token。
-
-## 3. 安全导入与验证
-
-普通用户使用插件设置入口。无桌面自动化时，保留下面的私有文件／管道接口；示例中的 `python3` 可替换为已准备的私有解释器。
-
-已有私有 JSON 文件可直接导入，agent 只需传路径，不读取或显示正文：
+只在用户明确准备运行环境时，从已安装插件执行：
 
 ```sh
-python3 credentials.py configure --input-file /absolute/private/source.json
+/bin/sh "$PACKAGE/bootstrap-runtime.sh" "$DATA" --prepare
 ```
 
-文件结构是 `provider`（值为 `cloudflare`）、`turn_key_id` 和 `api_token` 三个字段。`api_token` 必须是该 TURN Key 的令牌，而非账户 API Token。源文件必须属于用户、0600、非符号链接、非硬链接，目录祖先不得由其他用户写入。
+核对返回的 `binary` 位于预期私有版本目录。普通查询不得触发下载；插件加载本身也不准备运行环境。
 
-密码管理器或可信创建进程也可将这份 JSON 通过管道传给 `python3 credentials.py configure --stdin`。不要用含真实 token 的 `echo` 命令、heredoc 或聊天片段构造输入。
+长期 Key 和临时凭据均不得放入 argv、环境变量、聊天、日志、报告或公开 JSON。自动化配置凭据使用匿名 stdin 管道或已有的 0600 私有输入文件；原生向导使用系统隐藏输入。新凭据先远程验证，再原子替换。替换和删除需要明确授权；取消保留原文件。
 
-配置会先实际签发一份 60 秒临时凭据，仅验证并丢弃，成功后原子保存长期 Key。默认目标是插件数据目录下的 `credentials/cloudflare.json`。已有文件覆盖需确认；非交互操作必须有用户授权并加 `--replace`。失败保留原文件。
+## 已有配置优先
 
-存储是本地权限保护文件，不是加密 Keychain。长期 Key 不进入仓库、远端网关配置、状态栏或日志。正常运行的临时 TURN 凭据仅保留在本地 helper 内存中。
+调用 `BINARY onboarding inspect --data-dir DATA --package-dir PACKAGE`，stdin 为 `{}`。读取 configured、credential_configured、running、migration_required、registration、readiness 和路径信息，不根据旧状态文件猜测后台存活。自定义 profile 或尚未注册的验证目录必须显式传 `--config-dir PROFILE`；不跨 profile 推断全局归属。
 
-完成标准：`configure` 和 `check` 的脱敏 JSON 成功；只记录路径、是否验证、退出码。不得记录临时 TURN username/password 或长期 token。
+若 migration_required：
 
-## 4. 生成配置、安装和验证
+1. 告知 Stop 会中断共享 TURN 和入口 TCP SSH，但保留远端程序。
+2. 经用户授权执行 `BINARY relay stop --config CONFIG --state-dir RUNTIME`。核对 stopped 且恢复意图已撤销；不要依据陈旧 PID 杀进程。
+3. 调用 `BINARY onboarding migrate ...`，stdin `{"confirm":true}`。核验 schema3→4、原目标/网关指纹/daemon socket/凭据路径及 SSH 规则归属保留。
+4. 迁移不自动连接。只有获授权后显式 start；旧 Python 运行环境保留且不再被调用。
 
-保留 `discover` 返回的完整 `review`，向用户展示目标、原工作区、路径、SSH 规则文件和变更范围。取得授权后，调用 `onboarding.py apply`，stdin 为 `{"review":<原对象>,"authorize_replace":false}`；已有配置替换必须获准并设为 `true`。后端重新发现并逐项比较 review，目标或配置变化会拒绝应用，不能自行改写审核对象绕过检查。传输 JSON 时保留 null 字段，避免无配置标识被丢弃。
+迁移拒绝身份或所有权变化时，查明差异，不删除持久绑定、网关身份或锁来绕过校验。
 
-运行中的后台必须先由用户明确授权停止。原生安装保持配置／凭据独立；旧 `.path` 安装会在 review 明示迁移，也可在新版本源码目录显式执行 `install.py --migrate-native`。底层 `setup.py`、`install.py` 仍供高级自动化使用，但不再让普通用户逐个手动运行。
+## 新配置顺序
 
-切换必须使用插件原生命令，不打开原生连接对话框。验证至少包括：
+1. 安装原生插件并显式准备本机运行程序。
+2. 用户通过 Cloudflare 控制台创建自己的 TURN Key。只接受 TURN-key API token，不接受账户管理 Token，不代过 MFA 或服务条款。
+3. 导入并验证凭据；已配置时优先复用。
+4. 调用 `BINARY onboarding discover ...`，stdin `{"ssh_destination":"my-server"}`。必要时带整数 listen_port；返回 choose 时用返回的 candidate_id 再次 discover。
+5. discovery 将经过校验的架构匹配 Rust helper 放入远端私有缓存，用它只读核验服务。它不部署/启动另一个 session daemon；不要声称完全不写远端磁盘。
+6. 完整展示 review：目标、工作区、独立网关目录、入口端口、配置与 SSH 文件、旧配置摘要及更改清单。
+7. 获批后调用 apply，stdin `{"review":完整原样对象,"authorize_replace":已获替换授权}`。保留 JSON null；不自行拼改审核对象。后端重新发现并比较，变化时重新审核，不能重复提交旧 review。
+8. 配置成功不等于连接成功。经授权调用 `BINARY relay start --config CONFIG --state-dir RUNTIME --mode tls`；用户明确选择时才用 udp。
+9. 验证后台 ready、原生精确 Host 已连接、真实回流；检查原 daemon 与会话仍在。日志、抓包与截图须先避免或脱敏秘密。
 
-- 后台实时状态 ready，原生 Host connected，出现实际双向转发；两种状态分开判断。
-- 原 daemon 没有被替换，原 session/tab/pane 身份仍一致。
-- 用户同意断路测试后，停止专用后台不会自动变成直连；原服务继续可用。
-- 恢复并留下用户要求的连接状态。不要把一次成功当作长期 SLA 或更低延迟的证明。
+## 故障与管理
 
-## 5. 错误、撤销与交付
-
-`credentials.py` 退出码：0 成功；2 输入／参数错误；3 未配置；4 隐藏终端输入不可用；5 Cloudflare 请求或响应验证失败；6 取消、缺少变更确认或并发修改；7 私有文件／存储错误；130 中断。遇到错误先读取脱敏说明，不把远端原始响应打印出来。
-
-`remove-local` 仅移除本机凭据文件，不撤销 Cloudflare Key。云端撤销和账户 API Token 撤销是独立操作，必须明确授权。统一接口的 `update`／`uninstall` 要求 stdin 严格为 `{"confirm":true}` 且后台已停止；更新仅使用固定项目仓库，卸载保留配置、秘密、运行环境及远端身份。原生安装包会移除；旧版迁移保留的源码包不会盲删。
-
-交付时列出安装版本、运行状态、凭据保存位置、尚存限制、已执行的验证、仍运行的进程，以及如何升级／停止／卸载。无需包含任何秘密。
+- `relay status` 为实时控制查询；保存的状态文件不能证明进程存活。
+- 证书、凭据、身份和未知协议错误失败关闭。不得加直连兜底或关闭校验。
+- 共享 Stop 撤销恢复意图；Restore 仅恢复明确选择的原 Host，不等同于停止后台。
+- update/uninstall 走 onboarding，stdin `{"confirm":true}`，要求后台已停止。固定源更新；保留用户改动的文件和 SSH 规则。
+- 卸载不删除 Key、不撤销云端 Key、不关闭原 daemon。清理遗留运行环境前验证进程、安装、链接与回退引用。
+- 交付记录版本、CI/真实场景证据、安装路径、仍在运行的进程及保留资源，不公开私有配置或会话密钥。

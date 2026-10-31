@@ -31,15 +31,15 @@ local stepNative
 local helperRequests = {}
 local onboarding
 local setupError
-local managedPython = tern.plugin.data .. "/managed-python/python/bin/python3"
-local helperPython = "/usr/bin/python3"
+local nativeBinary = tern.plugin.data .. "/native-runtime/0.4.0/tern-turn-relay"
+local helperReady = false
 local hasConfig = false
 do
     local ok, exists = pcall(tern.fs.exists, configPath)
     hasConfig = ok and exists
-    local ready, installed = pcall(tern.fs.exists, managedPython)
-    if ready and installed then helperPython = managedPython end
-    if not hasConfig then statusText = "TURN · 待配置" end
+    local ready, installed = pcall(tern.fs.exists, nativeBinary)
+    helperReady = ready and installed
+    if not hasConfig then statusText = "TURN · 待配置" elseif not helperReady then statusText = "TURN · 待升级" end
 end
 
 local function text(value, max)
@@ -192,7 +192,40 @@ runner = require('./work-queue').new({ now = tern.now, timer = tern.timer },
     end)
 
 local function helper(command, mode, token, _cx, callback)
-    local argv = { helperPython, "-E", "-s", "-B", tern.plugin.dir .. "/relay.py", command,
+    if not helperReady then
+        if command ~= "stop" then
+            callback(nil, "Open TURN Settings to prepare the verified native controller; no connection was changed.", _cx)
+            return
+        end
+        if _cx then _cx:toast("info", "正在准备原生 Stop 控制程序", "旧版后台仍在运行；程序校验完成后才执行 Stop。准备失败不会假报已停止。") end
+        local prepareTimeout = 320000
+        local request = { token = token, deadline = tern.now() + prepareTimeout + HELPER_GRACE_MS }
+        local function prepared(result, fresh, timedOut)
+            if request.done then return end
+            request.done = true
+            helperRequests[request] = nil
+            local parsed, value = false, nil
+            if result and type(result.stdout) == "string" and #result.stdout <= MAX_JSON then parsed, value = pcall(tern.json.decode, result.stdout) end
+            if timedOut or not result or result.timed_out or result.status ~= 0 or not parsed or type(value) ~= "table" or value.ok ~= true or value.runtime_ready ~= true or value.binary ~= nativeBinary then
+                callback(nil, "Stop was NOT performed: native controller preparation failed or timed out. The existing backend may still be running; retry Settings before Stop.", fresh)
+                return
+            end
+            helperReady = true
+            helper(command, mode, token, fresh, callback)
+        end
+        request.consume = prepared
+        helperRequests[request] = true
+        local receipt = runner:wait(token, prepareTimeout + HELPER_GRACE_MS, prepared)
+        local ok = pcall(function()
+            tern.process.run({ "/bin/sh", tern.plugin.dir .. "/bootstrap-runtime.sh", tern.plugin.data, "--prepare" }, { timeout_ms = prepareTimeout }, function(result, _fresh)
+                receipt(result)
+                runner:wake()
+            end)
+        end)
+        if not ok then receipt({ launchFailed = true }); runner:wake() end
+        return
+    end
+    local argv = { nativeBinary, "relay", command,
         "--config", configPath, "--state-dir", stateDir }
     if mode then table.insert(argv, "--mode"); table.insert(argv, mode) end
     local timeout = (command == "start" or command == "resume") and 120000 or (command == "stop" and 20000 or 15000)
@@ -253,7 +286,7 @@ local function targetConfig(cx)
         return tern.json.decode(raw)
     end)
     local t = ok and type(value) == "table" and value.target
-    if not t or type(t) ~= "table" or value.schema ~= 3 or not text(value.ssh_destination, 253)
+    if not t or type(t) ~= "table" or (value.schema ~= 3 and value.schema ~= 4) or not text(value.ssh_destination, 253)
         or type(value.gateway) ~= "table" or not text(value.gateway.fingerprint, 256)
         or value.gateway.fingerprint == t.fingerprint or not text(value.gateway.daemon_socket, 4096)
         or not text(t.name, 64) or not text(t.host, 256) or not text(t.user, 128)
@@ -912,7 +945,7 @@ end
 
 onboarding = require('./onboarding').new({
     available = function() return not busy and not pending end,
-    runtimeReady = function(path) helperPython = path end,
+    runtimeReady = function(path) if path == nativeBinary then helperReady = true end end,
     configured = function() hasConfig = true; lastError = nil; refresh() end,
     reviewChanged = function() tern.chrome.refresh() end,
     failed = function(message)
@@ -942,12 +975,12 @@ tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
 tern.chrome.status(function()
     local reviewing = onboarding and onboarding.reviewed ~= nil
-    return { { text = reviewing and "TURN · 确认配置" or statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = (reviewing or not hasConfig) and "plugin.tern-turn-relay.setup" or "plugin.tern-turn-relay.status" } }
+    return { { text = reviewing and "TURN · 确认配置" or statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = (reviewing or not hasConfig or not helperReady) and "plugin.tern-turn-relay.setup" or "plugin.tern-turn-relay.status" } }
 end)
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
 -- paused. One asynchronous status query supplies the fresh owner context on load.
-if hasConfig then
+if hasConfig and helperReady then
 helper("status", nil, generation, nil, function(value, err, cx)
     if startupSeen then return end
     startupSeen = true

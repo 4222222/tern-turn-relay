@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .artifacts/
 dist/
+native/target/
 runtime/
 python-deps/
 .venv/

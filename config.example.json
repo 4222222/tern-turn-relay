@@ -1,9 +1,0 @@
-{
-  "documentation_only": true,
-  "description": "Not a runnable relay configuration. Generate verified schema-3 configuration using setup.py over an already trusted SSH alias.",
-  "command": "python3 setup.py --ssh-destination YOUR_SSH_ALIAS --credential-file /ABSOLUTE/PRIVATE/credentials.json --output /ABSOLUTE/PRIVATE/config.json",
-  "discovery": "Add --discover or --dry-run for redacted JSON without writing configuration. No daemon is spawned and no host key is accepted automatically.",
-  "ambiguity": "Select an existing service with --original-state-dir and --daemon-socket when discovery finds multiple candidates. Never copy an example fingerprint.",
-  "installation": "python3 install.py --config /ABSOLUTE/PRIVATE/config.json",
-  "credentials": "Use credentials.py --help for human and agent Cloudflare onboarding. Credential contents never belong in this file."
-}

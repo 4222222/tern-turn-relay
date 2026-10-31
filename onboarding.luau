@@ -10,7 +10,7 @@ function M.new(api)
     local self = { active = false }
     local epoch = 0
     local menu, inspect, chooseServer, discover, review
-    local python = tern.plugin.data .. "/managed-python/python/bin/python3"
+    local binary = tern.plugin.data .. "/native-runtime/0.4.0/tern-turn-relay"
     local queue = require('./work-queue').new({ now = tern.now, timer = tern.timer },
         function(token) return token == epoch end,
         function(cx)
@@ -77,9 +77,9 @@ function M.new(api)
         if not ok then receipt({ launchFailed = true }); queue:wake() end
     end
     local function backend(cx, action, input, callback)
-        local argv = { python, "-E", "-s", "-B", tern.plugin.dir .. "/onboarding.py", action,
+        local argv = { binary, "onboarding", action,
             "--data-dir", tern.plugin.data, "--package-dir", tern.plugin.dir }
-        run(cx, argv, input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update") and 240000 or 60000), callback)
+        run(cx, argv, input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update" or action == "migrate" or action == "discover") and 240000 or 60000), callback)
     end
     local function credentials(cx, snapshot)
         local replacing = snapshot.credential_configured == true
@@ -98,9 +98,10 @@ function M.new(api)
         if type(plan) ~= "table" or type(plan.configuration) ~= "table" then
             fail(cx, "服务器检查未返回可审核的配置。"); return
         end
-        -- JSON decoding drops null object members; preserve the review's exact
-        -- absent-config sentinel when sending it back for backend revalidation.
-        if plan.previous_config_sha256 == nil then plan.previous_config_sha256 = tern.json.null end
+        -- Luau drops JSON-null members; restore every reviewed absence sentinel.
+        for _, field in ipairs({ "previous_config_sha256", "installation_sha256", "ssh_config_sha256" }) do
+            if plan[field] == nil then plan[field] = tern.json.null end
+        end
         local config = plan.configuration
         local target, gateway = config.target or {}, config.gateway or {}
         local rows = {
@@ -234,8 +235,11 @@ function M.new(api)
             { label = snapshot.credential_configured and "更换 Cloudflare TURN Key" or "配置 Cloudflare TURN Key", value = "credentials",
                 detail = snapshot.credential_configured and "已有私有凭据；不会显示其内容" or "系统隐藏输入、验证成功后保存" },
         }
+        if snapshot.migration_required then
+            table.insert(items, 1, { label = "迁移到 Rust 后端", value = "migrate", detail = "先 Stop；保留 Key、服务器身份、原 daemon 和 SSH 规则；不自动连接" })
+        end
         if configured then
-            table.insert(items, 1, { label = "连接 TURN TLS", value = "connect", detail = "从本机或对应服务器 Host 连接；不切换无关 Host，不回退直连" })
+            if not snapshot.migration_required then table.insert(items, 1, { label = "连接 TURN TLS", value = "connect", detail = "从本机或对应服务器 Host 连接；不切换无关 Host，不回退直连" }) end
             table.insert(items, { label = "查看连接详情", value = "status" })
         end
         table.insert(items, { label = "高级：自定义本机端口", value = "port", detail = "仅在默认 18377 被占用时使用；更改将显示在配置确认页" })
@@ -245,6 +249,17 @@ function M.new(api)
             if answer.value == "server" then chooseServer(snapshot, fresh)
             elseif answer.value == "credentials" then credentials(fresh, snapshot)
             elseif answer.value == "manage" then manage(snapshot, fresh)
+            elseif answer.value == "migrate" then
+                pick(fresh, "确认迁移现有配置到 Rust 后端？", {
+                    { label = "确认迁移", value = "confirm", detail = "连接必须已停止；保留现有凭据、身份与工作区，旧运行环境不自动删除" },
+                    { label = "取消", value = "cancel" },
+                }, function(consent, current)
+                    if consent.value ~= "confirm" then menu(snapshot, current); return end
+                    backend(current, "migrate", { confirm = true }, function(_result, completed)
+                        api.configured()
+                        inspect(completed)
+                    end)
+                end)
             elseif answer.value == "port" then
                 local receipt = queue:wait(epoch, 600000, function(result, current, timedOut)
                     if timedOut or not result or result.answer == nil then finish(); return end
@@ -274,11 +289,11 @@ function M.new(api)
         epoch += 1
         if self.reviewed then confirmReview(cx); return end
         -- Only an explicit setup action can acquire a runtime; plugin loading never downloads.
-        cx:toast("info", "正在准备 TURN 设置", "首次使用将下载并校验插件私有 Python；无需自行安装或执行脚本。")
+        cx:toast("info", "正在准备 TURN 设置", "首次使用将下载并校验插件私有 Rust 程序；无需 Python 或本机编译。")
         run(cx, { "/bin/sh", tern.plugin.dir .. "/bootstrap-runtime.sh", tern.plugin.data, "--prepare" }, {}, 320000,
             function(value, fresh)
-                if value.python ~= python then fail(fresh, "运行环境路径不符合插件私有目录约束。"); return end
-                api.runtimeReady(python)
+                if value.binary ~= binary then fail(fresh, "运行环境路径不符合插件私有目录约束。"); return end
+                api.runtimeReady(binary)
                 inspect(fresh)
             end)
     end
