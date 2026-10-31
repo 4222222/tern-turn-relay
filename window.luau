@@ -436,12 +436,16 @@ inspectNative = function(cx)
 end
 
 schedule = function()
-    if timer or not (pending or busy
-        or ((cache.state == "ready" or cache.state == "starting") and nativeState ~= "disconnected")) then return end
+    -- Native Tern reconnects independently; a disconnected Host must not stop
+    -- observation of a live backend or freeze its last recovery snapshot.
+    if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting") then return end
     local token = generation
     timer = tern.timer(POLL_MS, function(_fresh)
         timer = nil
         if token ~= generation then schedule(); return end
+        -- Keep the next observation armed before queued/native work can exhaust
+        -- a timer hook's budget. Recovery must not depend on callback completion.
+        schedule()
         runner:post(token, function(fresh)
             if busy or (pending and pending.action == "restore") then
                 inspectNative(fresh)
