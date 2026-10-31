@@ -99,6 +99,7 @@ fn percentile(values:&mut [f64], q:f64)->Value {
 async fn exchange(endpoint:&TurnEndpoint, buffers:&mut WorkBuffers, work:&Workload, phase_name:&str, packets:u64, window:usize, report:bool)->Result<Value> {
     phase(phase_name);
     let started=Instant::now();
+    let drops_before=endpoint.stats().queue_drops;
     let mut pending:HashMap<u64,u64>=HashMap::with_capacity(window);
     let mut counts=Counts::default();
     let mut rtts=Vec::with_capacity(if phase_name=="latency" { packets as usize } else { 0 });
@@ -114,14 +115,17 @@ async fn exchange(endpoint:&TurnEndpoint, buffers:&mut WorkBuffers, work:&Worklo
             endpoint.send(&buffers.wire).await.map_err(|_|"turn_transport")?;
             counts.sent+=1;
         }
-        let now=buffers.stamp();
-        pending.retain(|_,stamp| { if now.saturating_sub(*stamp)>=timeout_ns {counts.timeouts+=1;false} else {true} });
-        let Some(oldest)=pending.values().min().copied() else {continue;};
-        let remaining=Duration::from_nanos((oldest+timeout_ns).saturating_sub(buffers.stamp()));
-        let size=match timeout(remaining,endpoint.recv(&mut buffers.incoming)).await {
-            Ok(Ok(size))=>size, Ok(Err(_))=>return Err("turn_transport"), Err(_)=>continue,
+        let received=endpoint.try_recv_timestamped(&mut buffers.incoming).map_err(|_|"turn_transport")?;
+        let (size,received_at)=if let Some(packet)=received {packet} else {
+            let now=buffers.stamp();
+            pending.retain(|_,stamp| { if now.saturating_sub(*stamp)>=timeout_ns {counts.timeouts+=1;false} else {true} });
+            let Some(oldest)=pending.values().min().copied() else {continue;};
+            let remaining=Duration::from_nanos((oldest+timeout_ns).saturating_sub(buffers.stamp()));
+            match timeout(remaining,endpoint.recv_timestamped(&mut buffers.incoming)).await {
+                Ok(Ok(packet))=>packet, Ok(Err(_))=>return Err("turn_transport"), Err(_)=>continue,
+            }
         };
-        let arrived=buffers.stamp();
+        let arrived=received_at.saturating_duration_since(buffers.clock).as_nanos().min(u64::MAX as u128) as u64;
         let Some(payload)=buffers.codec.decode(&buffers.incoming[..size]) else {continue;};
         if payload.len()!=work.payload_bytes || &payload[..4]!=b"TTRB" || !payload[20..].iter().enumerate().all(|(i,b)| *b==(i%251) as u8) {counts.integrity+=1;continue;}
         let id=u64::from_be_bytes(payload[4..12].try_into().map_err(|_|"framing_error")?);
@@ -134,6 +138,7 @@ async fn exchange(endpoint:&TurnEndpoint, buffers:&mut WorkBuffers, work:&Worklo
     }
     let duration=started.elapsed().as_secs_f64();
     let mut sample=json!({"event":"sample","phase":phase_name,"sent_packets":counts.sent,"sent_bytes":counts.sent*work.payload_bytes as u64,"acked_packets":counts.acked,"acked_bytes":counts.bytes,"timeouts":counts.timeouts,"integrity_errors":counts.integrity,"late_packets":counts.late,"duration_s":duration,"loss_packets":counts.sent-counts.acked});
+    sample["queue_drops"]=json!(endpoint.stats().queue_drops.saturating_sub(drops_before));
     if phase_name=="latency" {sample["p50_ms"]=percentile(&mut rtts,0.5);sample["p95_ms"]=percentile(&mut rtts,0.95);}
     if phase_name=="throughput" {sample["target_bytes"]=json!(work.throughput_bytes);sample["throughput_bps"]=json!(counts.bytes as f64*8./duration.max(1e-9));}
     if report {emit(sample.clone());}
@@ -178,7 +183,7 @@ async fn client(turn:TurnInput,peer:Peer,work:Workload,stop:watch::Receiver<bool
         result=TurnEndpoint::connect(&cfg,peer_addr)=>result.map_err(|_|"turn_connect")?,
         _=stopped(stop.clone())=>return Ok(()),
     };
-    emit(json!({"event":"ready"}));
+    emit(json!({"event":"ready","allocation_lifetime_s":endpoint.stats().lifetime_secs}));
     let result=tokio::select! {
         result=timeout(bound.min(valid),workload(&mut endpoint,&cfg,peer_addr,&mut buffers,&work))=>result.map_err(|_|"run_timeout").and_then(|v|v),
         _=stopped(stop.clone())=>Ok(()),

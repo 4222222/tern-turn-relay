@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ const MAX_FRAME: usize = 65_535;
 const MAX_PAYLOAD: usize = 65_040;
 const MAX_PENDING: usize = 64;
 const MAX_CONTROL: usize = 4096;
+const RECEIVE_QUEUE_CAPACITY: usize = 1032;
 
 #[derive(Clone)]
 pub struct TurnConfig {
@@ -86,6 +88,7 @@ pub struct TransportStats {
     pub refreshes: u64,
     pub remaining_ms: u64,
     pub lifetime_secs: u64,
+    pub queue_drops: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,6 +122,7 @@ struct Shared {
     leases: StdMutex<Leases>,
     stop: CancellationToken,
     changed: Notify,
+    queue_drops: AtomicU64,
 }
 
 impl Shared {
@@ -135,6 +139,7 @@ impl Shared {
             }),
             stop: CancellationToken::new(),
             changed: Notify::new(),
+            queue_drops: AtomicU64::new(0),
         }
     }
 
@@ -186,6 +191,7 @@ impl Shared {
             refreshes: leases.refreshes,
             remaining_ms,
             lifetime_secs: leases.lifetime_secs,
+            queue_drops: self.queue_drops.load(Ordering::Relaxed),
         }
     }
 
@@ -530,10 +536,15 @@ struct SendCommand {
     reply: oneshot::Sender<Result<usize>>,
 }
 
+struct ReceivedPacket {
+    bytes: Vec<u8>,
+    received_at: std::time::Instant,
+}
+
 pub struct TurnEndpoint {
     shared: Arc<Shared>,
     commands: mpsc::Sender<SendCommand>,
-    packets: Mutex<mpsc::Receiver<Vec<u8>>>,
+    packets: Mutex<mpsc::Receiver<ReceivedPacket>>,
     done: watch::Receiver<bool>,
 }
 
@@ -550,7 +561,7 @@ impl TurnEndpoint {
         let remote = SocketAddr::new(ip, config.port);
         let shared = Arc::new(Shared::new());
         let (commands, command_rx) = mpsc::channel(128);
-        let (packet_tx, packets) = mpsc::channel(512);
+        let (packet_tx, packets) = mpsc::channel(RECEIVE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
         let (done_tx, done) = watch::channel(false);
         let endpoint = Self { shared: shared.clone(), commands, packets: Mutex::new(packets), done };
@@ -598,20 +609,40 @@ impl TurnEndpoint {
     }
 
     pub async fn recv(&self, buffer: &mut [u8]) -> Result<usize> {
+        self.recv_timestamped(buffer).await.map(|(n, _)| n)
+    }
+
+    pub async fn recv_timestamped(&self, buffer: &mut [u8]) -> Result<(usize, std::time::Instant)> {
         self.shared.check(false)?;
         let receive = async {
             let mut packets = self.packets.lock().await;
             let packet = packets.recv().await.ok_or_else(|| self.shared.error())?;
-            self.shared.check(true)?;
-            if packet.len() > buffer.len() { return Err(TransportError::Capacity); }
-            buffer[..packet.len()].copy_from_slice(&packet);
-            Ok(packet.len())
+            self.deliver_packet(packet, buffer)
         };
         tokio::select! {
             biased;
             _ = self.shared.stop.cancelled() => Err(self.shared.error()),
             result = receive => result,
         }
+    }
+
+    pub fn try_recv_timestamped(&self, buffer: &mut [u8]) -> Result<Option<(usize, std::time::Instant)>> {
+        self.shared.check(false)?;
+        // A concurrent receiver is contention, not evidence that the queue is empty.
+        let mut packets = self.packets.try_lock().map_err(|_| TransportError::Capacity)?;
+        match packets.try_recv() {
+            Ok(packet) => self.deliver_packet(packet, buffer).map(Some),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(self.shared.error()),
+        }
+    }
+
+    fn deliver_packet(&self, packet: ReceivedPacket, buffer: &mut [u8]) -> Result<(usize, std::time::Instant)> {
+        // Arrival timestamps never authorize delivery after lease expiry or explicit stop.
+        self.shared.check(true)?;
+        if packet.bytes.len() > buffer.len() { return Err(TransportError::Capacity); }
+        buffer[..packet.bytes.len()].copy_from_slice(&packet.bytes);
+        Ok((packet.bytes.len(), packet.received_at))
     }
 
     pub fn stats(&self) -> TransportStats { self.shared.stats() }
@@ -656,7 +687,7 @@ async fn run_owner(
     peer: SocketAddr,
     shared: Arc<Shared>,
     mut commands: mpsc::Receiver<SendCommand>,
-    packets: mpsc::Sender<Vec<u8>>,
+    packets: mpsc::Sender<ReceivedPacket>,
     ready: oneshot::Sender<Result<()>>,
 ) {
     let setup = async {
@@ -693,18 +724,24 @@ async fn run_owner(
     let receiver = tokio::spawn(async move {
         let mut buffer = vec![0u8; MAX_FRAME];
         loop {
-            let received = tokio::select! {
+            let (received, received_at) = tokio::select! {
                 biased;
                 _ = read_shared.stop.cancelled() => break,
-                result = read_relay.recv_from(&mut buffer) => result,
+                result = read_relay.recv_from(&mut buffer) => (result, std::time::Instant::now()),
             };
             match received {
                 Ok((n, from)) if from == peer => {
                     if read_shared.check(true).is_err() { break; }
                     // Bounded UDP-style queue: congestion drops packets, never grows memory.
-                    if let Err(mpsc::error::TrySendError::Closed(_)) = packets.try_send(buffer[..n].to_vec()) {
-                        read_shared.fail(TransportError::Closed);
-                        break;
+                    match packets.try_send(ReceivedPacket { bytes: buffer[..n].to_vec(), received_at }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            read_shared.queue_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            read_shared.fail(TransportError::Closed);
+                            break;
+                        }
                     }
                 }
                 Ok(_) => { read_shared.fail(TransportError::Protocol); break; }
