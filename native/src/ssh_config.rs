@@ -130,16 +130,15 @@ fn trust_directives(bytes: &[u8]) -> Result<Vec<(String, Vec<String>)>> {
     Ok(result)
 }
 fn source_paths(stderr: &[u8]) -> Result<BTreeSet<PathBuf>> {
-    let text = std::str::from_utf8(stderr).map_err(|_| trust_error())?;
     let mut paths = BTreeSet::new();
-    for line in text.lines() {
-        let Some(encoded) = line.strip_prefix("debug1: Reading configuration data ") else {
-            if line.contains("Reading configuration data") { return Err(trust_error()); }
+    for line in stderr.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(bytes) = line.strip_prefix(b"debug1: Reading configuration data ") else {
+            if line.windows(b"Reading configuration data".len()).any(|part| part == b"Reading configuration data") { return Err(trust_error()); }
             continue;
         };
-        // OpenSSH debug output escapes backslashes and non-ASCII UTF-8 bytes.
-        // Decode only the observed unambiguous forms; do not guess log syntax.
-        let bytes = encoded.as_bytes();
+        // macOS OpenSSH 可混合原始 UTF-8 字节与八进制转义；必须先恢复字节，
+        // 再验证完整路径的 UTF-8，不能对整段诊断提前解码或有损替换。
         let mut decoded = Vec::with_capacity(bytes.len());
         let mut index = 0;
         while index < bytes.len() {
@@ -610,6 +609,19 @@ pub fn aliases(path: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_paths_decode_mixed_native_bytes_before_utf8_validation() {
+        let prefix = if cfg!(windows) { "C:/fixture/" } else { "/fixture/" };
+        let mut diagnostic = b"debug3: unrelated \xff\n debug note\n".to_vec();
+        diagnostic.extend_from_slice(b"debug1: Reading configuration data ");
+        diagnostic.extend_from_slice(prefix.as_bytes());
+        diagnostic.extend_from_slice(b"\xe4\\270\xad config\r\n");
+        assert!(std::str::from_utf8(&diagnostic).is_err());
+        assert_eq!(source_paths(&diagnostic).unwrap(), BTreeSet::from([PathBuf::from(format!("{prefix}中 config"))]));
+        let invalid = format!("debug1: Reading configuration data {prefix}\\377\n");
+        assert!(source_paths(invalid.as_bytes()).is_err());
+    }
+
     #[test]
     fn alias_tokenizer_preserves_quoting_without_executing_config() {
         assert_eq!(

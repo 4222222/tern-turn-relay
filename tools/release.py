@@ -131,6 +131,12 @@ def smoke(binary):
             if not source.exists():continue
             destination=package_dir/name;destination.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
             destination.write_bytes(source.read_bytes());destination.chmod(0o600)
+        if os.name=='nt':
+            # Elevated runners may assign Administrators as default owner. Establish
+            # the fixture's declared current-user ownership, never change user data.
+            shell=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
+            script="$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $paths=[Console]::In.ReadToEnd()|ConvertFrom-Json; foreach($p in $paths){$directory=[IO.Directory]::Exists($p); $acl=if($directory){New-Object Security.AccessControl.DirectorySecurity}else{New-Object Security.AccessControl.FileSecurity}; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $inherit=if($directory){[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'}else{[Security.AccessControl.InheritanceFlags]::None}; foreach($id in @($sid.Value,'S-1-5-18','S-1-5-32-544')){$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($id)),[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)))}; if($directory){[IO.Directory]::SetAccessControl($p,$acl)}else{[IO.File]::SetAccessControl($p,$acl)}}"
+            subprocess.run([str(shell),'-NoProfile','-NonInteractive','-Command',script],input=json.dumps([str(root),*(str(p) for p in root.rglob('*'))]).encode(),check=True,capture_output=True,timeout=30)
         # Windows Known Folders 属于真实登录用户；显式 profile 隔离不能靠伪造 USERPROFILE。
         environment=None if os.name=='nt' else dict(os.environ,HOME=str(home))
         profile=['--config-dir',str(root),'--data-dir',str(root/'plugin-data/tern-turn-relay'),'--package-dir',str(package_dir)]
