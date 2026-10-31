@@ -4,13 +4,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
+pub(crate) struct VerifiedAsset {
+    pub file: File,
+    pub digest: String,
+    pub size: u64,
+}
 struct TemporaryAsset(PathBuf);
 impl Drop for TemporaryAsset {
     fn drop(&mut self) {
@@ -56,7 +61,7 @@ pub fn manifest(directory: &Path) -> Result<Value> {
     }
     Ok(value)
 }
-fn verify(path: &Path, row: &Value) -> Result<()> {
+fn verify(path: &Path, row: &Value) -> Result<VerifiedAsset> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -83,9 +88,14 @@ fn verify(path: &Path, row: &Value) -> Result<()> {
     if hex::encode(digest.finalize()) != row["sha256"].as_str().ok_or_else(invalid)? {
         return Err(invalid());
     }
-    Ok(())
+    file.rewind().map_err(|_| invalid())?;
+    Ok(VerifiedAsset {
+        file,
+        digest: row["sha256"].as_str().ok_or_else(invalid)?.to_owned(),
+        size: info.len(),
+    })
 }
-pub async fn ensure_remote(arch: &str) -> Result<PathBuf> {
+pub async fn ensure_remote(arch: &str) -> Result<VerifiedAsset> {
     let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" | "arm64" => "arm64",
@@ -105,8 +115,7 @@ pub async fn ensure_remote(arch: &str) -> Result<PathBuf> {
     let row = &value["assets"][&name];
     let destination = directory.join(&name);
     if destination.symlink_metadata().is_ok() {
-        verify(&destination, row)?;
-        return Ok(destination);
+        return verify(&destination, row);
     }
     let url = format!(
         "https://github.com/jiwangyihao/tern-turn-relay/releases/download/v{}/{}",
@@ -195,8 +204,59 @@ pub async fn ensure_remote(arch: &str) -> Result<PathBuf> {
         File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(|_| invalid())?;
-        Ok(destination.clone())
+        Ok(())
     }
     .await;
-    result
+    result?;
+    verify(&destination, row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("ttr-asset-{:032x}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn verified_asset_keeps_the_validated_inode_when_path_is_replaced() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("helper");
+        let bytes = b"verified release content";
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let digest = hex::encode(Sha256::digest(bytes));
+        let row = serde_json::json!({"sha256":digest,"size":bytes.len()});
+        let mut asset = verify(&path, &row).unwrap();
+        std::fs::rename(&path, fixture.0.join("previous")).unwrap();
+        std::fs::write(&path, b"unverified replacement").unwrap();
+        let mut actual = Vec::new();
+        asset.file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(asset.digest, digest);
+        assert_eq!(asset.size, bytes.len() as u64);
+    }
+
+    #[test]
+    fn executable_with_matching_size_but_wrong_digest_is_rejected() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("helper");
+        std::fs::write(&path, b"altered").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let row = serde_json::json!({"sha256":hex::encode(Sha256::digest(b"trusted")),"size":7});
+        assert!(verify(&path, &row).is_err());
+    }
 }

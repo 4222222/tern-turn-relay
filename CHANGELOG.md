@@ -4,6 +4,7 @@
 
 - Replace the shipped Python runtime and helper scripts with native Rust executables on macOS arm64/x86_64 and Linux arm64/x86_64; retain the native Luau configuration UI.
 - Verify version-pinned executable sizes and SHA-256 before activation; acquire the Linux helper through the same private release manifest rather than requiring remote Python.
+- Reuse a verified content-addressed remote helper without retransmitting its executable; upload only on a cache miss, retaining ownership, permission and SHA-256 checks.
 - Preserve the authenticated gateway, original session daemon identity, independent SSH TCP forwarding, bounded queues, allocation renewal and classified recovery contracts.
 - Add explicit stopped-state schema-3 migration to schema 4, preserving credentials, gateway pins, workspace binding and managed SSH-rule ownership. Old private runtimes are retained, not executed or blindly deleted.
 - Keep credential input and issuance in the native helper, reject duplicate JSON keys, and retain private-file, no-redirect, no-proxy and redacted-error boundaries.

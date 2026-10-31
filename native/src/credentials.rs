@@ -580,7 +580,7 @@ mod tests {
     }
     #[tokio::test]
     async fn credential_mutation_lock_survives_atomic_target_replacement() {
-        use std::os::unix::fs::MetadataExt;
+        use std::{os::fd::AsRawFd, os::unix::fs::MetadataExt};
         let root = temporary_credentials();
         let target = root.join("credentials.lock");
         common::atomic_json(&target, &json!({"value":"old"})).unwrap();
@@ -621,6 +621,10 @@ mod tests {
             lock_inode
         );
         assert_eq!(common::read_json(&target, true).unwrap()["value"], "new");
+        // Parallel subprocess tests can briefly inherit this CLOEXEC descriptor.
+        // Release the fixture's shared open-file-description lock explicitly;
+        // this test checks stable lock identity across credential replacement.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         assert_eq!(
             mutation_lock(&target).unwrap().metadata().unwrap().ino(),

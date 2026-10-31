@@ -3,16 +3,7 @@ use crate::common::{self, Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngCore;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    fs::OpenOptions,
-    io::Read,
-    net::SocketAddr,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    process::Stdio,
-    time::Duration,
-};
+use std::{collections::BTreeSet, io::Read, net::SocketAddr, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -226,16 +217,22 @@ pub(crate) async fn receive<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<V
     Ok(value)
 }
 
-// Fixed bootstrap code; the only variable arguments are a canonical cache path,
-// a SHA-256 digest and a bounded size. Executable bytes arrive over SSH stdin.
-// Releases are immutable so deployment never rewrites an executing helper.
+// Both phases use the same fixed validation rules. Probe never creates or
+// changes paths; only a missing, otherwise trusted cache permits an upload.
 const INSTALLER: &str = r#"
 set -efu
 PATH=/usr/bin:/bin
 export PATH
 umask 077
-root=$1; digest=$2; size=$3
+root=$1; digest=$2; size=$3; operation=$4
+case "$operation" in probe|install) ;; *) exit 41 ;; esac
 uid=$(id -u)
+missing() {
+    if [ "$operation" = probe ]; then
+        printf '{"ok":true,"digest":"%s","cached":false}\n' "$digest"
+        exit 0
+    fi
+}
 check_dir() {
     [ ! -L "$1" ] && [ -d "$1" ] || exit 41
     owner=$(stat -c %u -- "$1"); mode=$(stat -c %a -- "$1")
@@ -243,19 +240,26 @@ check_dir() {
     [ $((0$mode & 0022)) -eq 0 ] || exit 41
 }
 walk() {
+    check_dir /
     rest=${1#/}; current=
     while [ -n "$rest" ]; do
         part=${rest%%/*}; current=$current/$part
         if [ "$rest" = "$part" ]; then rest=; else rest=${rest#*/}; fi
         [ -n "$part" ] && [ "$part" != . ] && [ "$part" != .. ] || exit 41
-        if [ ! -e "$current" ] && [ ! -L "$current" ]; then mkdir -m 700 -- "$current" || exit 41; fi
+        if [ ! -e "$current" ] && [ ! -L "$current" ]; then
+            missing
+            mkdir -m 700 -- "$current" || exit 41
+        fi
         check_dir "$current"
     done
 }
 walk "$root"
 [ "$(stat -c %u -- "$root")" = "$uid" ] && [ "$(stat -c %a -- "$root")" = 700 ] || exit 41
 release=$root/$digest
-if [ ! -e "$release" ] && [ ! -L "$release" ]; then mkdir -m 700 -- "$release" || exit 41; fi
+if [ ! -e "$release" ] && [ ! -L "$release" ]; then
+    missing
+    mkdir -m 700 -- "$release" || exit 41
+fi
 check_dir "$release"
 [ "$(stat -c %u -- "$release")" = "$uid" ] && [ "$(stat -c %a -- "$release")" = 700 ] || exit 41
 binary=$release/tern-turn-relay
@@ -265,9 +269,15 @@ valid() {
     [ "$(stat -c %h -- "$binary")" = 1 ] && [ "$(stat -c %s -- "$binary")" = "$size" ] || return 1
     actual=$(sha256sum -- "$binary"); [ "${actual%% *}" = "$digest" ]
 }
+if [ "$operation" = probe ]; then
+    if [ ! -e "$binary" ] && [ ! -L "$binary" ]; then missing; fi
+    valid || exit 41
+    printf '{"ok":true,"digest":"%s","cached":true}\n' "$digest"
+    exit 0
+fi
 temporary=$(mktemp "$release/.upload.XXXXXXXXXXXX")
 trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
-# Local input is bounded before SSH starts; also cap remote disk consumption.
+# The expected hash remains the manifest digest, not a hash supplied by stdin.
 dd iflag=fullblock bs=65536 count=1025 of="$temporary" 2>/dev/null
 [ "$(stat -c %s -- "$temporary")" = "$size" ] || exit 41
 actual=$(sha256sum -- "$temporary"); [ "${actual%% *}" = "$digest" ] || exit 41
@@ -279,7 +289,56 @@ valid || exit 41
 printf '{"ok":true,"digest":"%s"}\n' "$digest"
 "#;
 
+fn cache_response(success: bool, bytes: &[u8], digest: &str) -> Result<bool> {
+    if !success {
+        return Err(failure("security_error"));
+    }
+    let response = crate::remote::parse_json(bytes)?;
+    let cached = response["cached"]
+        .as_bool()
+        .ok_or_else(|| failure("protocol_error"))?;
+    if response != json!({"ok":true,"digest":digest,"cached":cached}) {
+        return Err(failure("identity_mismatch"));
+    }
+    Ok(cached)
+}
+
+fn upload_payload<R: Read>(cached: bool, source: &mut R, size: u64) -> Result<Option<Vec<u8>>> {
+    if cached {
+        return Ok(None);
+    }
+    if size == 0 || size > MAX_BINARY {
+        return Err(failure("security_error"));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    source
+        .take(size + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| failure("security_error"))?;
+    if bytes.len() as u64 != size {
+        return Err(failure("security_error"));
+    }
+    Ok(Some(bytes))
+}
+
+fn cache_command(root: &str, digest: &str, size: u64, operation: &str) -> String {
+    format!(
+        "/bin/sh -c {} sh {} {} {} {}",
+        common::shell_quote(INSTALLER),
+        common::shell_quote(root),
+        common::shell_quote(digest),
+        size,
+        common::shell_quote(operation)
+    )
+}
+
 pub(crate) async fn deploy(alias: &str, endpoint: &Value) -> Result<String> {
+    timeout(Duration::from_secs(180), deploy_inner(alias, endpoint))
+        .await
+        .map_err(|_| failure("connectivity_uncertain"))?
+}
+
+async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
     let probe = common::run(
         "/usr/bin/ssh",
         &common::ssh_args(
@@ -308,43 +367,40 @@ pub(crate) async fn deploy(alias: &str, endpoint: &Value) -> Result<String> {
     if endpoint["user"].as_str().is_none() {
         return Err(failure("security_error"));
     }
-    let source = crate::assets::ensure_remote(arch).await?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(source)
-        .map_err(|_| failure("security_error"))?;
-    let info = file.metadata().map_err(|_| failure("security_error"))?;
-    if !info.is_file()
-        || info.uid() != unsafe { libc::geteuid() }
-        || info.mode() & 0o022 != 0
-        || info.nlink() != 1
-        || info.len() == 0
-        || info.len() > MAX_BINARY
+    // The verified inode remains open across the remote probe. A cache hit
+    // neither reads this file nor allocates/copies/hashes the executable body.
+    let mut asset = crate::assets::ensure_remote(arch).await?;
+    if asset.size == 0
+        || asset.size > MAX_BINARY
+        || asset.digest.len() != 64
+        || !asset
+            .digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return Err(failure("security_error"));
     }
-    let mut bytes = Vec::with_capacity(info.len() as usize);
-    file.take(MAX_BINARY + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| failure("security_error"))?;
-    if bytes.len() as u64 != info.len() {
-        return Err(failure("security_error"));
-    }
-    let digest = hex::encode(Sha256::digest(&bytes));
     let root = format!("{}/.cache/tern-turn-relay-native", lines[1]);
-    let command = format!(
-        "/bin/sh -c {} sh {} {} {}",
-        common::shell_quote(INSTALLER),
-        common::shell_quote(&root),
-        digest,
-        bytes.len()
-    );
+    let helper = format!("{root}/{}/tern-turn-relay", asset.digest);
+    let command = cache_command(&root, &asset.digest, asset.size, "probe");
+    let probe = common::run(
+        "/usr/bin/ssh",
+        &common::ssh_args(alias, &command),
+        None,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|_| failure("connectivity_uncertain"))?;
+    let cached = cache_response(probe.status.success(), &probe.stdout, &asset.digest)?;
+    let Some(bytes) = upload_payload(cached, &mut asset.file, asset.size)? else {
+        return Ok(helper);
+    };
+    let command = cache_command(&root, &asset.digest, asset.size, "install");
     let output = common::run(
         "/usr/bin/ssh",
         &common::ssh_args(alias, &command),
         Some(&bytes),
-        Duration::from_secs(40),
+        Duration::from_secs(150),
     )
     .await
     .map_err(|_| failure("connectivity_uncertain"))?;
@@ -352,10 +408,10 @@ pub(crate) async fn deploy(alias: &str, endpoint: &Value) -> Result<String> {
         return Err(failure("security_error"));
     }
     let response = crate::remote::parse_json(&output.stdout)?;
-    if response != json!({"ok":true,"digest":digest}) {
+    if response != json!({"ok":true,"digest":asset.digest}) {
         return Err(failure("identity_mismatch"));
     }
-    Ok(format!("{root}/{digest}/tern-turn-relay"))
+    Ok(helper)
 }
 
 async fn prepare(config: &Value, pinned: bool) -> Result<String> {
@@ -384,7 +440,7 @@ fn initial_request(config: &Value, host: &str, socket: &str) -> Value {
 }
 
 pub async fn provision(config: &Value) -> Result<Value> {
-    timeout(Duration::from_secs(50), async {
+    timeout(Duration::from_secs(180), async {
         let helper = prepare(config, false).await?;
         let (alias, host, state, socket) = settings(config, false)?;
         let command = format!(
@@ -728,6 +784,206 @@ mod tests {
                     .code,
                 reason
             );
+        }
+    }
+    #[test]
+    fn cached_hit_never_reads_or_allocates_an_upload_body() {
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("verified cache hit must not read executable bytes");
+            }
+        }
+        let digest = "a".repeat(64);
+        let response =
+            serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":true})).unwrap();
+        let cached = cache_response(true, &response, &digest).unwrap();
+        assert!(upload_payload(cached, &mut Unreadable, MAX_BINARY)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            cache_response(false, &response, &digest).unwrap_err().code,
+            "security_error"
+        );
+        assert!(cache_response(true, b"{\"ok\":true,\"cached\":false}", &digest).is_err());
+        let extra =
+            serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":true,"extra":true}))
+                .unwrap();
+        assert!(cache_response(true, &extra, &digest).is_err());
+    }
+
+    #[test]
+    fn missing_cache_requires_exact_bounded_payload() {
+        let digest = "a".repeat(64);
+        let response =
+            serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":false})).unwrap();
+        let cached = cache_response(true, &response, &digest).unwrap();
+        let mut source = std::io::Cursor::new(b"verified".as_slice());
+        assert_eq!(
+            upload_payload(cached, &mut source, 8).unwrap(),
+            Some(b"verified".to_vec())
+        );
+        assert_eq!(source.position(), 8);
+        assert!(upload_payload(false, &mut b"short".as_slice(), 8).is_err());
+        assert!(upload_payload(false, &mut b"too long".as_slice(), 3).is_err());
+        assert!(upload_payload(false, &mut b"".as_slice(), MAX_BINARY + 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    mod cache_installation {
+        use super::*;
+        use sha2::{Digest, Sha256};
+        use std::{
+            fs,
+            os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+            path::PathBuf,
+        };
+
+        const BODY: &[u8] = b"verified native helper fixture";
+
+        struct Fixture {
+            base: PathBuf,
+            root: PathBuf,
+            digest: String,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                // /tmp is deliberately not trusted by the production validator.
+                // Use a new owned directory below the account's trusted home.
+                let home = crate::remote::linux::account().unwrap().1;
+                let base = home.join(format!(
+                    ".tern-gateway-cache-test-{:032x}",
+                    rand::random::<u128>()
+                ));
+                fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+                Self {
+                    root: base.join("cache"),
+                    base,
+                    digest: hex::encode(Sha256::digest(BODY)),
+                }
+            }
+            fn binary(&self) -> PathBuf {
+                self.root.join(&self.digest).join("tern-turn-relay")
+            }
+            async fn invoke(&self, operation: &str, input: Option<&[u8]>) -> std::process::Output {
+                let args = vec![
+                    "-c".into(),
+                    INSTALLER.into(),
+                    "sh".into(),
+                    self.root.to_str().unwrap().into(),
+                    self.digest.clone(),
+                    BODY.len().to_string(),
+                    operation.into(),
+                ];
+                common::run("/bin/sh", &args, input, Duration::from_secs(10))
+                    .await
+                    .unwrap()
+            }
+            async fn install(&self) {
+                let output = self.invoke("install", Some(BODY)).await;
+                assert!(output.status.success());
+                assert_eq!(
+                    crate::remote::parse_json(&output.stdout).unwrap(),
+                    json!({"ok":true,"digest":self.digest})
+                );
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.base);
+            }
+        }
+
+        #[tokio::test]
+        async fn readonly_miss_then_atomic_upload_then_readonly_hit() {
+            let fixture = Fixture::new();
+            let probe = fixture.invoke("probe", None).await;
+            assert!(
+                !cache_response(probe.status.success(), &probe.stdout, &fixture.digest).unwrap()
+            );
+            assert!(!fixture.root.exists());
+            assert_eq!(fs::read_dir(&fixture.base).unwrap().count(), 0);
+            fixture.install().await;
+            let binary = fixture.binary();
+            let before = fs::metadata(&binary).unwrap();
+            assert_eq!(before.mode() & 0o777, 0o700);
+            assert_eq!(before.nlink(), 1);
+            assert_eq!(fs::read(&binary).unwrap(), BODY);
+            let probe = fixture.invoke("probe", None).await;
+            assert!(
+                cache_response(probe.status.success(), &probe.stdout, &fixture.digest).unwrap()
+            );
+            assert_eq!(fs::metadata(&binary).unwrap().ino(), before.ino());
+            assert_eq!(fs::read_dir(binary.parent().unwrap()).unwrap().count(), 1);
+        }
+
+        #[tokio::test]
+        async fn unsafe_cache_is_fatal_not_a_miss_and_is_never_replaced() {
+            for kind in [
+                "writable",
+                "symlink",
+                "hardlink",
+                "wrong-digest",
+                "unsafe-parent",
+            ] {
+                let fixture = Fixture::new();
+                fixture.install().await;
+                let binary = fixture.binary();
+                match kind {
+                    "writable" => {
+                        fs::set_permissions(&binary, fs::Permissions::from_mode(0o777)).unwrap()
+                    }
+                    "symlink" => {
+                        let victim = fixture.base.join("keep");
+                        fs::write(&victim, b"unrelated fixture bytes").unwrap();
+                        fs::remove_file(&binary).unwrap();
+                        std::os::unix::fs::symlink(&victim, &binary).unwrap();
+                    }
+                    "hardlink" => fs::hard_link(&binary, fixture.base.join("keep")).unwrap(),
+                    "wrong-digest" => fs::write(&binary, vec![b'x'; BODY.len()]).unwrap(),
+                    "unsafe-parent" => fs::set_permissions(
+                        binary.parent().unwrap(),
+                        fs::Permissions::from_mode(0o770),
+                    )
+                    .unwrap(),
+                    _ => unreachable!(),
+                }
+                let before = fs::read(&binary).unwrap();
+                let probe = fixture.invoke("probe", None).await;
+                assert_eq!(
+                    cache_response(probe.status.success(), &probe.stdout, &fixture.digest)
+                        .unwrap_err()
+                        .code,
+                    "security_error"
+                );
+                assert_eq!(fs::read(&binary).unwrap(), before);
+                assert_eq!(fs::read_dir(binary.parent().unwrap()).unwrap().count(), 1);
+            }
+            let fixture = Fixture::new();
+            fs::set_permissions(&fixture.base, fs::Permissions::from_mode(0o777)).unwrap();
+            let probe = fixture.invoke("probe", None).await;
+            assert_eq!(
+                cache_response(probe.status.success(), &probe.stdout, &fixture.digest)
+                    .unwrap_err()
+                    .code,
+                "security_error"
+            );
+            assert!(!fixture.root.exists());
+        }
+
+        #[tokio::test]
+        async fn upload_must_match_manifest_digest_and_preserves_existing_helper() {
+            let fixture = Fixture::new();
+            let corrupt = vec![b'x'; BODY.len()];
+            let failed = fixture.invoke("install", Some(&corrupt)).await;
+            assert!(!failed.status.success());
+            assert!(!fixture.binary().exists());
+            fixture.install().await;
+            let before = fs::metadata(fixture.binary()).unwrap().ino();
+            let failed = fixture.invoke("install", Some(&corrupt)).await;
+            assert!(!failed.status.success());
+            assert_eq!(fs::metadata(fixture.binary()).unwrap().ino(), before);
+            assert_eq!(fs::read(fixture.binary()).unwrap(), BODY);
         }
     }
 }
