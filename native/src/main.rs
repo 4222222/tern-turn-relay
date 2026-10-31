@@ -58,6 +58,11 @@ async fn dispatch(args: &[String]) -> Result<Option<Value>> {
     }
 }
 fn main() {
+    #[cfg(windows)]
+    if let Err(error) = windows_process::prevent_stdio_inheritance() {
+        emit(&json!({"ok":false,"code":error.code,"error":error.message,"exit_code":error.exit_code}));
+        std::process::exit(error.exit_code);
+    }
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);

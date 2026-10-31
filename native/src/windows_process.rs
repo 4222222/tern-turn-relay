@@ -40,6 +40,23 @@ fn failure(code: &'static str) -> Error {
     )
 }
 
+/// 子进程必须只继承显式配置的 stdio，不能保留启动器的响应管道写端。
+pub(crate) fn prevent_stdio_inheritance() -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT},
+        System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE},
+    };
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(failure("process-stdio"));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a fixed relative executable below the OS-reported system directory, never PATH.
 pub(crate) fn system_program(relative: &str) -> Result<String> {
     let relative = Path::new(relative);
@@ -408,5 +425,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "由响应管道回归测试在独立进程中调用"]
+    async fn detached_stdio_helper() {
+        prevent_stdio_inheritance().unwrap();
+        let mut command = Command::new(powershell());
+        command.args(args("Start-Sleep -Seconds 60"))
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let (mut child, job) = spawn(&mut command, true).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        job.release().unwrap();
+        println!("detached-child-started");
+    }
+
+    #[tokio::test]
+    async fn detached_service_does_not_hold_launcher_response_pipe_open() {
+        let executable = crate::windows_security::normalize_system_path(&std::env::current_exe().unwrap()).unwrap();
+        let mut command = Command::new(executable);
+        command.args(["--ignored", "--exact", "windows_process::tests::detached_stdio_helper", "--nocapture"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (child, job) = spawn(&mut command, false).unwrap();
+        // 外层 Job 始终拥有整个测试进程树，包括 helper 释放的嵌套 Job。
+        let output = timeout(Duration::from_secs(20), child.wait_with_output()).await;
+        drop(job);
+        let output = output.expect("后台继承了响应管道，启动器退出后仍未收到 EOF").unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("detached-child-started"));
     }
 }
