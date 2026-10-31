@@ -29,7 +29,7 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: tern-turn-relay-darwin-arm64
             binary: tern-turn-relay
