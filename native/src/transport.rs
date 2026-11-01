@@ -305,6 +305,8 @@ fn parse_stun(raw: &[u8]) -> Result<Message> {
 enum Writer {
     Tls(WriteHalf<TlsStream<TcpStream>>),
     Udp(Arc<UdpSocket>),
+    #[cfg(test)]
+    Gated(tests::GatedWriter),
 }
 impl Writer {
     async fn send(&mut self, raw: &[u8]) -> Result<()> {
@@ -327,6 +329,8 @@ impl Writer {
                 }
                 Ok(())
             }
+            #[cfg(test)]
+            Self::Gated(writer) => writer.send(raw).await,
         }
     }
 }
@@ -1628,5 +1632,158 @@ mod tests {
             Err(TransportError::Closed)
         );
         drop(server);
+    }
+
+    // Inject backpressure at the wire boundary, not at Endpoint::send. The
+    // production command queue, owner scheduler, framing and receive gates run
+    // unchanged. This does not simulate a TLS handshake or certificate checks.
+    pub(super) struct GatedWriter {
+        entered: mpsc::Sender<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+        written: mpsc::Sender<Vec<u8>>,
+    }
+    impl GatedWriter {
+        pub(super) async fn send(&mut self, raw: &[u8]) -> Result<()> {
+            self.entered
+                .try_send(raw.to_vec())
+                .map_err(|_| TransportError::Capacity)?;
+            self.release.recv().await.ok_or(TransportError::Closed)?;
+            self.written
+                .try_send(raw.to_vec())
+                .map_err(|_| TransportError::Capacity)
+        }
+    }
+
+    struct GatedEndpoint {
+        endpoint: Arc<Endpoint>,
+        incoming: mpsc::Sender<Result<Vec<u8>>>,
+        entered: mpsc::Receiver<Vec<u8>>,
+        release: mpsc::Sender<()>,
+        written: mpsc::Receiver<Vec<u8>>,
+    }
+
+    fn gated_endpoint(lease: Duration) -> GatedEndpoint {
+        let now = Instant::now();
+        let expires = common::unix_time() + 3600.0;
+        let shared = Arc::new(Shared {
+            state: StdMutex::new(State {
+                allocation: Some(now + lease),
+                permission: Some(now + lease),
+                error: None,
+                expires,
+                refreshes: 0,
+                receive_bytes: 0,
+            }),
+            cancel: CancellationToken::new(),
+        });
+        let (commands, command_rx) = mpsc::channel(1);
+        let (packets_tx, packets) = mpsc::channel(RECEIVE_PACKETS);
+        let (incoming, incoming_rx) = mpsc::channel(64);
+        let (entered_tx, entered) = mpsc::channel(1);
+        let (release, release_rx) = mpsc::channel(1);
+        let (written_tx, written) = mpsc::channel(1);
+        let reader_cancel = shared.cancel.clone();
+        let reader = ReaderGuard(tokio::spawn(async move {
+            reader_cancel.cancelled().await;
+        }));
+        // Start at the established-allocation boundary. No UDP socket or
+        // mode-flipped UDP writer stands in for the pending stream write.
+        let mut owner = Owner {
+            writer: Writer::Gated(GatedWriter {
+                entered: entered_tx,
+                release: release_rx,
+                written: written_tx,
+            }),
+            incoming: incoming_rx,
+            _reader: reader,
+            shared: shared.clone(),
+            packets: packets_tx,
+            commands: command_rx,
+            config: TurnConfig {
+                mode: Mode::Tls,
+                host: "unused.invalid".into(),
+                port: 443,
+                username: "test-user".into(),
+                password: "test-password".into(),
+                expires,
+            },
+            peer: "127.0.0.1:4321".parse().unwrap(),
+            realm: None,
+            nonce: None,
+            integrity: None,
+            lifetime: Duration::from_secs(120),
+            refresh_at: now + Duration::from_secs(60),
+            bind_at: now + Duration::from_secs(90),
+            bound: true,
+            frame: Vec::new(),
+        };
+        let owner_shared = shared.clone();
+        let task = tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = owner_shared.cancel.cancelled() => Ok(()),
+                result = owner.loop_packets() => result,
+            };
+            owner_shared.fail(result.err().unwrap_or(TransportError::Closed));
+        });
+        GatedEndpoint {
+            endpoint: Arc::new(Endpoint {
+                shared,
+                commands,
+                packets: Mutex::new(packets),
+                owner: Mutex::new(Some(task)),
+                expires,
+            }),
+            incoming,
+            entered,
+            release,
+            written,
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_receives_while_transport_write_is_pending() {
+        let mut fixture = gated_endpoint(Duration::from_secs(120));
+        let endpoint = fixture.endpoint.clone();
+        let sending = tokio::spawn(async move { endpoint.send(b"up").await });
+        let frame = timeout(Duration::from_secs(2), fixture.entered.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(frame, [0x40, 0, 0, 2, b'u', b'p', 0, 0]);
+        fixture.incoming.send(Ok(vec![0x40, 0, 0, 4, b'd', b'o', b'w', b'n']))
+            .await.unwrap();
+        let mut buffer = [0; 32];
+        let received = timeout(Duration::from_millis(250), fixture.endpoint.recv(&mut buffer)).await;
+        let remained_pending = !sending.is_finished();
+        let remained_healthy = fixture.endpoint.health();
+        // Release and join before the red assertion so failure leaves no worker.
+        fixture.release.send(()).await.unwrap();
+        let sent = timeout(Duration::from_secs(2), sending).await.unwrap().unwrap();
+        let written = fixture.written.try_recv();
+        fixture.endpoint.close().await;
+        assert!(remained_pending, "uplink must remain gated during downlink delivery");
+        assert_eq!(remained_healthy, Ok(()));
+        assert_eq!(sent, Ok(()));
+        assert_eq!(written.unwrap(), frame);
+        assert!(fixture.written.try_recv().is_err(), "write must not be replayed");
+        let length = received.expect("downlink blocked behind the pending transport write").unwrap();
+        assert_eq!(&buffer[..length], b"down");
+    }
+
+    #[tokio::test]
+    async fn endpoint_write_timeout_retires_transport() {
+        // The lease bounds the real send deadline without changing OP_TIMEOUT.
+        let mut fixture = gated_endpoint(Duration::from_secs(1));
+        let endpoint = fixture.endpoint.clone();
+        let sending = tokio::spawn(async move { endpoint.send(b"up").await });
+        timeout(Duration::from_secs(2), fixture.entered.recv()).await.unwrap().unwrap();
+        let sent = timeout(Duration::from_secs(3), sending).await.unwrap().unwrap();
+        assert_eq!(sent, Err(TransportError::Timeout));
+        assert_eq!(fixture.endpoint.failure().await, TransportError::Timeout);
+        assert_eq!(fixture.endpoint.health(), Err(TransportError::Timeout));
+        assert_eq!(fixture.endpoint.send(b"later").await, Err(TransportError::Timeout));
+        fixture.endpoint.close().await;
+        assert!(fixture.release.is_closed(), "timed-out writer must be dropped");
+        assert_eq!(fixture.entered.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+        assert_eq!(fixture.written.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }

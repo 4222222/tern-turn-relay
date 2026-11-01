@@ -203,6 +203,14 @@ impl FlowRecord {
             notified.await;
         }
     }
+    async fn wait_after_allocation_failure(&self, error: TransportError) {
+        let previous = {
+            let mut data = self.data.lock().unwrap();
+            data.recovery_error = Some(error.public().message);
+            data.demand
+        };
+        self.new_demand(previous).await;
+    }
 }
 struct FlowHandle {
     record: Arc<FlowRecord>,
@@ -413,12 +421,7 @@ async fn flow_loop(
                 }
                 Err(error) if error.recoverable() => {
                     shared.defer();
-                    let previous = {
-                        let mut data = record.data.lock().unwrap();
-                        data.recovery_error = Some(error.public().message);
-                        data.demand
-                    };
-                    record.new_demand(previous).await;
+                    record.wait_after_allocation_failure(error).await;
                     continue;
                 }
                 Err(error) => return Err(error.public()),
@@ -1516,6 +1519,104 @@ pub async fn run(args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_shared() -> Shared {
+        let now = Instant::now();
+        Shared {
+            config: json!({}),
+            mode: Mode::Tls,
+            state: StdMutex::new(ServiceState {
+                public: json!({"state": "ready"}),
+                ssh_endpoint: None,
+                ssh_count: Arc::new(AtomicUsize::new(0)),
+                flows: HashMap::new(),
+                warm: None,
+                route_available: true,
+                peer: None,
+                key: [0; 32],
+                generation: CancellationToken::new(),
+                gateway_recovering: false,
+                gateway_reconnects: 0,
+                gateway_failure_reason: None,
+                recovery_error: None,
+                retired_refreshes: 0,
+                bytes_up: 0,
+                bytes_down: 0,
+                dropped_packets: 0,
+                dropped_bytes: 0,
+                last_drop: None,
+                allocation_retry_at: now,
+                no_clients_since: now,
+                demand: 0,
+                credentials_expires: None,
+                initialized: true,
+            }),
+            credentials: Mutex::new(CredentialCache {
+                path: PathBuf::new(),
+                cached: None,
+                expires: 0.0,
+                retry_at: now,
+            }),
+            stop: CancellationToken::new(),
+            fatal: CancellationToken::new(),
+            demand: Notify::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_queued_work_retries_after_cooldown_without_new_enqueue() {
+        let shared = recovery_shared();
+        let record = FlowRecord::new(None);
+        assert!(record.enqueue(b"pending handshake"));
+
+        // Exercise flow_loop's production post-exhaustion gate, followed by
+        // its existing cooldown, without issuing another local packet.
+        shared.defer();
+        let previous = record.data.lock().unwrap().demand;
+        let retry = async {
+            record.wait_after_allocation_failure(TransportError::Timeout).await;
+            shared.cooldown().await;
+        };
+        tokio::pin!(retry);
+        assert!(futures_util::poll!(retry.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(futures_util::poll!(retry.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(retry.as_mut()).is_ready(),
+            "queued work must become retry-eligible when cooldown expires, without another enqueue"
+        );
+        assert_eq!(record.next().await, b"pending handshake");
+        assert_eq!(record.data.lock().unwrap().demand, previous);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_existing_cooldown_wait_is_not_extended_by_another_flow() {
+        let shared = recovery_shared();
+        shared.defer();
+        let waiting = shared.cooldown();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        shared.defer();
+        let newcomer = shared.cooldown();
+        tokio::pin!(newcomer);
+        assert!(futures_util::poll!(newcomer.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_ready(),
+            "a later independent failure must not extend an already-waiting flow's cooldown"
+        );
+        assert!(futures_util::poll!(newcomer.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(28)).await;
+        assert!(futures_util::poll!(newcomer.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(newcomer.as_mut()).is_ready(),
+            "a new waiter must honor the later shared cooldown deadline"
+        );
+    }
 
     #[test]
     fn queue_bounds_drop_new_packets_but_preserve_demand_and_accounting() {
