@@ -207,6 +207,9 @@ impl FlowRecord {
         let previous = {
             let mut data = self.data.lock().unwrap();
             data.recovery_error = Some(error.public().message);
+            if !data.queue.is_empty() {
+                return;
+            }
             data.demand
         };
         self.new_demand(previous).await;
@@ -337,11 +340,8 @@ impl Shared {
         state.allocation_retry_at = state.allocation_retry_at.max(Instant::now() + COOLDOWN);
     }
     async fn cooldown(&self) {
-        loop {
-            let until = self.state.lock().unwrap().allocation_retry_at;
-            if until <= Instant::now() {
-                return;
-            }
+        let until = self.state.lock().unwrap().allocation_retry_at;
+        if until > Instant::now() {
             tokio::time::sleep_until(until).await;
         }
     }
@@ -1591,6 +1591,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn recovery_empty_queue_waits_for_new_demand_after_allocation_failure() {
+        let record = FlowRecord::new(None);
+        let retry = record.wait_after_allocation_failure(TransportError::Timeout);
+        tokio::pin!(retry);
+        assert!(futures_util::poll!(retry.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(futures_util::poll!(retry.as_mut()).is_pending());
+        assert!(record.enqueue(b"new handshake"));
+        assert!(futures_util::poll!(retry.as_mut()).is_ready());
+        assert_eq!(record.next().await, b"new handshake");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn recovery_existing_cooldown_wait_is_not_extended_by_another_flow() {
         let shared = recovery_shared();
         shared.defer();
@@ -1616,6 +1629,64 @@ mod tests {
             futures_util::poll!(newcomer.as_mut()).is_ready(),
             "a new waiter must honor the later shared cooldown deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn flow_loop_delivers_downlink_while_uplink_send_is_pending() {
+        let mut fixture = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        let record = Arc::new(FlowRecord::new(Some(fixture.endpoint.clone())));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let key = [7; 32];
+        let codec = Codec::new(key);
+        let frame = crate::protocol::encode(
+            &key,
+            crate::protocol::SERVER_TO_CLIENT,
+            codec.flow,
+            1,
+            b"downlink while sending",
+        ).unwrap();
+        let mut channel = vec![0x40, 0];
+        channel.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        channel.extend_from_slice(&frame);
+        channel.resize((channel.len() + 3) & !3, 0);
+        assert!(record.enqueue(b"blocked uplink"));
+        let worker = tokio::spawn(flow_loop(
+            shared.clone(),
+            record,
+            socket.clone(),
+            client.local_addr().unwrap(),
+            "127.0.0.1:4321".parse().unwrap(),
+            codec,
+        ));
+
+        // This barrier proves Endpoint::send reached the blocked transport
+        // write before any authenticated downlink is made available.
+        timeout(Duration::from_secs(2), fixture.entered.recv())
+            .await.unwrap().unwrap();
+        fixture.incoming.send(Ok(channel)).await.unwrap();
+        let mut buffer = [0; 128];
+        let received = timeout(Duration::from_secs(1), client.recv_from(&mut buffer)).await;
+        let send_still_pending = matches!(
+            fixture.written.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        );
+
+        // Never release the write gate: delivery must not depend on uplink
+        // completion. Clean up both real loops before reporting a failure.
+        worker.abort();
+        let _ = worker.await;
+        fixture.endpoint.close().await;
+        assert!(send_still_pending, "uplink must remain gated during downlink delivery");
+        let (length, source) = received
+            .expect("flow_loop must receive authenticated downlink while its uplink send is pending")
+            .unwrap();
+        assert_eq!(&buffer[..length], b"downlink while sending");
+        assert_eq!(source, socket.local_addr().unwrap());
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.bytes_up, 0);
+        assert_eq!(state.bytes_down, b"downlink while sending".len() as u64);
     }
 
     #[test]

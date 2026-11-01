@@ -602,7 +602,8 @@ impl Drop for Endpoint {
 }
 
 struct Owner {
-    writer: Writer,
+    // Temporarily owned by write_frame while its single write future is pending.
+    writer: Option<Writer>,
     incoming: mpsc::Receiver<Result<Vec<u8>>>,
     _reader: ReaderGuard,
     shared: Arc<Shared>,
@@ -731,6 +732,74 @@ impl Owner {
         }
         Ok(())
     }
+    fn dispatch_response(&mut self, raw: &[u8], request: &Message) -> Result<Option<Message>> {
+        if self.dispatch_payload(raw)? {
+            return Ok(None);
+        }
+        let mut message = parse_stun(raw)?;
+        if message.transaction_id != request.transaction_id {
+            return Ok(None);
+        }
+        if message.typ.method != request.typ.method
+            || !matches!(message.typ.class, CLASS_SUCCESS_RESPONSE | CLASS_ERROR_RESPONSE)
+        {
+            return if self.config.mode == Mode::Udp {
+                Ok(None)
+            } else {
+                Err(TransportError::Protocol)
+            };
+        }
+        if let Err(error) = self.validate_response(&mut message) {
+            return if self.config.mode == Mode::Udp { Ok(None) } else { Err(error) };
+        }
+        Ok(Some(message))
+    }
+
+    async fn write_frame(
+        &mut self,
+        raw: &[u8],
+        until: Instant,
+        request: Option<&Message>,
+    ) -> Result<Option<Message>> {
+        let mut writer = self.writer.take().expect("one ordered transport writer");
+        let result = async {
+            if until <= Instant::now() {
+                return Err(TransportError::Timeout);
+            }
+            let sending = timeout_at(until, writer.send(raw));
+            tokio::pin!(sending);
+            // At most one authenticated matching response is retained. Receiving
+            // never restarts/cancels the write, including a partially flushed TLS frame.
+            let mut response = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self.shared.cancel.cancelled() => return Err(TransportError::Closed),
+                    result = &mut sending => {
+                        result.map_err(|_| TransportError::Timeout)??;
+                        return Ok(response);
+                    }
+                    raw = self.incoming.recv() => {
+                        let raw = self.received(raw)?;
+                        if let Some(request) = request.filter(|_| response.is_none()) {
+                            response = self.dispatch_response(&raw, request)?;
+                        } else {
+                            self.dispatch_payload(&raw)?;
+                        }
+                    }
+                }
+            }
+        }.await;
+        self.writer = Some(writer);
+        if let Err(error) = &result {
+            // Any interrupted TLS write may have emitted a partial frame.
+            if self.config.mode == Mode::Tls {
+                self.shared.fail(*error);
+            }
+        }
+        result
+    }
+
     async fn transaction(
         &mut self,
         request: &Message,
@@ -743,16 +812,8 @@ impl Owner {
             return Err(TransportError::Timeout);
         }
         let sent = Instant::now();
-        if let Err(error) = timeout_at(until, self.writer.send(&request.raw))
-            .await
-            .map_err(|_| TransportError::Timeout)
-            .and_then(|result| result)
-        {
-            // Retrying a partially written TLS record corrupts STUN framing.
-            if self.config.mode == Mode::Tls {
-                self.shared.fail(error);
-            }
-            return Err(error);
+        if let Some(response) = self.write_frame(&request.raw, until, Some(request)).await? {
+            return Ok((response, sent));
         }
         let mut interval = Duration::from_millis(500);
         let mut retransmit = sent + interval;
@@ -762,26 +823,23 @@ impl Owner {
                 _ = tokio::time::sleep_until(until) => return Err(TransportError::Timeout),
                 raw = self.incoming.recv() => {
                     let raw = self.received(raw)?;
-                    if self.dispatch_payload(&raw)? { continue; }
-                    let mut message = parse_stun(&raw)?;
-                    if message.transaction_id != request.transaction_id { continue; }
-                    if message.typ.method != request.typ.method || !matches!(message.typ.class, CLASS_SUCCESS_RESPONSE | CLASS_ERROR_RESPONSE) {
-                        if self.config.mode == Mode::Udp { continue; }
-                        return Err(TransportError::Protocol);
+                    if let Some(message) = self.dispatch_response(&raw, request)? {
+                        return Ok((message, sent));
                     }
-                    if let Err(error) = self.validate_response(&mut message) {
-                        if self.config.mode == Mode::Udp { continue; }
-                        return Err(error);
-                    }
-                    return Ok((message, sent));
                 }
                 _ = tokio::time::sleep_until(retransmit), if self.config.mode == Mode::Udp => {
-                    timeout_at(until, self.writer.send(&request.raw)).await.map_err(|_| TransportError::Timeout)??;
+                    if let Some(message) = self.write_frame(&request.raw, until, Some(request)).await? {
+                        return Ok((message, sent));
+                    }
                     interval = (interval * 2).min(Duration::from_secs(4));
                     retransmit = Instant::now() + interval;
                 }
                 command = self.commands.recv(), if self.bound && !self.commands.is_closed() => {
-                    if let Some(command) = command { self.send_command(command, until).await?; }
+                    if let Some(command) = command {
+                        if let Some(message) = self.send_command(command, until, Some(request)).await? {
+                            return Ok((message, sent));
+                        }
+                    }
                 }
             }
         }
@@ -984,7 +1042,7 @@ impl Owner {
                 }
                 command = self.commands.recv(), if !self.commands.is_closed() => {
                     if let Some(command) = command {
-                        self.send_command(command, Instant::now() + OP_TIMEOUT).await?;
+                        self.send_command(command, Instant::now() + OP_TIMEOUT, None).await?;
                     }
                 }
             }
@@ -995,7 +1053,8 @@ impl Owner {
         &mut self,
         command: SendCommand,
         control_deadline: Instant,
-    ) -> Result<()> {
+        request: Option<&Message>,
+    ) -> Result<Option<Message>> {
         let until = self
             .shared
             .check()?
@@ -1009,13 +1068,15 @@ impl Owner {
         if self.config.mode == Mode::Tls {
             self.frame.resize((self.frame.len() + 3) & !3, 0);
         }
-        let result = timeout_at(until, self.writer.send(&self.frame))
-            .await
-            .map_err(|_| TransportError::Timeout)
-            .and_then(|result| result)
-            .and_then(|_| self.shared.check().map(|_| ()));
-        let _ = command.reply.send(result);
-        if let Err(error) = result {
+        let frame = std::mem::take(&mut self.frame);
+        let result = self.write_frame(&frame, until, request).await.and_then(|response| {
+            self.shared.check()?;
+            Ok(response)
+        });
+        self.frame = frame;
+        let status = result.as_ref().map(|_| ()).map_err(|error| *error);
+        let _ = command.reply.send(status);
+        if let Err(error) = status {
             self.shared.fail(error);
         }
         result
@@ -1043,7 +1104,7 @@ impl Owner {
                 }
                 command = self.commands.recv() => {
                     let Some(command) = command else { return Ok(()); };
-                    self.send_command(command, Instant::now() + OP_TIMEOUT).await?;
+                    self.send_command(command, Instant::now() + OP_TIMEOUT, None).await?;
                 }
             }
         }
@@ -1062,7 +1123,7 @@ async fn owner(
         let (writer, incoming, reader) = wire(&config, shared.clone()).await?;
         let now = Instant::now();
         let mut owner = Owner {
-            writer,
+            writer: Some(writer),
             incoming,
             _reader: reader,
             shared: shared.clone(),
@@ -1115,11 +1176,16 @@ async fn owner(
     // both halves retires the allocation; UDP can safely send a best-effort delete.
     if owner.config.mode == Mode::Udp {
         if let Ok(delete) = owner.request(METHOD_REFRESH, true) {
-            let _ = timeout(Duration::from_secs(1), owner.writer.send(&delete.raw)).await;
+            if let Some(writer) = owner.writer.as_mut() {
+                let _ = timeout(Duration::from_secs(1), writer.send(&delete.raw)).await;
+            }
         }
     }
     result
 }
+
+#[cfg(test)]
+pub(crate) use tests::gated_endpoint;
 
 #[cfg(test)]
 mod tests {
@@ -1275,7 +1341,7 @@ mod tests {
         );
         let (_command_tx, commands) = mpsc::channel(1);
         let mut owner = Owner {
-            writer,
+            writer: Some(writer),
             incoming,
             _reader: reader,
             shared,
@@ -1654,15 +1720,19 @@ mod tests {
         }
     }
 
-    struct GatedEndpoint {
-        endpoint: Arc<Endpoint>,
-        incoming: mpsc::Sender<Result<Vec<u8>>>,
-        entered: mpsc::Receiver<Vec<u8>>,
-        release: mpsc::Sender<()>,
-        written: mpsc::Receiver<Vec<u8>>,
+    pub(crate) struct GatedEndpoint {
+        pub(crate) endpoint: Arc<Endpoint>,
+        pub(crate) incoming: mpsc::Sender<Result<Vec<u8>>>,
+        pub(crate) entered: mpsc::Receiver<Vec<u8>>,
+        pub(crate) release: mpsc::Sender<()>,
+        pub(crate) written: mpsc::Receiver<Vec<u8>>,
     }
 
-    fn gated_endpoint(lease: Duration) -> GatedEndpoint {
+    pub(crate) fn gated_endpoint(lease: Duration) -> GatedEndpoint {
+        gated_endpoint_with_refresh(lease, Duration::from_secs(60))
+    }
+
+    fn gated_endpoint_with_refresh(lease: Duration, refresh_after: Duration) -> GatedEndpoint {
         let now = Instant::now();
         let expires = common::unix_time() + 3600.0;
         let shared = Arc::new(Shared {
@@ -1689,11 +1759,11 @@ mod tests {
         // Start at the established-allocation boundary. No UDP socket or
         // mode-flipped UDP writer stands in for the pending stream write.
         let mut owner = Owner {
-            writer: Writer::Gated(GatedWriter {
+            writer: Some(Writer::Gated(GatedWriter {
                 entered: entered_tx,
                 release: release_rx,
                 written: written_tx,
-            }),
+            })),
             incoming: incoming_rx,
             _reader: reader,
             shared: shared.clone(),
@@ -1708,11 +1778,13 @@ mod tests {
                 expires,
             },
             peer: "127.0.0.1:4321".parse().unwrap(),
-            realm: None,
-            nonce: None,
-            integrity: None,
+            realm: Some(Realm::new(ATTR_REALM, "test-realm".into())),
+            nonce: Some(Nonce::new(ATTR_NONCE, "test-nonce".into())),
+            integrity: Some(MessageIntegrity::new_long_term_integrity(
+                "test-user".into(), "test-realm".into(), "test-password".into(),
+            )),
             lifetime: Duration::from_secs(120),
-            refresh_at: now + Duration::from_secs(60),
+            refresh_at: now + refresh_after,
             bind_at: now + Duration::from_secs(90),
             bound: true,
             frame: Vec::new(),
@@ -1784,6 +1856,76 @@ mod tests {
         fixture.endpoint.close().await;
         assert!(fixture.release.is_closed(), "timed-out writer must be dropped");
         assert_eq!(fixture.entered.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+        assert_eq!(fixture.written.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn endpoint_preserves_control_response_during_pending_write() {
+        for payload_write in [false, true] {
+            let mut fixture = gated_endpoint_with_refresh(Duration::from_secs(120), Duration::ZERO);
+            let request = timeout(Duration::from_secs(2), fixture.entered.recv())
+                .await.unwrap().unwrap();
+            let request = parse_stun(&request).unwrap();
+            assert_eq!(request.typ, MessageType::new(METHOD_REFRESH, CLASS_REQUEST));
+            let sending = if payload_write {
+                fixture.release.send(()).await.unwrap();
+                timeout(Duration::from_secs(2), fixture.written.recv()).await.unwrap().unwrap();
+                let endpoint = fixture.endpoint.clone();
+                let sending = tokio::spawn(async move { endpoint.send(b"up").await });
+                let frame = timeout(Duration::from_secs(2), fixture.entered.recv())
+                    .await.unwrap().unwrap();
+                assert_eq!(frame, [0x40, 0, 0, 2, b'u', b'p', 0, 0]);
+                Some(sending)
+            } else {
+                None
+            };
+            let integrity = MessageIntegrity::new_long_term_integrity(
+                "test-user".into(), "test-realm".into(), "test-password".into(),
+            );
+            let response = success(&request, 120, &integrity, true);
+            fixture.incoming.send(Ok(response.raw)).await.unwrap();
+            fixture.incoming.send(Ok(vec![0x40, 0, 0, 4, b'd', b'o', b'w', b'n']))
+                .await.unwrap();
+            let mut buffer = [0; 32];
+            let received = timeout(Duration::from_millis(250), fixture.endpoint.recv(&mut buffer)).await;
+            let refreshes_before_write = fixture.endpoint.stats().refreshes;
+            fixture.release.send(()).await.unwrap();
+            timeout(Duration::from_secs(2), fixture.written.recv()).await.unwrap().unwrap();
+            if let Some(sending) = sending {
+                assert_eq!(timeout(Duration::from_secs(2), sending).await.unwrap().unwrap(), Ok(()));
+            }
+            let refreshed = timeout(Duration::from_secs(2), async {
+                while fixture.endpoint.stats().refreshes == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await;
+            let healthy = fixture.endpoint.health();
+            fixture.endpoint.close().await;
+            let length = received.expect("control write blocked downlink dispatch").unwrap();
+            assert_eq!(&buffer[..length], b"down");
+            assert_eq!(refreshes_before_write, 0, "write must finish before accepting its response");
+            refreshed.expect("matching response was discarded during the pending write");
+            assert_eq!(healthy, Ok(()));
+            assert_eq!(fixture.endpoint.stats().refreshes, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_invalid_integrity_during_pending_control_write() {
+        let mut fixture = gated_endpoint_with_refresh(Duration::from_secs(120), Duration::ZERO);
+        let request = timeout(Duration::from_secs(2), fixture.entered.recv())
+            .await.unwrap().unwrap();
+        let request = parse_stun(&request).unwrap();
+        let wrong_integrity = MessageIntegrity::new_long_term_integrity(
+            "test-user".into(), "test-realm".into(), "wrong-password".into(),
+        );
+        let response = success(&request, 120, &wrong_integrity, true);
+        fixture.incoming.send(Ok(response.raw)).await.unwrap();
+        let failure = timeout(Duration::from_secs(2), fixture.endpoint.failure()).await;
+        fixture.endpoint.close().await;
+        assert_eq!(failure.unwrap(), TransportError::Authentication);
+        assert_eq!(fixture.endpoint.stats().refreshes, 0);
+        assert!(fixture.release.is_closed());
         assert_eq!(fixture.written.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
     }
 }
