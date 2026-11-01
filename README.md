@@ -44,9 +44,9 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 
 Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 known_hosts，不要把 Git Bash/WSL 的 SSH 配置误当原生配置。路径含空格或中文可用；向导按 argv 元素传参，不拼接 shell 命令。默认本机入口只绑定 `127.0.0.1`，不要开放到公网。下载不使用系统 HTTP 代理；企业网络需要能直接访问 GitHub HTTPS 发行资产、Cloudflare TURN TLS/UDP 与原 SSH 服务。不要通过关闭证书或身份验证绕过网络限制。
 
-## 从 0.4.x / 0.5.0–0.5.1 升级到 0.5.2
+## 从 0.4.x / 0.5.0–0.5.2 升级到 0.5.3
 
-先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.2/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
+先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.3/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
 
 ## 从 0.3.x 升级
 
@@ -70,6 +70,8 @@ Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 
 
 状态栏流量按 1024 换算，是本次后台累计字节而非速率。历史丢包不等于当前拥塞。详情页可滚动、重复查询复用同一页。`ready` 表示后台就绪，不能替代原生 Host 已连接的验证；旧 `status.json` 也不是进程存活证明。
 
+已成功建立的网关遇到明确的可恢复网络故障时，会按 2、5、15、30 秒退避，之后每 30 秒继续尝试，不因旧重试次数耗尽而永久停机。每次重连仍重新核验原 daemon 和网关身份；Stop 会取消等待及正在进行的连接。首次启动尚未建立连接时仍有启动期限。认证、指纹、权限、哈希、未知协议或无法可靠分类的错误仍停止，不自动放行。详情中的“最近网关故障阶段”保留脱敏诊断；它是历史原因，不代表当前仍未恢复。
+
 ## 路径与安全约束
 
 本机 Tern → loopback UDP → Cloudflare TURN → 认证封装网关 → 远端 loopback Tern frontend → **原 session daemon**。
@@ -79,7 +81,7 @@ Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 
 - Linux 远端始终核验 UNIX socket、SO_PEERCRED、daemon PID、进程启动时间、系统启动标识、可执行文件路径、参数、所有权与权限。同一进程/socket 上的 Tern 就地升级允许可执行文件 inode 改变；其他身份变化拒绝自动改绑。Windows 本机控制使用私有 ACL 与实时进程身份，不把旧状态文件或陈旧 PID 当作停止授权。
 - TLS 验证证书和主机名。证书、授权、未知协议及身份错误失败关闭，不作为网络抖动无限重试。
 - 已建立的 TURN 分配按有效期续期，以单调时钟约束真实到期时间；过期分配不继续转发。可恢复故障只重建受影响 flow；网关恢复单独处理，并重新核验原工作区。
-- 单 flow 上行队列最多 64 包 / 256 KiB，最多 16 条 flow；记录丢弃并保留健康连接。重试、冷却、闲置回收和 Stop 取消均有界。
+- 单 flow 上行队列最多 64 包 / 256 KiB，最多 16 条 flow；记录丢弃并保留健康连接。单次连接、flow 重试、冷却、闲置回收和 Stop 取消均有界；已建立网关的可恢复重连采用有上限的退避间隔，不设永久失败次数上限。
 - 同一本机端口上的 TCP 独立转发到原 SSH 服务，**SSH 不经过 TURN**。通过 HostKeyAlias 验证原主机身份，不改远端 authorized_keys。忽略 OpenSSH 配置的第三方 SSH 实现不在保证范围内。
 
 TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体积更小，但没有证明 RTT 更低或吞吐始终更高；不要把本版当作跨境延迟保证。
@@ -94,7 +96,7 @@ TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体�
 | Windows | 默认数据目录为 `%LOCALAPPDATA%\Tern\plugin-data\tern-turn-relay\`；插件代码位于 `%APPDATA%\Tern\plugins\tern-turn-relay\`，两者不是同一个目录。自定义 profile 以 Tern 实际传入并经核验的路径为准 |
 
 - `credentials/cloudflare.json`：Unix 使用目录 0700、文件 0600 的私有明文文件；Windows 保存用户级 DPAPI 密文，同时保留私有文件 DACL。Windows 密文不能直接复制给另一用户使用；旧明文文件不会静默加载，需在 Settings 显式重新配置，取消时保留原文件。输入文件仍须满足私有文件要求。
-- `native-runtime/0.5.2/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
+- `native-runtime/0.5.3/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
 - `config.json`、`installation.json`：非秘密配置及安装归属。
 - `runtime/`：生命周期锁、原生控制入口、状态和恢复意图。不要自行删除锁或按 PID/进程名杀进程来绕过检查。
 - Windows 私有资源在创建时使用当前用户、SYSTEM 与 Administrators 的受保护 DACL；本机仅接受规范的盘符绝对路径，远端路径仍为 POSIX。原子比较并替换使用 TxF 内核事务写锁、事务内私有暂存文件、`MoveFileTransacted` 与提交，避免检查后同名替换造成丢失更新；不采用「检查后 rename」或「先删除再重写」降级。
