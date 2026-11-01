@@ -3,7 +3,13 @@ use crate::common::{self, Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngCore;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, io::Read, net::SocketAddr, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io::Read,
+    net::SocketAddr,
+    process::{Output, Stdio},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -289,18 +295,142 @@ valid || exit 41
 printf '{"ok":true,"digest":"%s"}\n' "$digest"
 "#;
 
-fn cache_response(success: bool, bytes: &[u8], digest: &str) -> Result<bool> {
-    if !success {
-        return Err(failure("security_error"));
+#[derive(Clone, Copy)]
+enum PreparationStage {
+    Architecture,
+    CacheProbe,
+    CacheInstall,
+}
+
+impl PreparationStage {
+    fn annotate(self, mut error: Error) -> Error {
+        error.message = match self {
+            Self::Architecture => "Dedicated gateway architecture probe failed.",
+            Self::CacheProbe => "Dedicated gateway cache probe failed.",
+            Self::CacheInstall => "Dedicated gateway cache install failed.",
+        };
+        error
     }
-    let response = crate::remote::parse_json(bytes)?;
+
+    fn failure(self, code: &str) -> Error {
+        self.annotate(failure(code))
+    }
+
+    fn process_error(self, error: Error) -> Error {
+        // Without a completed Output, only an explicit deadline is evidence
+        // of a transient failure. Spawn, I/O and output-limit errors fail closed.
+        self.failure(if error.code == "process-timeout" {
+            "connectivity_uncertain"
+        } else {
+            "unknown"
+        })
+    }
+}
+
+fn network_diagnostic(line: &str) -> bool {
+    let reason = if let Some(rest) = line.strip_prefix("ssh: connect to host ") {
+        rest.rsplit_once(": ").map(|(_, reason)| reason)
+    } else if let Some(rest) = line.strip_prefix("Read from remote host ") {
+        rest.rsplit_once(": ").map(|(_, reason)| reason)
+    } else {
+        line.strip_prefix("kex_exchange_identification: read: ")
+            .or_else(|| line.strip_prefix("client_loop: send disconnect: "))
+    };
+    if reason.is_some_and(|reason| {
+        matches!(reason, "Connection timed out" | "Operation timed out"
+            | "Connection reset by peer" | "Connection refused"
+            | "No route to host" | "Network is unreachable" | "Broken pipe")
+    }) || line == "Connection timed out during banner exchange" {
+        return true;
+    }
+    let peer = line.strip_prefix("Connection reset by ").or_else(|| {
+        line.strip_prefix("Connection to ")?.strip_suffix(" timed out")
+    });
+    peer.and_then(|peer| peer.rsplit_once(" port "))
+        .is_some_and(|(host, port)| {
+            !host.is_empty()
+                && !host.chars().any(char::is_whitespace)
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        })
+}
+
+fn preparation_status(output: &Output, stage: PreparationStage) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    // Keep the exit status and stderr together until classification. In
+    // particular, the installer's validation refusal outranks network text.
+    let code = if output.status.code() == Some(41) {
+        "security_error"
+    } else if let Ok(stderr) = std::str::from_utf8(&output.stderr) {
+        let contains = |needle: &str| {
+            stderr.as_bytes().windows(needle.len())
+                .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()))
+        };
+        if ["host key", "hostkey", "remote host identification has changed"]
+            .iter().any(|needle| contains(needle)) {
+            "security_error"
+        } else if ["permission denied", "access denied", "authentication",
+            "load key", "sign_and_send_pubkey"]
+            .iter().any(|needle| contains(needle)) {
+            "authorization_denied"
+        } else if output.status.code() == Some(255)
+            && !stderr.trim().is_empty()
+            && stderr.lines().map(str::trim).filter(|line| !line.is_empty())
+                .all(network_diagnostic)
+        {
+            // Only known OpenSSH network diagnostics qualify. Unknown lines,
+            // including localized diagnostics, remain terminal rather than
+            // guessing from exit 255 or network words in arbitrary text.
+            "connectivity_uncertain"
+        } else {
+            "unknown"
+        }
+    } else {
+        "unknown"
+    };
+    Err(stage.failure(code))
+}
+
+fn architecture_response(output: &Output) -> Result<(&str, &str)> {
+    let stage = PreparationStage::Architecture;
+    preparation_status(output, stage)?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| stage.failure("protocol_error"))?;
+    let mut lines = text.lines();
+    let (Some(arch), Some(home), None) = (lines.next(), lines.next(), lines.next()) else {
+        return Err(stage.failure("protocol_error"));
+    };
+    let arch = match arch {
+        "x86_64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        _ => return Err(stage.failure("security_error")),
+    };
+    common::safe_absolute(home).map_err(|_| stage.failure("security_error"))?;
+    Ok((arch, home))
+}
+
+fn cache_response(output: &Output, digest: &str) -> Result<bool> {
+    let stage = PreparationStage::CacheProbe;
+    preparation_status(output, stage)?;
+    let response = crate::remote::parse_json(&output.stdout).map_err(|e| stage.annotate(e))?;
     let cached = response["cached"]
         .as_bool()
-        .ok_or_else(|| failure("protocol_error"))?;
+        .ok_or_else(|| stage.failure("protocol_error"))?;
     if response != json!({"ok":true,"digest":digest,"cached":cached}) {
-        return Err(failure("identity_mismatch"));
+        return Err(stage.failure("identity_mismatch"));
     }
     Ok(cached)
+}
+
+fn install_response(output: &Output, digest: &str) -> Result<()> {
+    let stage = PreparationStage::CacheInstall;
+    preparation_status(output, stage)?;
+    let response = crate::remote::parse_json(&output.stdout).map_err(|e| stage.annotate(e))?;
+    if response != json!({"ok":true,"digest":digest}) {
+        return Err(stage.failure("identity_mismatch"));
+    }
+    Ok(())
 }
 
 fn upload_payload<R: Read>(cached: bool, source: &mut R, size: u64) -> Result<Option<Vec<u8>>> {
@@ -349,21 +479,8 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
         Duration::from_secs(15),
     )
     .await
-    .map_err(|_| failure("connectivity_uncertain"))?;
-    if !probe.status.success() {
-        return Err(failure("connectivity_uncertain"));
-    }
-    let text = std::str::from_utf8(&probe.stdout).map_err(|_| failure("protocol_error"))?;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() != 2 {
-        return Err(failure("protocol_error"));
-    }
-    let arch = match lines[0] {
-        "x86_64" => "x86_64",
-        "aarch64" | "arm64" => "aarch64",
-        _ => return Err(failure("security_error")),
-    };
-    common::safe_absolute(lines[1]).map_err(|_| failure("security_error"))?;
+    .map_err(|e| PreparationStage::Architecture.process_error(e))?;
+    let (arch, home) = architecture_response(&probe)?;
     if endpoint["user"].as_str().is_none() {
         return Err(failure("security_error"));
     }
@@ -380,7 +497,7 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
     {
         return Err(failure("security_error"));
     }
-    let root = format!("{}/.cache/tern-turn-relay-native", lines[1]);
+    let root = format!("{home}/.cache/tern-turn-relay-native");
     let helper = format!("{root}/{}/tern-turn-relay", asset.digest);
     let command = cache_command(&root, &asset.digest, asset.size, "probe");
     let probe = common::run(
@@ -390,8 +507,8 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
         Duration::from_secs(15),
     )
     .await
-    .map_err(|_| failure("connectivity_uncertain"))?;
-    let cached = cache_response(probe.status.success(), &probe.stdout, &asset.digest)?;
+    .map_err(|e| PreparationStage::CacheProbe.process_error(e))?;
+    let cached = cache_response(&probe, &asset.digest)?;
     let Some(bytes) = upload_payload(cached, &mut asset.file, asset.size)? else {
         return Ok(helper);
     };
@@ -403,14 +520,8 @@ async fn deploy_inner(alias: &str, endpoint: &Value) -> Result<String> {
         Duration::from_secs(150),
     )
     .await
-    .map_err(|_| failure("connectivity_uncertain"))?;
-    if !output.status.success() {
-        return Err(failure("security_error"));
-    }
-    let response = crate::remote::parse_json(&output.stdout)?;
-    if response != json!({"ok":true,"digest":asset.digest}) {
-        return Err(failure("identity_mismatch"));
-    }
+    .map_err(|e| PreparationStage::CacheInstall.process_error(e))?;
+    install_response(&output, &asset.digest)?;
     Ok(helper)
 }
 
@@ -791,6 +902,138 @@ mod tests {
             );
         }
     }
+    fn ssh_output(code: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn preparation_output_classifies_network_and_refuses_untrusted_failures() {
+        for (code, stderr, expected) in [
+            (255, "ssh: connect to host example port 22: Connection timed out\n", "connectivity_uncertain"),
+            (255, "kex_exchange_identification: read: Connection reset by peer\n", "connectivity_uncertain"),
+            (255, "Connection reset by 192.0.2.1 port 22\n", "connectivity_uncertain"),
+            (255, "Connection to 192.0.2.1 port 22 timed out\n", "connectivity_uncertain"),
+            (255, "client_loop: send disconnect: Broken pipe\n", "connectivity_uncertain"),
+            (41, "ssh: connect to host example port 22: Connection timed out\n", "security_error"),
+            (255, "user@example: Permission denied (publickey).\n", "authorization_denied"),
+            (255, "Host key verification failed.\n", "security_error"),
+            (255, "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n", "security_error"),
+            (255, "ssh: connect to host example port 22: Connection timed out\nuser@example: Permission denied (publickey).\n", "authorization_denied"),
+            (255, "Host key verification failed.\nConnection reset by 192.0.2.1 port 22\n", "security_error"),
+            (255, "Too many authentication failures\nConnection reset by 192.0.2.1 port 22\n", "authorization_denied"),
+            (255, "Load key \"/private/secret-key\": invalid format\nConnection reset by 192.0.2.1 port 22\n", "authorization_denied"),
+            (255, "unexpected failure\nConnection reset by 192.0.2.1 port 22\n", "unknown"),
+            (255, "remote command failed\n", "unknown"),
+            (255, "unknown error mentioning Connection timed out\n", "unknown"),
+            (255, "Connexion réinitialisée par le correspondant\n", "unknown"),
+            (255, "", "unknown"),
+            (1, "Connection reset by 192.0.2.1 port 22\n", "unknown"),
+        ] {
+            let output = ssh_output(code, b"untrusted response", stderr.as_bytes());
+            let errors = [
+                architecture_response(&output).unwrap_err(),
+                cache_response(&output, "digest").unwrap_err(),
+                install_response(&output, "digest").unwrap_err(),
+            ];
+            for (error, message) in errors.into_iter().zip([
+                "Dedicated gateway architecture probe failed.",
+                "Dedicated gateway cache probe failed.",
+                "Dedicated gateway cache install failed.",
+            ]) {
+                assert_eq!(error.code, expected, "{code}: {stderr}");
+                assert_eq!(recoverable(error.code), expected == "connectivity_uncertain");
+                assert_eq!(error.message, message);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_process_evidence_fails_closed() {
+        let outputs = vec![ssh_output(255, b"", b"\xffConnection reset by 192.0.2.1 port 22\n")];
+        #[cfg(unix)]
+        let outputs = {
+            let mut outputs = outputs;
+            use std::os::unix::process::ExitStatusExt;
+            let mut signaled = ssh_output(255, b"", b"Connection reset by 192.0.2.1 port 22\n");
+            signaled.status = std::process::ExitStatus::from_raw(9);
+            outputs.push(signaled);
+            outputs
+        };
+        for output in outputs {
+            for error in [
+                architecture_response(&output).unwrap_err(),
+                cache_response(&output, "digest").unwrap_err(),
+                install_response(&output, "digest").unwrap_err(),
+            ] {
+                assert_eq!(error.code, "unknown");
+                assert!(!recoverable(error.code));
+            }
+        }
+        for stage in [PreparationStage::Architecture, PreparationStage::CacheProbe, PreparationStage::CacheInstall] {
+            for code in ["process-start", "process-io", "process-wait", "response-limit"] {
+                let error = stage.process_error(Error::new(code, "private process detail"));
+                assert_eq!(error.code, "unknown");
+                assert!(!recoverable(error.code));
+                assert!(!error.message.contains("private"));
+            }
+            let error = stage.process_error(Error::new("process-timeout", "private process detail"));
+            assert_eq!(error.code, "connectivity_uncertain");
+            assert!(recoverable(error.code));
+            assert!(!error.message.contains("private"));
+        }
+    }
+
+    #[test]
+    fn successful_preparation_still_requires_exact_identity_and_schema() {
+        let digest = "a".repeat(64);
+        let architecture = ssh_output(0, b"arm64\n/home/test\n", b"");
+        assert_eq!(architecture_response(&architecture).unwrap(), ("aarch64", "/home/test"));
+        let installed = ssh_output(0, &serde_json::to_vec(&json!({"ok":true,"digest":digest})).unwrap(), b"");
+        install_response(&installed, &digest).unwrap();
+        for response in [
+            json!({"ok":true,"digest":"wrong","cached":true}),
+            json!({"ok":true,"digest":digest,"cached":true,"extra":true}),
+        ] {
+            let output = ssh_output(0, &serde_json::to_vec(&response).unwrap(), b"");
+            let error = cache_response(&output, &digest).unwrap_err();
+            assert_eq!(error.code, "identity_mismatch");
+            assert!(!recoverable(error.code));
+            assert_eq!(error.message, "Dedicated gateway cache probe failed.");
+        }
+        let output = ssh_output(0, b"{\"ok\":true,\"digest\":\"wrong\"}", b"");
+        let error = install_response(&output, &digest).unwrap_err();
+        assert_eq!(error.code, "identity_mismatch");
+        assert!(!recoverable(error.code));
+        assert_eq!(error.message, "Dedicated gateway cache install failed.");
+        let error = architecture_response(&ssh_output(0, b"unexpected\n/home/test\n", b""))
+            .unwrap_err();
+        assert_eq!(error.code, "security_error");
+        assert!(!recoverable(error.code));
+        assert_eq!(error.message, "Dedicated gateway architecture probe failed.");
+        let malformed = ssh_output(0, b"not a response", b"");
+        for error in [
+            architecture_response(&malformed).unwrap_err(),
+            cache_response(&malformed, &digest).unwrap_err(),
+            install_response(&malformed, &digest).unwrap_err(),
+        ] {
+            assert!(!recoverable(error.code));
+        }
+    }
+
     #[test]
     fn cached_hit_never_reads_or_allocates_an_upload_body() {
         struct Unreadable;
@@ -802,19 +1045,19 @@ mod tests {
         let digest = "a".repeat(64);
         let response =
             serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":true})).unwrap();
-        let cached = cache_response(true, &response, &digest).unwrap();
+        let cached = cache_response(&ssh_output(0, &response, b""), &digest).unwrap();
         assert!(upload_payload(cached, &mut Unreadable, MAX_BINARY)
             .unwrap()
             .is_none());
         assert_eq!(
-            cache_response(false, &response, &digest).unwrap_err().code,
+            cache_response(&ssh_output(41, &response, b""), &digest).unwrap_err().code,
             "security_error"
         );
-        assert!(cache_response(true, b"{\"ok\":true,\"cached\":false}", &digest).is_err());
+        assert!(cache_response(&ssh_output(0, b"{\"ok\":true,\"cached\":false}", b""), &digest).is_err());
         let extra =
             serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":true,"extra":true}))
                 .unwrap();
-        assert!(cache_response(true, &extra, &digest).is_err());
+        assert!(cache_response(&ssh_output(0, &extra, b""), &digest).is_err());
     }
 
     #[test]
@@ -822,7 +1065,7 @@ mod tests {
         let digest = "a".repeat(64);
         let response =
             serde_json::to_vec(&json!({"ok":true,"digest":digest,"cached":false})).unwrap();
-        let cached = cache_response(true, &response, &digest).unwrap();
+        let cached = cache_response(&ssh_output(0, &response, b""), &digest).unwrap();
         let mut source = std::io::Cursor::new(b"verified".as_slice());
         assert_eq!(
             upload_payload(cached, &mut source, 8).unwrap(),
@@ -886,11 +1129,7 @@ mod tests {
             }
             async fn install(&self) {
                 let output = self.invoke("install", Some(BODY)).await;
-                assert!(output.status.success());
-                assert_eq!(
-                    crate::remote::parse_json(&output.stdout).unwrap(),
-                    json!({"ok":true,"digest":self.digest})
-                );
+                install_response(&output, &self.digest).unwrap();
             }
         }
         impl Drop for Fixture {
@@ -904,7 +1143,7 @@ mod tests {
             let fixture = Fixture::new();
             let probe = fixture.invoke("probe", None).await;
             assert!(
-                !cache_response(probe.status.success(), &probe.stdout, &fixture.digest).unwrap()
+                !cache_response(&probe, &fixture.digest).unwrap()
             );
             assert!(!fixture.root.exists());
             assert_eq!(fs::read_dir(&fixture.base).unwrap().count(), 0);
@@ -916,7 +1155,7 @@ mod tests {
             assert_eq!(fs::read(&binary).unwrap(), BODY);
             let probe = fixture.invoke("probe", None).await;
             assert!(
-                cache_response(probe.status.success(), &probe.stdout, &fixture.digest).unwrap()
+                cache_response(&probe, &fixture.digest).unwrap()
             );
             assert_eq!(fs::metadata(&binary).unwrap().ino(), before.ino());
             assert_eq!(fs::read_dir(binary.parent().unwrap()).unwrap().count(), 1);
@@ -956,7 +1195,7 @@ mod tests {
                 let before = fs::read(&binary).unwrap();
                 let probe = fixture.invoke("probe", None).await;
                 assert_eq!(
-                    cache_response(probe.status.success(), &probe.stdout, &fixture.digest)
+                    cache_response(&probe, &fixture.digest)
                         .unwrap_err()
                         .code,
                     "security_error"
@@ -968,7 +1207,7 @@ mod tests {
             fs::set_permissions(&fixture.base, fs::Permissions::from_mode(0o777)).unwrap();
             let probe = fixture.invoke("probe", None).await;
             assert_eq!(
-                cache_response(probe.status.success(), &probe.stdout, &fixture.digest)
+                cache_response(&probe, &fixture.digest)
                     .unwrap_err()
                     .code,
                 "security_error"
@@ -981,12 +1220,18 @@ mod tests {
             let fixture = Fixture::new();
             let corrupt = vec![b'x'; BODY.len()];
             let failed = fixture.invoke("install", Some(&corrupt)).await;
-            assert!(!failed.status.success());
+            assert_eq!(failed.status.code(), Some(41));
+            let error = install_response(&failed, &fixture.digest).unwrap_err();
+            assert_eq!(error.code, "security_error");
+            assert!(!recoverable(error.code));
             assert!(!fixture.binary().exists());
             fixture.install().await;
             let before = fs::metadata(fixture.binary()).unwrap().ino();
             let failed = fixture.invoke("install", Some(&corrupt)).await;
-            assert!(!failed.status.success());
+            assert_eq!(failed.status.code(), Some(41));
+            let error = install_response(&failed, &fixture.digest).unwrap_err();
+            assert_eq!(error.code, "security_error");
+            assert!(!recoverable(error.code));
             assert_eq!(fs::metadata(fixture.binary()).unwrap().ino(), before);
             assert_eq!(fs::read(fixture.binary()).unwrap(), BODY);
         }

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File},
+    future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -234,6 +235,7 @@ struct ServiceState {
     gateway_recovering: bool,
     gateway_reconnects: u64,
     gateway_failure_reason: Option<&'static str>,
+    gateway_failure_message: Option<&'static str>,
     recovery_error: Option<&'static str>,
     retired_refreshes: u64,
     bytes_up: u64,
@@ -321,6 +323,7 @@ impl Shared {
         result["gateway_recovering"] = json!(state.gateway_recovering);
         result["gateway_reconnects"] = json!(state.gateway_reconnects);
         result["gateway_failure_reason"] = json!(state.gateway_failure_reason);
+        result["gateway_failure_message"] = json!(state.gateway_failure_message);
         result["credentials_expires_at"] = json!(expires);
         result["recovery_error"] = if matches!(result["state"].as_str(), Some("error" | "stopped"))
         {
@@ -639,6 +642,63 @@ async fn warm_gateway(
     }
 }
 
+// Only established sessions retry indefinitely. Keep the delay index bounded
+// and the public attempt counter saturating even through a prolonged outage.
+async fn recover_gateway<T, Open, Opening>(
+    shared: &Shared,
+    attempts: &mut usize,
+    established: bool,
+    mut failure: Error,
+    mut open: Open,
+) -> Result<Option<T>>
+where
+    Open: FnMut() -> Opening,
+    Opening: Future<Output = Result<T>>,
+{
+    loop {
+        if shared.stop.is_cancelled() || shared.fatal.is_cancelled() {
+            return Ok(None);
+        }
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.gateway_failure_reason = Some(gateway_reason(failure.code));
+            state.gateway_failure_message = Some(failure.message);
+            state.recovery_error = Some(failure.message);
+            state.gateway_recovering = gateway_recoverable(failure.code);
+        }
+        if !gateway_recoverable(failure.code) {
+            return Err(failure);
+        }
+        if !established && *attempts == GATEWAY_DELAYS.len() {
+            return Err(Error::new("gateway_recovery_exhausted", "Exclusive gateway recovery exhausted its bounded attempts; no direct fallback was attempted."));
+        }
+        let delay = GATEWAY_DELAYS[(*attempts).min(GATEWAY_DELAYS.len() - 1)];
+        *attempts = (*attempts + 1).min(GATEWAY_DELAYS.len());
+        tokio::select! {
+            biased;
+            _ = shared.stop.cancelled() => return Ok(None),
+            _ = shared.fatal.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+        }
+        let next = tokio::select! {
+            biased;
+            _ = shared.stop.cancelled() => return Ok(None),
+            _ = shared.fatal.cancelled() => return Ok(None),
+            result = async {
+                {
+                    let mut state = shared.state.lock().unwrap();
+                    state.gateway_reconnects = state.gateway_reconnects.saturating_add(1);
+                }
+                open().await
+            } => result,
+        };
+        match next {
+            Ok(next) => return Ok(Some(next)),
+            Err(error) => failure = error,
+        }
+    }
+}
+
 async fn gateway_manager(shared: Arc<Shared>, ready: mpsc::Sender<()>) -> Result<()> {
     let first = tokio::select! {
         biased;
@@ -649,6 +709,7 @@ async fn gateway_manager(shared: Arc<Shared>, ready: mpsc::Sender<()>) -> Result
     let original = first.descriptor.clone();
     let mut gateway = Some(first);
     let mut recovering = false;
+    let mut established = false;
     let mut attempts = 0;
     loop {
         let current = gateway.as_mut().expect("gateway generation present");
@@ -682,6 +743,7 @@ async fn gateway_manager(shared: Arc<Shared>, ready: mpsc::Sender<()>) -> Result
                     return Ok(());
                 }
                 attempts = 0;
+                established = true;
                 tokio::select! {
                     biased;
                     _ = shared.stop.cancelled() => None,
@@ -699,6 +761,7 @@ async fn gateway_manager(shared: Arc<Shared>, ready: mpsc::Sender<()>) -> Result
                 .is_some_and(|error| gateway_recoverable(error.code));
             if let Some(error) = &failure {
                 state.gateway_failure_reason = Some(gateway_reason(error.code));
+                state.gateway_failure_message = Some(error.message);
                 state.recovery_error = Some(error.message);
                 state.public["ok"] = json!(false);
                 if state.public["state"] != "error" {
@@ -709,53 +772,31 @@ async fn gateway_manager(shared: Arc<Shared>, ready: mpsc::Sender<()>) -> Result
         retire_route(&shared).await;
         let _ = current.close().await;
         gateway.take();
-        let Some(mut failure) = failure else {
+        let Some(failure) = failure else {
             return Ok(());
         };
         recovering = true;
-        loop {
-            if !gateway_recoverable(failure.code) {
-                return Err(failure);
-            }
-            if attempts == GATEWAY_DELAYS.len() {
-                return Err(Error::new("gateway_recovery_exhausted", "Exclusive gateway recovery exhausted its bounded attempts; no direct fallback was attempted."));
-            }
-            let delay = GATEWAY_DELAYS[attempts];
-            attempts += 1;
-            tokio::select! {
-                biased;
-                _ = shared.stop.cancelled() => return Ok(()),
-                _ = shared.fatal.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
-            }
+        let Some(mut next) = recover_gateway(
+            &shared,
+            &mut attempts,
+            established,
+            failure,
+            || Gateway::open(&shared.config),
+        ).await? else {
+            return Ok(());
+        };
+        if !same_generation(&original, &next.descriptor, &shared.config) {
+            let error = Error::new("identity_mismatch", "Gateway identity or original daemon changed; refusing to rebind the workspace.");
             {
                 let mut state = shared.state.lock().unwrap();
-                state.gateway_recovering = true;
-                state.gateway_reconnects += 1;
+                state.gateway_failure_reason = Some(gateway_reason(error.code));
+                state.gateway_failure_message = Some(error.message);
+                state.recovery_error = Some(error.message);
             }
-            let next = tokio::select! {
-                biased;
-                _ = shared.stop.cancelled() => return Ok(()),
-                _ = shared.fatal.cancelled() => return Ok(()),
-                result = Gateway::open(&shared.config) => result,
-            };
-            match next {
-                Ok(mut next) => {
-                    if !same_generation(&original, &next.descriptor, &shared.config) {
-                        let _ = next.close().await;
-                        return Err(Error::new("identity_mismatch", "Gateway identity or original daemon changed; refusing to rebind the workspace."));
-                    }
-                    gateway = Some(next);
-                    break;
-                }
-                Err(error) => {
-                    shared.state.lock().unwrap().gateway_failure_reason =
-                        Some(gateway_reason(error.code));
-                    shared.state.lock().unwrap().recovery_error = Some(error.message);
-                    failure = error;
-                }
-            }
+            let _ = next.close().await;
+            return Err(error);
         }
+        gateway = Some(next);
     }
 }
 
@@ -1230,6 +1271,7 @@ async fn serve(
             gateway_recovering: false,
             gateway_reconnects: 0,
             gateway_failure_reason: None,
+            gateway_failure_message: None,
             recovery_error: None,
             retired_refreshes: 0,
             bytes_up: 0,
@@ -1570,6 +1612,7 @@ mod tests {
                 gateway_recovering: false,
                 gateway_reconnects: 0,
                 gateway_failure_reason: None,
+                gateway_failure_message: None,
                 recovery_error: None,
                 retired_refreshes: 0,
                 bytes_up: 0,
@@ -1593,6 +1636,179 @@ mod tests {
             fatal: CancellationToken::new(),
             demand: Notify::new(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_survives_prolonged_outage_at_capped_frequency() {
+        let shared = recovery_shared();
+        let calls = AtomicUsize::new(0);
+        let mut attempts = 0;
+        let retry = recover_gateway(
+            &shared,
+            &mut attempts,
+            true,
+            crate::gateway::failure("control_eof"),
+            || {
+                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                std::future::ready(if call == 8 {
+                    Ok(())
+                } else {
+                    Err(crate::gateway::failure("connectivity_uncertain"))
+                })
+            },
+        );
+        tokio::pin!(retry);
+        assert!(futures_util::poll!(retry.as_mut()).is_pending());
+        for (index, delay) in [2, 5, 15, 30, 30, 30, 30, 30].into_iter().enumerate() {
+            tokio::time::advance(Duration::from_secs(delay - 1)).await;
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            assert_eq!(calls.load(Ordering::SeqCst), index);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            if index < 7 {
+                assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            } else {
+                assert!(matches!(futures_util::poll!(retry.as_mut()), std::task::Poll::Ready(Ok(Some(())))));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+        }
+        let status = shared.snapshot();
+        assert_eq!(status["gateway_reconnects"], 8);
+        assert_eq!(status["gateway_failure_reason"], "connectivity_uncertain");
+        assert_eq!(status["gateway_failure_message"], crate::gateway::failure("connectivity_uncertain").message);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_stop_or_fatal_cancels_wait_without_reopening() {
+        for fatal in [false, true] {
+            let shared = recovery_shared();
+            let calls = AtomicUsize::new(0);
+            let mut attempts = 0;
+            let retry = recover_gateway(
+                &shared,
+                &mut attempts,
+                true,
+                crate::gateway::failure("control_eof"),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<(), _>(crate::gateway::failure("connectivity_uncertain")))
+                },
+            );
+            tokio::pin!(retry);
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if fatal { shared.fatal.cancel(); } else { shared.stop.cancel(); }
+            assert!(matches!(futures_util::poll!(retry.as_mut()), std::task::Poll::Ready(Ok(None))));
+            tokio::time::advance(Duration::from_secs(300)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_stop_or_fatal_cancels_inflight_open() {
+        for fatal in [false, true] {
+            let shared = recovery_shared();
+            let calls = AtomicUsize::new(0);
+            let mut attempts = 0;
+            let retry = recover_gateway(
+                &shared,
+                &mut attempts,
+                true,
+                crate::gateway::failure("control_eof"),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<()>>()
+                },
+            );
+            tokio::pin!(retry);
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if fatal { shared.fatal.cancel(); } else { shared.stop.cancel(); }
+            assert!(matches!(futures_util::poll!(retry.as_mut()), std::task::Poll::Ready(Ok(None))));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_existing_security_failure_never_opens() {
+        let shared = recovery_shared();
+        let calls = AtomicUsize::new(0);
+        let mut attempts = 0;
+        let result = recover_gateway(
+            &shared,
+            &mut attempts,
+            true,
+            crate::gateway::failure("security_error"),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(()))
+            },
+        ).await;
+        assert_eq!(result.unwrap_err().code, "security_error");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_terminal_refusal_never_retries_again() {
+        for code in ["security_error", "authorization_denied", "identity_mismatch", "protocol_error", "unknown"] {
+            let shared = recovery_shared();
+            let calls = AtomicUsize::new(0);
+            let mut attempts = 0;
+            let result = recover_gateway(
+                &shared,
+                &mut attempts,
+                true,
+                crate::gateway::failure("control_eof"),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<(), _>(crate::gateway::failure(code)))
+                },
+            ).await;
+            assert_eq!(result.unwrap_err().code, code);
+            tokio::time::advance(Duration::from_secs(300)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let status = shared.snapshot();
+            assert_eq!(status["gateway_recovering"], false);
+            assert_eq!(status["gateway_failure_reason"], code);
+            assert_eq!(status["gateway_failure_message"], crate::gateway::failure(code).message);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_before_establishment_keeps_original_attempt_budget() {
+        let shared = recovery_shared();
+        let calls = AtomicUsize::new(0);
+        let mut attempts = 0;
+        let result = recover_gateway(
+            &shared,
+            &mut attempts,
+            false,
+            crate::gateway::failure("control_eof"),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(crate::gateway::failure("connectivity_uncertain")))
+            },
+        ).await;
+        assert_eq!(result.unwrap_err().code, "gateway_recovery_exhausted");
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_counter_saturates_while_reconnections_continue() {
+        let shared = recovery_shared();
+        shared.state.lock().unwrap().gateway_reconnects = u64::MAX;
+        let mut attempts = 0;
+        assert_eq!(recover_gateway(
+            &shared,
+            &mut attempts,
+            true,
+            crate::gateway::failure("control_eof"),
+            || std::future::ready(Ok(())),
+        ).await.unwrap(), Some(()));
+        assert_eq!(shared.snapshot()["gateway_reconnects"], u64::MAX);
     }
 
     #[tokio::test(start_paused = true)]
