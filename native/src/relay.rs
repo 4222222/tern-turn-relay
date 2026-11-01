@@ -508,6 +508,37 @@ async fn flow_loop(
     }
 }
 
+async fn bind_loopback_udp(port: u16) -> Result<UdpSocket> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|_| Error::new("udp_bind", "Cannot bind the loopback UDP relay port."))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SOCKET_ERROR};
+        // 本机客户端关闭端口后的 ICMP 回报不应终止共享 UDP 监听器。
+        // 仅关闭 PORT_UNREACHABLE 回报；真正的套接字错误仍由接收循环处理。
+        let report_unreachable = 0u32;
+        let mut returned = 0u32;
+        if unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as _,
+                SIO_UDP_CONNRESET,
+                (&report_unreachable as *const u32).cast(),
+                std::mem::size_of_val(&report_unreachable) as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        } == SOCKET_ERROR {
+            return Err(Error::new("udp_configuration", "Cannot configure loopback UDP port-unreachable handling."));
+        }
+    }
+    Ok(socket)
+}
+
 async fn udp_receiver(shared: Arc<Shared>, socket: Arc<UdpSocket>) -> Result<()> {
     let mut buffer = vec![0; 65536];
     loop {
@@ -1350,11 +1381,7 @@ async fn serve(
         let endpoint = ssh::resolve(&shared.config).await?;
         shared.state.lock().unwrap().ssh_endpoint = Some(endpoint.value());
         let port = shared.config["listen_port"].as_u64().ok_or_else(invalid)? as u16;
-        let socket = Arc::new(
-            UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
-                .await
-                .map_err(|_| Error::new("udp_bind", "Cannot bind the loopback UDP relay port."))?,
-        );
+        let socket = Arc::new(bind_loopback_udp(port).await?);
         let udp_shared = shared.clone();
         udp_task = Some(tokio::spawn(async move {
             if let Err(error) = udp_receiver(udp_shared.clone(), socket).await {
@@ -1996,6 +2023,24 @@ mod tests {
         assert!(record.data.lock().unwrap().queue.is_empty());
         assert!(fixture.entered.try_recv().is_err(), "no duplicate uplink may be submitted");
         assert!(fixture.written.try_recv().is_err(), "no duplicate uplink may be written");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn closed_loopback_client_does_not_break_shared_udp_listener() {
+        let listener = bind_loopback_udp(0).await.unwrap();
+        let old_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let closed_address = old_client.local_addr().unwrap();
+        drop(old_client);
+        listener.send_to(b"late-reply", closed_address).await.unwrap();
+        let mut buffer = [0u8; 64];
+        assert!(tokio::time::timeout(Duration::from_millis(100), listener.recv_from(&mut buffer)).await.is_err(),
+            "关闭客户端的 ICMP 回报不能使共享监听器接收失败");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client.send_to(b"healthy-client", listener.local_addr().unwrap()).await.unwrap();
+        let (length, source) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buffer)).await.unwrap().unwrap();
+        assert_eq!(&buffer[..length], b"healthy-client");
+        assert_eq!(source, client.local_addr().unwrap());
     }
 
     #[test]
