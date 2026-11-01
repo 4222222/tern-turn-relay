@@ -392,6 +392,25 @@ async fn retire_endpoint(shared: &Shared, record: &FlowRecord) {
     }
 }
 
+async fn deliver_downlink(
+    shared: &Shared,
+    record: &FlowRecord,
+    socket: &UdpSocket,
+    address: SocketAddr,
+    codec: &mut Codec,
+    frame: &[u8],
+) -> Result<()> {
+    if let Some(payload) = codec.decode(frame) {
+        // The generation is retired before its cancellation is signalled.
+        if shared.state.lock().unwrap().route_available {
+            socket.send_to(payload, address).await.map_err(|_| Error::new("loopback_delivery", "Loopback delivery failed; reconnect to recover."))?;
+            shared.state.lock().unwrap().bytes_down += payload.len() as u64;
+            record.data.lock().unwrap().last_activity = Instant::now();
+        }
+    }
+    Ok(())
+}
+
 async fn flow_loop(
     shared: Arc<Shared>,
     record: Arc<FlowRecord>,
@@ -431,23 +450,36 @@ async fn flow_loop(
             error = endpoint.failure() => Err(error),
             packet = endpoint.recv(&mut incoming) => match packet {
                 Ok(length) => {
-                    if let Some(payload) = codec.decode(&incoming[..length]) {
-                        // The generation is retired before its cancellation is signalled.
-                        if shared.state.lock().unwrap().route_available {
-                            socket.send_to(payload, address).await.map_err(|_| Error::new("loopback_delivery", "Loopback delivery failed; reconnect to recover."))?;
-                            shared.state.lock().unwrap().bytes_down += payload.len() as u64;
-                            record.data.lock().unwrap().last_activity = Instant::now();
-                        }
-                    }
+                    deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
                     Ok(())
                 }
                 Err(error) => Err(error),
             },
             packet = record.next() => {
                 codec.encode(&packet, &mut outgoing)?;
-                match endpoint.send(&outgoing).await {
-                    Ok(()) => { shared.state.lock().unwrap().bytes_up += packet.len() as u64; Ok(()) },
-                    Err(error) => Err(error),
+                let sending = endpoint.send(&outgoing);
+                tokio::pin!(sending);
+                loop {
+                    tokio::select! {
+                        error = endpoint.failure() => break Err(error),
+                        result = &mut sending => {
+                            if result.is_ok() {
+                                shared.state.lock().unwrap().bytes_up += packet.len() as u64;
+                            }
+                            break result;
+                        },
+                        received = endpoint.recv(&mut incoming) => match received {
+                            Ok(length) => {
+                                deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
+                            },
+                            Err(error) => break Err(error),
+                        },
+                    }
+                    batch += 1;
+                    if batch == 32 {
+                        batch = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             },
         };
@@ -1652,9 +1684,11 @@ mod tests {
         channel.extend_from_slice(&frame);
         channel.resize((channel.len() + 3) & !3, 0);
         assert!(record.enqueue(b"blocked uplink"));
+        assert!(record.enqueue(b"second uplink"));
+        assert!(record.enqueue(b"third uplink"));
         let worker = tokio::spawn(flow_loop(
             shared.clone(),
-            record,
+            record.clone(),
             socket.clone(),
             client.local_addr().unwrap(),
             "127.0.0.1:4321".parse().unwrap(),
@@ -1672,6 +1706,7 @@ mod tests {
             fixture.written.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         );
+        let queued_while_sending = record.data.lock().unwrap().queue.len();
 
         // Never release the write gate: delivery must not depend on uplink
         // completion. Clean up both real loops before reporting a failure.
@@ -1679,6 +1714,7 @@ mod tests {
         let _ = worker.await;
         fixture.endpoint.close().await;
         assert!(send_still_pending, "uplink must remain gated during downlink delivery");
+        assert_eq!(queued_while_sending, 2, "only one ordered uplink may be in flight");
         let (length, source) = received
             .expect("flow_loop must receive authenticated downlink while its uplink send is pending")
             .unwrap();
@@ -1687,6 +1723,63 @@ mod tests {
         let state = shared.state.lock().unwrap();
         assert_eq!(state.bytes_up, 0);
         assert_eq!(state.bytes_down, b"downlink while sending".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn flow_loop_preserves_uplink_order_and_sequence_across_gated_sends() {
+        let mut fixture = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        let record = Arc::new(FlowRecord::new(Some(fixture.endpoint.clone())));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let key = [7; 32];
+        let codec = Codec::new(key);
+        let flow = codec.flow;
+        let payloads: [&[u8]; 3] = [b"first", b"second", b"third"];
+        for payload in payloads {
+            assert!(record.enqueue(payload));
+        }
+        let worker = tokio::spawn(flow_loop(
+            shared.clone(),
+            record.clone(),
+            socket.clone(),
+            socket.local_addr().unwrap(),
+            "127.0.0.1:4321".parse().unwrap(),
+            codec,
+        ));
+
+        let mut completed_bytes = 0;
+        for (index, payload) in payloads.iter().enumerate() {
+            let channel = timeout(Duration::from_secs(2), fixture.entered.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(&channel[..2], &[0x40, 0]);
+            let length = u16::from_be_bytes([channel[2], channel[3]]) as usize;
+            let decoded = crate::protocol::decode(
+                &key,
+                crate::protocol::CLIENT_TO_SERVER,
+                &channel[4..4 + length],
+            ).unwrap();
+            assert_eq!(decoded, (flow, index as u64 + 1, *payload));
+            assert_eq!(record.data.lock().unwrap().queue.len(), 2 - index);
+            assert_eq!(shared.state.lock().unwrap().bytes_up, completed_bytes);
+            assert!(matches!(fixture.written.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            fixture.release.send(()).await.unwrap();
+            let written = timeout(Duration::from_secs(2), fixture.written.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(written, channel);
+            completed_bytes += payload.len() as u64;
+        }
+        let accounted = timeout(Duration::from_secs(2), async {
+            while shared.state.lock().unwrap().bytes_up != completed_bytes {
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        worker.abort();
+        let _ = worker.await;
+        fixture.endpoint.close().await;
+        accounted.expect("each completed uplink must be accounted exactly once");
+        assert!(record.data.lock().unwrap().queue.is_empty());
+        assert!(fixture.entered.try_recv().is_err(), "no duplicate uplink may be submitted");
+        assert!(fixture.written.try_recv().is_err(), "no duplicate uplink may be written");
     }
 
     #[test]

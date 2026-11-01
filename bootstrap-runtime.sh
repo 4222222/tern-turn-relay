@@ -56,7 +56,7 @@ permissions=$(/usr/bin/stat -f '%Lp' "$manifest")
 case "$permissions" in 400|600|444|644) ;; *) fail 'Native release manifest is writable by another user' ;; esac
 [ "$(/usr/bin/stat -f '%z' "$manifest")" -le 65536 ] || fail 'Native release manifest exceeds its limit'
 version=$(/usr/bin/plutil -extract version raw -o - "$manifest") || fail 'Invalid native release manifest'
-[ "$version" = 0.5.1 ] || fail 'Native release version does not match the plugin'
+[ "$version" = 0.5.2 ] || fail 'Native release version does not match the plugin'
 [ "$(/usr/bin/plutil -extract schema raw -o - "$manifest")" = 1 ] || fail 'Unsupported native release manifest'
 asset=tern-turn-relay-darwin-$arch
 sha256=$(/usr/bin/plutil -extract "assets.$asset.sha256" raw -o - "$manifest") || fail 'Native asset checksum is missing'

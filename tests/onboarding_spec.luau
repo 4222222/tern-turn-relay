@@ -71,8 +71,8 @@ end
 
 function cases.wrong_binary_or_version_never_reaches_inspect()
     for _, value in ipairs({
-        { ok = true, runtime_ready = true, version = '0.4.0', binary = 'C:/用户/data/native-runtime/0.5.1/tern-turn-relay.exe' },
-        { ok = true, runtime_ready = true, version = '0.5.1', binary = 'C:/other.exe' },
+        { ok = true, runtime_ready = true, version = '0.4.0', binary = 'C:/用户/data/native-runtime/0.5.2/tern-turn-relay.exe' },
+        { ok = true, runtime_ready = true, version = '0.5.2', binary = 'C:/other.exe' },
     }) do
         local f = fixture('windows')
         f.wizard.open(f:context())
@@ -84,7 +84,7 @@ end
 function cases.valid_preparation_uses_exact_private_exe()
     local f = fixture('windows')
     f.wizard.open(f:context())
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.1', binary = 'C:\\用户\\data\\native-runtime\\0.5.1\\tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.2', binary = 'C:\\用户\\data\\native-runtime\\0.5.2\\tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.changes == 1)
     local argv = f.calls[2].argv
     assert(argv[1] == 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe' and argv[10] == '--exec' and argv[11] == 'onboarding' and argv[12] == 'inspect')
@@ -95,7 +95,7 @@ end
 function cases.runtime_reverification_failure_never_reaches_inspect()
     local f = fixture('windows')
     f.wizard.open(f:context())
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.1', binary = 'C:/用户/data/native-runtime/0.5.1/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.2', binary = 'C:/用户/data/native-runtime/0.5.2/tern-turn-relay.exe' })
     assert(f.calls[2].argv[10] == '--exec')
     f:complete({ ok = false, error = 'runtime changed' }, 1)
     assert(f.inspected == 0 and #f.errors == 1 and not f.wizard.active)

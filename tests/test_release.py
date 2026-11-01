@@ -14,7 +14,7 @@ release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
 
-def collected_fixtures(directory, current='0.5.1'):
+def collected_fixtures(directory, current='0.5.2'):
     for index,(name,(target,system,arch)) in enumerate(release.ASSET_TARGETS.items()):
         data=(name.encode()+bytes(range(128)))*(index+1)
         (directory/name).write_bytes(data)
@@ -49,7 +49,7 @@ class ReleaseTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((release.ROOT / name).read_bytes())
             (package / 'native/src').mkdir(parents=True)
-            (package / 'native/Cargo.toml').write_text('version = "0.5.1"\n')
+            (package / 'native/Cargo.toml').write_text('version = "0.5.2"\n')
             (package / 'native/Cargo.lock').write_text('version = 4\n')
             (package / 'native/src/main.rs').write_text('fn main() {}\n')
             (package / 'tools').mkdir()
@@ -64,10 +64,10 @@ class ReleaseTests(unittest.TestCase):
                 release.manifest(binaries, package / 'release.json')
                 with contextlib.redirect_stdout(io.StringIO()):
                     release.package(root / 'out',binaries)
-                with tarfile.open(root / 'out/tern-turn-relay-0.5.1.tar.gz') as archive:
-                    names = {Path(name).relative_to('tern-turn-relay-0.5.1').as_posix() for name in archive.getnames()}
+                with tarfile.open(root / 'out/tern-turn-relay-0.5.2.tar.gz') as archive:
+                    names = {Path(name).relative_to('tern-turn-relay-0.5.2').as_posix() for name in archive.getnames()}
                     self.assertTrue(set(release.RUNTIME_FILES).issubset(names))
-                    manifest = json.load(archive.extractfile('tern-turn-relay-0.5.1/release.json'))
+                    manifest = json.load(archive.extractfile('tern-turn-relay-0.5.2/release.json'))
                     self.assertIn('tern-turn-relay-windows-x86_64.exe', manifest['assets'])
                 value = json.loads((package / 'release.json').read_text())
                 del value['assets']['tern-turn-relay-windows-x86_64.exe']

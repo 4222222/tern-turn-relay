@@ -63,7 +63,7 @@ try {
     $package = Join-Path $root 'plugin 中文'
     $data = Join-Path $root 'data 中文'
     $runtimeRoot = Join-Path $data 'native-runtime'
-    $runtime = Join-Path $runtimeRoot '0.5.1'
+    $runtime = Join-Path $runtimeRoot '0.5.2'
     foreach ($directory in @($package, $data, $runtimeRoot, $runtime)) { [void][IO.Directory]::CreateDirectory($directory, (PrivateAcl $true)) }
     $systemShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     Copy-Item -LiteralPath $script -Destination $package
@@ -87,7 +87,7 @@ public static class BootstrapBoundaryProbe {
 '@
     [IO.File]::SetAccessControl($exe, (PrivateAcl $false))
     $entry = @{ size = (Get-Item -LiteralPath $exe).Length; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() }
-    $manifest = @{ schema = 1; version = '0.5.1'; assets = @{ 'tern-turn-relay-windows-x86_64.exe' = $entry } } | ConvertTo-Json -Depth 5
+    $manifest = @{ schema = 1; version = '0.5.2'; assets = @{ 'tern-turn-relay-windows-x86_64.exe' = $entry } } | ConvertTo-Json -Depth 5
     foreach ($manifestPath in @((Join-Path $package 'release.json'), (Join-Path $runtime 'release.json'))) {
         [IO.File]::WriteAllText($manifestPath, $manifest, (New-Object Text.UTF8Encoding($false)))
         [IO.File]::SetAccessControl($manifestPath, (PrivateAcl $false))
