@@ -441,7 +441,18 @@ mod tests {
 
     #[tokio::test]
     async fn detached_service_does_not_hold_launcher_response_pipe_open() {
-        let executable = crate::windows_security::normalize_system_path(&std::env::current_exe().unwrap()).unwrap();
+        // Cargo/runner 的产物可能具有额外链接或不同归属；测试运行时使用独立私有副本。
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let base = crate::windows_security::normalize_system_path(&std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let fixture = Fixture(base.join(format!("ttr-stdio-{:032x}", rand::random::<u128>())));
+        crate::common::private_dir(&fixture.0, true).unwrap();
+        let executable = fixture.0.join("launcher.exe");
+        let mut copied = crate::windows_security::create_file(&executable).unwrap();
+        std::io::copy(&mut std::fs::File::open(std::env::current_exe().unwrap()).unwrap(), &mut copied.file).unwrap();
+        drop(copied);
         let mut command = Command::new(executable);
         command.args(["--ignored", "--exact", "windows_process::tests::detached_stdio_helper", "--nocapture"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
