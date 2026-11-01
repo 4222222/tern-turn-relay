@@ -359,6 +359,22 @@ impl Drop for ReaderGuard {
     }
 }
 
+fn tls_handshake_error(error: std::io::Error) -> TransportError {
+    // rustls 的证书/协议验证错误始终失败关闭，不能按网络中断恢复。
+    if error.get_ref().is_some_and(|source| source.is::<rustls::Error>()) {
+        return TransportError::TlsAuthentication;
+    }
+    match error.kind() {
+        std::io::ErrorKind::TimedOut => TransportError::Timeout,
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::NotConnected => TransportError::Network,
+        _ => TransportError::TlsAuthentication,
+    }
+}
+
 async fn wire(
     config: &TurnConfig,
     shared: Arc<Shared>,
@@ -422,7 +438,7 @@ async fn wire(
     let stream = TlsConnector::from(Arc::new(tls))
         .connect(name, tcp)
         .await
-        .map_err(|_| TransportError::TlsAuthentication)?;
+        .map_err(tls_handshake_error)?;
     let (mut reader, writer) = tokio::io::split(stream);
     let task = tokio::spawn(async move {
         let mut buffer = vec![0; MAX_WIRE];
@@ -1137,6 +1153,49 @@ mod tests {
         assert_eq!(early, late);
         assert!(lease_end(sent, lifetime, sent + lifetime).is_err());
         assert!(lease_end(sent, Duration::ZERO, sent).is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_closing_during_tls_handshake_is_recoverable_network_loss() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let config = TurnConfig {
+            mode: Mode::Tls,
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            username: "test-user".into(),
+            password: "test-password".into(),
+            expires: common::unix_time() + 3600.0,
+        };
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = [0u8; 4096];
+            assert!(stream.read(&mut hello).await.unwrap() > 0);
+            // 模拟握手中的网络断开，没有发送证书或 TLS 验证失败告警。
+        });
+        let shared = Arc::new(Shared {
+            state: StdMutex::new(State {
+                allocation: None, permission: None, error: None,
+                expires: config.expires, refreshes: 0, receive_bytes: 0,
+            }),
+            cancel: CancellationToken::new(),
+        });
+        let error = timeout(Duration::from_secs(5), wire(&config, shared)).await.unwrap().err().unwrap();
+        peer.await.unwrap();
+        assert_eq!(error, TransportError::Network);
+        assert!(error.recoverable());
+    }
+
+    #[test]
+    fn tls_verification_errors_never_become_recoverable_network_errors() {
+        for kind in [std::io::ErrorKind::InvalidData, std::io::ErrorKind::ConnectionReset] {
+            let error = std::io::Error::new(kind,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer));
+            let classified = tls_handshake_error(error);
+            assert_eq!(classified, TransportError::TlsAuthentication);
+            assert!(!classified.recoverable());
+        }
+        assert_eq!(tls_handshake_error(std::io::ErrorKind::TimedOut.into()), TransportError::Timeout);
+        assert_eq!(tls_handshake_error(std::io::ErrorKind::Other.into()), TransportError::TlsAuthentication);
     }
 
     #[test]

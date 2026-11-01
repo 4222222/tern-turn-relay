@@ -136,7 +136,7 @@ function cases.stop_bad_runtime_identity_and_timeout_preserve_hosts()
             f.time = 322001
             assert(f:tick())
         else
-            f:complete({ ok = true, runtime_ready = true, version = '0.5.0', binary = 'C:/wrong.exe' })
+            f:complete({ ok = true, runtime_ready = true, version = '0.5.1', binary = 'C:/wrong.exe' })
         end
         assert(#f.calls == 1 and f.mutations == 0 and f.status()[1].tone == 'error')
         f:command('status')
@@ -147,7 +147,7 @@ end
 function cases.successful_prepare_still_requires_real_stop_result()
     local f = fixture('windows', true)
     f:command('disconnect')
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.0', binary = 'C:/用户/data/native-runtime/0.5.0/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.1', binary = 'C:/用户/data/native-runtime/0.5.1/tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.calls[2].argv[10] == '--exec' and f.calls[2].argv[11] == 'relay' and f.calls[2].argv[12] == 'stop')
     assert(f.mutations == 0)
     f:complete({ ok = true, state = 'stopped' }) -- 缺失状态 schema，不能伪报成功。
@@ -258,6 +258,29 @@ function cases.live_status_timeout_discards_late_ready()
     f.response = f:value('ready'); late({ stdout = '{}', status = 0 }, {})
     f:flush()
     assert(f.status()[1].text:find('不可用') and f.mutations == 0)
+end
+
+function cases.failed_observation_recovers_without_user_command()
+    for _, os in ipairs({ 'windows', 'macos' }) do
+        for _, initiallyReady in ipairs({ false, true }) do
+            local f = fixture(os, true, true)
+            f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+            if initiallyReady then
+                f:complete(f:value('ready'))
+                f.time = 3000; f:flush()
+            end
+            for _ = 1, 2 do
+                f:complete({ ok = false, error = 'control unavailable' }, 1)
+                assert(f.status()[1].text:find('不可用'))
+                local previous = #f.calls
+                f.time += 3000; f:flush()
+                assert(#f.calls == previous + 1, '状态查询失败后必须继续观察，不依赖手工 Status')
+            end
+            f:complete(f:value('ready'))
+            assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('异常'))
+            assert(f.mutations == 0, '查询恢复不能启动后台或修改 Host')
+        end
+    end
 end
 
 function cases.stop_generation_discards_previous_status()

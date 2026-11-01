@@ -290,6 +290,8 @@ local function queryStatus(token, cx, callback, subscriber)
         elseif value then
             accept(value)
         end
+        -- 查询失败不代表后台永久停止；先续订只读观察，再交付 UI 回调。
+        schedule()
         for _, consume in ipairs(request.callbacks) do
             runner:post(token, function(current) consume(value, err, current) end)
         end
@@ -438,7 +440,8 @@ end
 schedule = function()
     -- Native Tern reconnects independently; a disconnected Host must not stop
     -- observation of a live backend or freeze its last recovery snapshot.
-    if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting") then return end
+    if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting"
+        or (hasConfig and helperReady and cache.state == "error")) then return end
     local token = generation
     timer = tern.timer(POLL_MS, function(_fresh)
         timer = nil
