@@ -1,4 +1,4 @@
-Third-party notices for Tern TURN Relay 0.5.0
+Third-party notices for Tern TURN Relay 0.5.1
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
