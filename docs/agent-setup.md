@@ -4,7 +4,7 @@
 
 ## 入口与秘密边界
 
-新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.4/tern-turn-relay`；Windows 为 `native-runtime/0.5.4/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
+新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.5/tern-turn-relay`；Windows 为 `native-runtime/0.5.5/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
 
 只在用户明确准备运行环境时，从已安装插件执行：
 
@@ -58,7 +58,7 @@ Windows 信任现有 Tern 插件环境：不要求收紧宿主或普通数据目
 ## 故障与管理
 
 - `relay status` 为实时控制查询；保存的状态文件不能证明进程存活。
-- 证书、凭据、身份和未知协议错误失败关闭。不得加直连兜底或关闭校验。
+- 证书、授权、身份、本地凭据安全和未知协议错误失败关闭。临时 TURN 凭据到期由连接轮换处理；明确的续发网络错误、HTTP 429/5xx 按有界频率重试，不因此终止仍有效的连接。不得延长旧凭据有效期、加直连兜底或关闭校验。
 - 共享 Stop 撤销恢复意图；Restore 仅恢复明确选择的原 Host，不等同于停止后台。
 - update/uninstall 走 onboarding，stdin `{"confirm":true}`，要求后台已停止。固定源更新；保留用户改动的文件和 SSH 规则。
 - 卸载不删除 Key、不撤销云端 Key、不关闭原 daemon。清理遗留运行环境前验证进程、安装、链接与回退引用。

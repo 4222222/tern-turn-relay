@@ -709,12 +709,33 @@ mod tests {
         assert!(retryable(&error));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn refused_issuance_connection_can_retry() {
-        // Retain a bound, non-listening socket so another test cannot claim it.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
-        let address = socket.local_addr().unwrap();
+    async fn reset_issuance_connection_can_retry() {
+        use tokio::io::AsyncReadExt;
+
+        // Own a listening endpoint and reset an established request explicitly;
+        // a bound non-listening port does not portably produce connection refusal.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+            assert_eq!(unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            }, 0);
+            drop(stream);
+        });
         let result = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
@@ -723,8 +744,21 @@ mod tests {
             .get(format!("http://{address}/private-key-fixture"))
             .send()
             .await;
-        assert!(result.as_ref().unwrap_err().is_connect());
-        assert!(!result.as_ref().unwrap_err().is_timeout());
+        server.await.unwrap();
+        let request_error = result.as_ref().unwrap_err();
+        assert!(!request_error.is_timeout());
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(request_error);
+        let mut reset = false;
+        while let Some(error) = cause {
+            if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+            {
+                reset = true;
+                break;
+            }
+            cause = error.source();
+        }
+        assert!(reset, "fixture must produce a concrete TCP reset, not an unrelated failure");
         let error = issue_response(result, 1000.0, 86400).await.unwrap_err();
         assert!(retryable(&error));
         assert!(!error.to_string().contains("private-key-fixture"));

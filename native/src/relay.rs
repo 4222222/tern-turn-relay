@@ -1976,7 +1976,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expired_credentials_wait_through_issuance_cooldown_then_resume_original_flow() {
         let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() - 1.0);
-        let mut next = transport::gated_endpoint(Duration::from_secs(120));
+        let fresh_expiry = common::unix_time() + 3600.0;
         let shared = Arc::new(recovery_shared());
         {
             let mut cache = shared.credentials.lock().await;
@@ -1992,14 +1992,20 @@ mod tests {
         let address = socket.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let attempts = calls.clone();
-        let replacement = next.endpoint.clone();
+        let (allocated, mut allocations) = mpsc::channel(1);
         let codec = Codec::new([7; 32]);
         let flow = codec.flow;
         let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
             "127.0.0.1:4321".parse().unwrap(), codec, move |config, _, _| {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(config.expires, replacement.expires);
-                std::future::ready(Ok(replacement.clone()))
+                assert_eq!(config.expires, fresh_expiry);
+                // Allocate only after issuance recovers, as production does.
+                // An endpoint created before the 60-second outage would already
+                // be refreshing its TURN lease when this test expects payload.
+                let fixture = transport::gated_endpoint_expiring(Duration::from_secs(120), config.expires);
+                let endpoint = fixture.endpoint.clone();
+                assert!(allocated.try_send(fixture).is_ok());
+                std::future::ready(Ok(endpoint))
             });
         let worker = tokio::spawn(supervise_flow(
             shared.clone(), record.clone(), CancellationToken::new(), work,
@@ -2014,8 +2020,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(record.data.lock().unwrap().queue.len(), 1);
         assert!(!shared.fatal.is_cancelled());
-        seed_credentials(&shared, next.endpoint.expires).await;
+        seed_credentials(&shared, fresh_expiry).await;
         tokio::time::advance(Duration::from_secs(1)).await;
+        let mut next = allocations.recv().await.unwrap();
         let channel = next.entered.recv().await.unwrap();
         assert_uplink(&channel, &[7; 32], flow, 1, b"retained through outage");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
