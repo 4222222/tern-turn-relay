@@ -23,6 +23,13 @@ fn invalid() -> Error {
 fn remote_error() -> Error {
     Error::with_exit("credential-error", "Cloudflare TURN credential issuance failed; verify connectivity, TLS trust and TURN-key authorization.", 5)
 }
+/// Only positively classified transient issuance failures may be retried.
+pub(crate) fn retryable(error: &Error) -> bool {
+    matches!(
+        error.code,
+        "credential-network" | "credential-rate-limited" | "credential-unavailable"
+    )
+}
 fn cancelled() -> Error {
     Error::with_exit("cancelled", "Local credential change cancelled.", 6)
 }
@@ -164,8 +171,16 @@ async fn issue_key(key: &Value, ttl: u64) -> Result<Value> {
         .header("User-Agent", "tern-turn-relay/0.4.0")
         .json(&json!({"ttl":ttl}))
         .send()
-        .await
-        .map_err(|_| remote_error())?;
+        .await;
+    issue_response(response, issued, ttl).await
+}
+
+async fn issue_response(
+    response: reqwest::Result<reqwest::Response>,
+    issued: f64,
+    ttl: u64,
+) -> Result<Value> {
+    let response = response.map_err(|_| remote_error())?;
     if !response.status().is_success() || response.content_length().is_some_and(|n| n > 131072) {
         return Err(remote_error());
     }
@@ -548,6 +563,168 @@ pub async fn run(args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Exercise the production issuance-result boundary with real reqwest HTTP,
+    // timeout and TLS errors. No production endpoint or TLS policy is overridden.
+    async fn issuance_fixture(reply: Option<String>, tls: bool) -> reqwest::Result<reqwest::Response> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            if let Some(reply) = reply {
+                let _ = stream.write_all(reply.as_bytes()).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let scheme = if tls { "https" } else { "http" };
+        let result = client
+            .get(format!("{scheme}://{address}/private-key-fixture"))
+            .send()
+            .await;
+        server.abort();
+        result
+    }
+
+    async fn http_issuance(status: u16, body: &str) -> Result<Value> {
+        let reply = format!(
+            "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        issue_response(issuance_fixture(Some(reply), false).await, 1000.0, 86400).await
+    }
+
+    #[tokio::test]
+    async fn rate_limited_issuance_can_retry() {
+        assert!(retryable(&http_issuance(429, "private-response-fixture").await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn unavailable_issuance_can_retry() {
+        assert!(retryable(&http_issuance(503, "private-response-fixture").await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn timed_out_issuance_can_retry_without_exposing_request_url() {
+        let result = issuance_fixture(None, false).await;
+        assert!(result.as_ref().unwrap_err().is_timeout());
+        let error = issue_response(result, 1000.0, 86400).await.unwrap_err();
+        assert!(!error.to_string().contains("private-key-fixture"));
+        assert!(retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn issuance_security_and_protocol_failures_remain_terminal() {
+        for status in [301, 302, 307, 308, 400, 401, 403] {
+            let error = http_issuance(status, "private-response-fixture").await.unwrap_err();
+            assert!(!retryable(&error), "status {status}");
+            assert!(!error.to_string().contains("private-response-fixture"));
+        }
+        for body in ["not-json", "{}", "{\"iceServers\":[]}"] {
+            assert!(!retryable(&http_issuance(200, body).await.unwrap_err()));
+        }
+        assert!(!retryable(&http_issuance(200, &"x".repeat(131073)).await.unwrap_err()));
+
+        // A connect error can be a TLS failure, not a transient network outage.
+        let result = issuance_fixture(
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into()),
+            true,
+        ).await;
+        assert!(result.as_ref().unwrap_err().is_connect());
+        let error = issue_response(result, 1000.0, 86400).await.unwrap_err();
+        assert!(!retryable(&error));
+        assert!(!error.to_string().contains("private-key-fixture"));
+        assert!(!retryable(&validate(json!({"provider":"invalid"})).unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn untrusted_certificate_issuance_remains_terminal() {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        // Isolated self-signed localhost fixture, never trusted by the client.
+        let certificate = base64::engine::general_purpose::STANDARD.decode("MIIBNTCB3aADAgECAgkA1l/bYXWB8ZQwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTEwMzAxMTAwM1oXDTM2MTAzMTAxMTAwM1owFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOvdQQhnbWhcKjctPQfumvwqDfGIGMBYoL9Ay40VVyNFeXlR0lpBR0Er0p+6inwgEjrttOTezBn79C2/uH/4seqMYMBYwFAYDVR0RBA0wC4IJbG9jYWxob3N0MAoGCCqGSM49BAMCA0cAMEQCHykeh7xfi47nH1ZhL59EA+stUtKLLx3s7igXQ0WTgqYCIQCUD61QQvDNf3Q6n/cg6dJAUT1MQmSGw6Vk6kEppdotOA==").unwrap();
+        let key = base64::engine::general_purpose::STANDARD.decode("MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJc9d23Vo1Le7KaqvzrsanFIZBncpx2gHIvtJAw4X/BahRANCAAQ691BCGdtaFwqNy09B+6a/CoN8YgYwFigv0DLjRVXI0V5eVHSWkFHQSvSn7qKfCASOu205N7MGfv0Lb+4f/ix6").unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certificate)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+            let _ = acceptor.accept(stream).await;
+        });
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .resolve("localhost", address)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let result = client
+            .get(format!("https://localhost:{}/private-key-fixture", address.port()))
+            .send()
+            .await;
+        server.abort();
+
+        fn certificate_rejected(error: &(dyn std::error::Error + 'static)) -> bool {
+            if matches!(error.downcast_ref::<rustls::Error>(), Some(rustls::Error::InvalidCertificate(_))) {
+                return true;
+            }
+            if let Some(inner) = error.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
+                if certificate_rejected(inner) {
+                    return true;
+                }
+            }
+            error.source().is_some_and(certificate_rejected)
+        }
+        let request_error = result.as_ref().unwrap_err();
+        assert!(request_error.is_connect());
+        assert!(certificate_rejected(request_error));
+        let error = issue_response(result, 1000.0, 86400).await.unwrap_err();
+        assert!(!retryable(&error));
+        assert!(!error.to_string().contains("private-key-fixture"));
+    }
+
+    #[tokio::test]
+    async fn successful_issuance_preserves_validated_payload_and_expiry() {
+        let entries = json!([{
+            "urls":"turns:turn.cloudflare.com:5349?transport=tcp",
+            "username":"fixture-user",
+            "credential":"fixture-password"
+        }]);
+        let result = http_issuance(200, &json!({"iceServers":entries}).to_string())
+            .await
+            .unwrap();
+        assert_eq!(result["entries"], entries);
+        assert_eq!(result["expires_unix"], json!(87400.0));
+        for ttl in [0, 86401] {
+            let error = issue_key(&json!({}), ttl).await.unwrap_err();
+            assert!(!retryable(&error));
+        }
+    }
+
     #[test]
     fn validates_only_supported_secret_fields() {
         let input = json!({"provider":"cloudflare","turn_key_id":"a_B-9","api_token":"opaque","ignored":"never retained"});

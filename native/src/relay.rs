@@ -420,8 +420,24 @@ async fn flow_loop(
     socket: Arc<UdpSocket>,
     address: SocketAddr,
     peer: SocketAddr,
-    mut codec: Codec,
+    codec: Codec,
 ) -> Result<()> {
+    flow_loop_with(shared, record, socket, address, peer, codec, allocate).await
+}
+
+async fn flow_loop_with<Open, Opening>(
+    shared: Arc<Shared>,
+    record: Arc<FlowRecord>,
+    socket: Arc<UdpSocket>,
+    address: SocketAddr,
+    peer: SocketAddr,
+    mut codec: Codec,
+    mut open: Open,
+) -> Result<()>
+where
+    Open: FnMut(TurnConfig, SocketAddr, bool) -> Opening,
+    Opening: Future<Output = std::result::Result<Arc<Endpoint>, TransportError>>,
+{
     let mut incoming = vec![0; MAX_FRAME];
     let mut outgoing = Vec::with_capacity(MAX_FRAME);
     let mut batch = 0;
@@ -433,7 +449,7 @@ async fn flow_loop(
             record.data.lock().unwrap().recovering = true;
             shared.cooldown().await;
             let config = shared.turn_config(false).await?;
-            match allocate(config, peer, true).await {
+            match open(config, peer, true).await {
                 Ok(endpoint) => {
                     let mut data = record.data.lock().unwrap();
                     data.endpoint = Some(endpoint.clone());
@@ -643,6 +659,28 @@ async fn retire_route(shared: &Shared) {
     };
     tokio::join!(close_flows, close_warm);
     shared.state.lock().unwrap().no_clients_since = Instant::now();
+}
+
+async fn check_warm(shared: &Shared) {
+    let failed_warm = {
+        let mut state = shared.state.lock().unwrap();
+        if state.warm.as_ref().is_some_and(|warm| !warm.usable()) {
+            state.warm.take()
+        } else {
+            None
+        }
+    };
+    if let Some(warm) = failed_warm {
+        let error = warm.health().err().unwrap_or(TransportError::Network);
+        if error.recoverable() {
+            shared.defer();
+            shared.state.lock().unwrap().recovery_error = Some(error.public().message);
+        } else {
+            shared.fail(error.public());
+        }
+        warm.close().await;
+        shared.state.lock().unwrap().retired_refreshes += warm.stats().refreshes;
+    }
 }
 
 async fn warm_gateway(
@@ -1431,7 +1469,6 @@ async fn serve(
                 }
                 _ = tick.tick() => {
                     let mut removed = Vec::new();
-                    let mut failed_warm = None;
                     let should_renew;
                     {
                         let mut state = shared.state.lock().unwrap();
@@ -1444,7 +1481,6 @@ async fn serve(
                         for address in finished { if let Some(flow) = state.flows.remove(&address) { removed.push(flow); } }
                         if !removed.is_empty() && state.flows.is_empty() && state.ssh_count.load(Ordering::SeqCst) == 0 { state.no_clients_since = now; }
                         if state.ssh_count.load(Ordering::SeqCst) != 0 { state.no_clients_since = now; }
-                        if state.warm.as_ref().is_some_and(|warm| !warm.usable()) { failed_warm = state.warm.take(); }
                         if (state.initialized || shared.fatal.is_cancelled()) && state.flows.is_empty()
                             && state.ssh_count.load(Ordering::SeqCst) == 0 && !state.gateway_recovering
                             && now.duration_since(state.no_clients_since) >= SERVICE_IDLE { shared.stop.cancel(); }
@@ -1453,13 +1489,7 @@ async fn serve(
                             && renewal.as_ref().is_none_or(JoinHandle::is_finished);
                     }
                     for flow in removed { let _ = flow.task.await; }
-                    if let Some(warm) = failed_warm {
-                        let error = warm.health().err().unwrap_or(TransportError::Network);
-                        if error.recoverable() { shared.defer(); shared.state.lock().unwrap().recovery_error = Some(error.public().message); }
-                        else { shared.fail(error.public()); }
-                        warm.close().await;
-                        shared.state.lock().unwrap().retired_refreshes += warm.stats().refreshes;
-                    }
+                    check_warm(&shared).await;
                     if should_renew {
                         let renew_shared = shared.clone();
                         renewal = Some(tokio::spawn(async move {
@@ -1620,6 +1650,84 @@ pub async fn run(args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn cached_credential_rotation(warm_handoff: bool) {
+        let old = transport::gated_endpoint_expiring(
+            Duration::from_secs(120), common::unix_time() + 14.0,
+        );
+        let mut replacement = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        let expires = replacement.endpoint.expires;
+        {
+            let mut cache = shared.credentials.lock().await;
+            cache.cached = Some(json!({"entries": [{
+                "urls": "turns:unused.invalid:443?transport=tcp",
+                "username": "test-user", "credential": "test-password"
+            }]}));
+            cache.expires = expires;
+        }
+        shared.state.lock().unwrap().credentials_expires = Some(expires);
+        let current = if warm_handoff {
+            shared.state.lock().unwrap().warm = Some(old.endpoint.clone());
+            check_warm(&shared).await;
+            shared.state.lock().unwrap().warm.take()
+        } else {
+            Some(old.endpoint.clone())
+        };
+        let record = Arc::new(FlowRecord::new(current));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let key = [7; 32];
+        let codec = Codec::new(key);
+        let flow = codec.flow;
+        assert!(record.enqueue(b"same flow after credential guard"));
+        let next = replacement.endpoint.clone();
+        let running = flow_loop_with(
+            shared.clone(), record.clone(), socket, address, peer, codec,
+            move |config, actual_peer, _| {
+                assert_eq!(config.expires, expires);
+                assert_eq!(config.mode, Mode::Tls);
+                assert_eq!(actual_peer, peer);
+                std::future::ready(Ok(next.clone()))
+            },
+        );
+        tokio::pin!(running);
+        let sent = timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut running => {
+                    if let Err(error) = result {
+                        shared.fail(error);
+                    }
+                    None
+                },
+                frame = replacement.entered.recv() => frame,
+            }
+        }).await;
+        old.endpoint.close().await;
+        replacement.endpoint.close().await;
+        assert!(!shared.fatal.is_cancelled(),
+            "fresh cached credentials must prevent endpoint credential expiry from becoming a global fatal error");
+        let channel = sent.expect("replacement must carry the original queued flow")
+            .expect("flow must not terminate at the old credential guard");
+        let length = u16::from_be_bytes([channel[2], channel[3]]) as usize;
+        let decoded = crate::protocol::decode(
+            &key, crate::protocol::CLIENT_TO_SERVER, &channel[4..4 + length],
+        ).unwrap();
+        assert_eq!(decoded, (flow, 1, b"same flow after credential guard".as_slice()));
+        assert!(old.endpoint.expires < expires,
+            "rotation must replace the allocation, not extend its credential expiry");
+    }
+
+    #[tokio::test]
+    async fn active_flow_rotates_to_cached_credentials_at_old_credential_guard() {
+        cached_credential_rotation(false).await;
+    }
+
+    #[tokio::test]
+    async fn warm_endpoint_credential_guard_preserves_recoverable_flow_intent() {
+        cached_credential_rotation(true).await;
+    }
 
     fn recovery_shared() -> Shared {
         let now = Instant::now();

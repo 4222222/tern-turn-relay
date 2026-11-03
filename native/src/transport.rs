@@ -1185,7 +1185,7 @@ async fn owner(
 }
 
 #[cfg(test)]
-pub(crate) use tests::gated_endpoint;
+pub(crate) use tests::{gated_endpoint, gated_endpoint_expiring};
 
 #[cfg(test)]
 mod tests {
@@ -1733,8 +1733,15 @@ mod tests {
     }
 
     fn gated_endpoint_with_refresh(lease: Duration, refresh_after: Duration) -> GatedEndpoint {
+        gated_endpoint_configured(lease, refresh_after, common::unix_time() + 3600.0)
+    }
+
+    pub(crate) fn gated_endpoint_expiring(lease: Duration, expires: f64) -> GatedEndpoint {
+        gated_endpoint_configured(lease, Duration::from_secs(60), expires)
+    }
+
+    fn gated_endpoint_configured(lease: Duration, refresh_after: Duration, expires: f64) -> GatedEndpoint {
         let now = Instant::now();
-        let expires = common::unix_time() + 3600.0;
         let shared = Arc::new(Shared {
             state: StdMutex::new(State {
                 allocation: Some(now + lease),
