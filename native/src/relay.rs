@@ -107,7 +107,7 @@ impl CredentialCache {
             }
             return Err(Error::new(
                 "credentials_cooldown",
-                "Credential retry is cooling down; reconnect after one minute.",
+                "Credential refresh is temporarily cooling down; relay recovery will retry automatically.",
             ));
         }
         let issued = timeout(
@@ -117,6 +117,9 @@ impl CredentialCache {
         .await
         .map_err(|_| Error::new("credentials_timeout", "Credential API timed out."))
         .and_then(|result| result);
+        self.accept_issued(mode, now, issued)
+    }
+    fn accept_issued(&mut self, mode: Mode, now: f64, issued: Result<Value>) -> Result<TurnConfig> {
         match issued {
             Ok(value) => {
                 let expires = value["expires_unix"]
@@ -131,6 +134,7 @@ impl CredentialCache {
                 let config = transport::select(&value["entries"], mode, expires)?;
                 self.cached = Some(value);
                 self.expires = expires;
+                self.retry_at = Instant::now();
                 Ok(config)
             }
             Err(error) => {
@@ -278,7 +282,7 @@ impl Shared {
         let mut recovering = 0;
         let mut refreshes = state.retired_refreshes;
         let mut usable = false;
-        let mut expires = state.credentials_expires;
+        let mut expires: Option<f64> = None;
         let mut recovery_error = state.recovery_error;
         for handle in state.flows.values() {
             let flow = handle.record.data.lock().unwrap();
@@ -324,7 +328,12 @@ impl Shared {
         result["gateway_reconnects"] = json!(state.gateway_reconnects);
         result["gateway_failure_reason"] = json!(state.gateway_failure_reason);
         result["gateway_failure_message"] = json!(state.gateway_failure_message);
-        result["credentials_expires_at"] = json!(expires);
+        result["active_credentials_expires_at"] = json!(expires);
+        result["cached_credentials_expires_at"] = json!(state.credentials_expires);
+        result["credentials_expires_at"] = json!(match (expires, state.credentials_expires) {
+            (Some(active), Some(cached)) => Some(active.min(cached)),
+            (active, cached) => active.or(cached),
+        });
         result["recovery_error"] = if matches!(result["state"].as_str(), Some("error" | "stopped"))
         {
             Value::Null
@@ -414,6 +423,80 @@ async fn deliver_downlink(
     Ok(())
 }
 
+fn retryable_credentials(error: &Error) -> bool {
+    credentials::retryable(error)
+        || matches!(error.code, "credentials_timeout" | "credentials_cooldown")
+}
+
+fn replaceable(error: TransportError) -> bool {
+    error.recoverable() || error == TransportError::CredentialsExpired
+}
+
+// This future is polled alongside the old endpoint, not on its traffic path.
+// One pending allocation per owner bounds resources; dropping it cancels open.
+async fn prepare_endpoint<Open, Opening>(
+    shared: &Shared,
+    peer: SocketAddr,
+    previous_expiry: Option<f64>,
+    open: &mut Open,
+) -> Result<Arc<Endpoint>>
+where
+    Open: FnMut(TurnConfig, SocketAddr, bool) -> Opening,
+    Opening: Future<Output = std::result::Result<Arc<Endpoint>, TransportError>>,
+{
+    if let Some(expires) = previous_expiry {
+        tokio::time::sleep(Duration::from_secs_f64(
+            (expires - 300.0 - common::unix_time()).max(0.0),
+        )).await;
+    }
+    loop {
+        shared.cooldown().await;
+        let config = match shared.turn_config(previous_expiry.is_some()).await {
+            Ok(config) => config,
+            Err(error) if retryable_credentials(&error) => {
+                shared.state.lock().unwrap().recovery_error = Some(error.message);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if previous_expiry.is_some_and(|expires| config.expires <= expires) {
+            // A cooldown may return the still-valid old cache. Never churn
+            // allocations using the very credentials we are trying to retire.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        match open(config, peer, true).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(error) if replaceable(error) => {
+                shared.state.lock().unwrap().recovery_error = Some(error.public().message);
+                shared.defer();
+            }
+            Err(error) => return Err(error.public()),
+        }
+    }
+}
+
+async fn supervise_flow(
+    shared: Arc<Shared>,
+    record: Arc<FlowRecord>,
+    stopped: CancellationToken,
+    work: impl Future<Output = Result<()>>,
+) {
+    let result = tokio::select! {
+        biased;
+        _ = stopped.cancelled() => Ok(()),
+        _ = shared.stop.cancelled() => Ok(()),
+        _ = shared.fatal.cancelled() => Ok(()),
+        result = work => result,
+    };
+    if let Err(error) = result { shared.fail(error); }
+    retire_endpoint(&shared, &record).await;
+    let mut data = record.data.lock().unwrap();
+    data.queue.clear();
+    data.bytes = 0;
+}
+
 async fn flow_loop(
     shared: Arc<Shared>,
     record: Arc<FlowRecord>,
@@ -440,86 +523,119 @@ where
 {
     let mut incoming = vec![0; MAX_FRAME];
     let mut outgoing = Vec::with_capacity(MAX_FRAME);
+    // Keep the encoded frame through recovery: no second sequence number and
+    // no queue growth when the disposition of a failed write is uncertain.
+    let mut pending = None;
     let mut batch = 0;
     loop {
         let current = record.data.lock().unwrap().endpoint.clone();
-        let endpoint = if let Some(endpoint) = current {
-            endpoint
-        } else {
-            record.data.lock().unwrap().recovering = true;
-            shared.cooldown().await;
-            let config = shared.turn_config(false).await?;
-            match open(config, peer, true).await {
-                Ok(endpoint) => {
-                    let mut data = record.data.lock().unwrap();
-                    data.endpoint = Some(endpoint.clone());
-                    data.recovering = false;
-                    data.recovery_error = None;
-                    endpoint
-                }
-                Err(error) if error.recoverable() => {
-                    shared.defer();
-                    record.wait_after_allocation_failure(error).await;
-                    continue;
+        if let Some(endpoint) = &current {
+            if let Err(error) = endpoint.health() {
+                if !replaceable(error) { return Err(error.public()); }
+                retire_endpoint(&shared, &record).await;
+            }
+        }
+        let current = record.data.lock().unwrap().endpoint.clone();
+        let endpoint = match current {
+            Some(endpoint) => endpoint,
+            None => {
+                record.data.lock().unwrap().recovering = true;
+                let endpoint = prepare_endpoint(&shared, peer, None, &mut open).await?;
+                let mut data = record.data.lock().unwrap();
+                data.endpoint = Some(endpoint.clone());
+                data.recovering = false;
+                data.recovery_error = None;
+                endpoint
+            }
+        };
+        let preparing = prepare_endpoint(&shared, peer, Some(endpoint.expires), &mut open);
+        tokio::pin!(preparing);
+        let mut replacement = None;
+        loop {
+            let outcome = tokio::select! {
+                ready = &mut preparing, if replacement.is_none() => {
+                    replacement = Some(ready?);
+                    break;
+                },
+                error = endpoint.failure() => Err(error),
+                packet = endpoint.recv(&mut incoming) => match packet {
+                    Ok(length) => {
+                        deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                },
+                packet = async { if pending.is_some() { None } else { Some(record.next().await) } } => {
+                    if let Some(packet) = packet {
+                        codec.encode(&packet, &mut outgoing)?;
+                        pending = Some(packet.len());
+                    }
+                    let sending = endpoint.send(&outgoing);
+                    tokio::pin!(sending);
+                    loop {
+                        tokio::select! {
+                            ready = &mut preparing, if replacement.is_none() => {
+                                replacement = Some(ready?);
+                            },
+                            error = endpoint.failure() => break Err(error),
+                            result = &mut sending => {
+                                if result.is_ok() {
+                                    shared.state.lock().unwrap().bytes_up += pending.take().unwrap() as u64;
+                                }
+                                break result;
+                            },
+                            received = endpoint.recv(&mut incoming) => match received {
+                                Ok(length) => {
+                                    deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
+                                },
+                                Err(error) => break Err(error),
+                            },
+                        }
+                        batch += 1;
+                        if batch == 32 { batch = 0; tokio::task::yield_now().await; }
+                    }
+                },
+            };
+            match outcome {
+                Ok(()) => {}
+                Err(error) if replaceable(error) => {
+                    {
+                        let mut data = record.data.lock().unwrap();
+                        data.recovering = true;
+                        data.recovery_error = Some(error.public().message);
+                    }
+                    retire_endpoint(&shared, &record).await;
+                    // A network failure can predate the renewal window. Start
+                    // ordinary recovery instead of waiting for credential age.
+                    if replacement.is_none() && error != TransportError::CredentialsExpired {
+                        shared.defer();
+                        if pending.is_none() {
+                            record.wait_after_allocation_failure(error).await;
+                        }
+                        break;
+                    }
+                    if replacement.is_none() { replacement = Some(preparing.as_mut().await?); }
+                    break;
                 }
                 Err(error) => return Err(error.public()),
             }
-        };
-        let outcome: std::result::Result<(), TransportError> = tokio::select! {
-            error = endpoint.failure() => Err(error),
-            packet = endpoint.recv(&mut incoming) => match packet {
-                Ok(length) => {
-                    deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            packet = record.next() => {
-                codec.encode(&packet, &mut outgoing)?;
-                let sending = endpoint.send(&outgoing);
-                tokio::pin!(sending);
-                loop {
-                    tokio::select! {
-                        error = endpoint.failure() => break Err(error),
-                        result = &mut sending => {
-                            if result.is_ok() {
-                                shared.state.lock().unwrap().bytes_up += packet.len() as u64;
-                            }
-                            break result;
-                        },
-                        received = endpoint.recv(&mut incoming) => match received {
-                            Ok(length) => {
-                                deliver_downlink(&shared, &record, &socket, address, &mut codec, &incoming[..length]).await?;
-                            },
-                            Err(error) => break Err(error),
-                        },
-                    }
-                    batch += 1;
-                    if batch == 32 {
-                        batch = 0;
-                        tokio::task::yield_now().await;
-                    }
-                }
-            },
-        };
-        match outcome {
-            Ok(()) => {}
-            Err(error) if error.recoverable() => {
-                {
-                    let mut data = record.data.lock().unwrap();
-                    data.recovering = true;
-                    data.recovery_error = Some(error.public().message);
-                }
-                shared.defer();
-                drop(endpoint);
-                retire_endpoint(&shared, &record).await;
-            }
-            Err(error) => return Err(error.public()),
+            if replacement.is_some() { break; }
+            batch += 1;
+            if batch == 32 { batch = 0; tokio::task::yield_now().await; }
         }
-        batch += 1;
-        if batch == 32 {
-            batch = 0;
-            tokio::task::yield_now().await;
+        if let Some(next) = replacement {
+            // Readiness of a new allocation must never hide an authorization
+            // or protocol refusal on the still-published old allocation.
+            if let Some(current) = record.data.lock().unwrap().endpoint.as_ref() {
+                if let Err(error) = current.health() {
+                    if !replaceable(error) { return Err(error.public()); }
+                }
+            }
+            retire_endpoint(&shared, &record).await;
+            let mut data = record.data.lock().unwrap();
+            data.endpoint = Some(next);
+            data.recovering = false;
+            data.recovery_error = None;
         }
     }
 }
@@ -602,20 +718,10 @@ async fn udp_receiver(shared: Arc<Shared>, socket: Arc<UdpSocket>) -> Result<()>
                 let peer = state.peer.expect("available route has peer");
                 let codec = Codec::new(state.key);
                 let task = tokio::spawn(async move {
-                    let result = tokio::select! {
-                        biased;
-                        _ = stopped.cancelled() => Ok(()),
-                        _ = worker_shared.stop.cancelled() => Ok(()),
-                        _ = worker_shared.fatal.cancelled() => Ok(()),
-                        result = flow_loop(worker_shared.clone(), worker_record.clone(), worker_socket, address, peer, codec) => result,
-                    };
-                    if let Err(error) = result {
-                        worker_shared.fail(error);
-                    }
-                    retire_endpoint(&worker_shared, &worker_record).await;
-                    let mut data = worker_record.data.lock().unwrap();
-                    data.queue.clear();
-                    data.bytes = 0;
+                    supervise_flow(
+                        worker_shared.clone(), worker_record.clone(), stopped,
+                        flow_loop(worker_shared, worker_record, worker_socket, address, peer, codec),
+                    ).await;
                 });
                 state.flows.insert(
                     address,
@@ -662,25 +768,65 @@ async fn retire_route(shared: &Shared) {
 }
 
 async fn check_warm(shared: &Shared) {
-    let failed_warm = {
-        let mut state = shared.state.lock().unwrap();
-        if state.warm.as_ref().is_some_and(|warm| !warm.usable()) {
-            state.warm.take()
-        } else {
-            None
+    let warm = shared.state.lock().unwrap().warm.clone();
+    if let Some(warm) = warm {
+        if let Err(error) = warm.health() {
+            if replaceable(error) {
+                shared.state.lock().unwrap().recovery_error = Some(error.public().message);
+            } else {
+                shared.fail(error.public());
+            }
         }
+    }
+}
+
+async fn rotate_warm<Open, Opening>(shared: &Shared, open: &mut Open) -> Result<()>
+where
+    Open: FnMut(TurnConfig, SocketAddr, bool) -> Opening,
+    Opening: Future<Output = std::result::Result<Arc<Endpoint>, TransportError>>,
+{
+    let (warm, peer, generation) = {
+        let state = shared.state.lock().unwrap();
+        (state.warm.clone(), state.peer, state.generation.clone())
     };
-    if let Some(warm) = failed_warm {
-        let error = warm.health().err().unwrap_or(TransportError::Network);
-        if error.recoverable() {
-            shared.defer();
-            shared.state.lock().unwrap().recovery_error = Some(error.public().message);
-        } else {
-            shared.fail(error.public());
-        }
+    let (Some(warm), Some(peer)) = (warm, peer) else { return Ok(()); };
+    let previous = (warm.expires <= common::unix_time() + 300.0).then_some(warm.expires);
+    let next = tokio::select! {
+        biased;
+        _ = shared.stop.cancelled() => return Ok(()),
+        _ = shared.fatal.cancelled() => return Ok(()),
+        _ = generation.cancelled() => return Ok(()),
+        result = prepare_endpoint(shared, peer, previous, open) => result?,
+    };
+    let refusal = {
+        let state = shared.state.lock().unwrap();
+        if state.warm.as_ref().is_some_and(|current| Arc::ptr_eq(current, &warm)) {
+            warm.health().err().filter(|error| !replaceable(*error))
+        } else { None }
+    };
+    if let Some(error) = refusal {
+        next.close().await;
+        return Err(error.public());
+    }
+    let installed = {
+        let mut state = shared.state.lock().unwrap();
+        if !generation.is_cancelled() && !shared.stop.is_cancelled()
+            && !shared.fatal.is_cancelled() && state.route_available
+            && state.warm.as_ref().is_some_and(|current| Arc::ptr_eq(current, &warm)) {
+            state.warm = Some(next.clone());
+            state.recovery_error = None;
+            true
+        } else { false }
+    };
+    if installed {
         warm.close().await;
         shared.state.lock().unwrap().retired_refreshes += warm.stats().refreshes;
+    } else {
+        // UDP may have claimed the warm endpoint during preparation. Its flow
+        // now owns rotation; never install a second, orphaned warm allocation.
+        next.close().await;
     }
+    Ok(())
 }
 
 async fn warm_gateway(
@@ -692,7 +838,15 @@ async fn warm_gateway(
         if recovering {
             shared.cooldown().await;
         }
-        let config = shared.turn_config(false).await?;
+        let config = match shared.turn_config(false).await {
+            Ok(config) => config,
+            Err(error) if retryable_credentials(&error) => {
+                shared.state.lock().unwrap().recovery_error = Some(error.message);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         match allocate(config, peer, recovering).await {
             Ok(endpoint) => return Ok(endpoint),
             Err(error) if recovering && error.recoverable() => {
@@ -1484,8 +1638,9 @@ async fn serve(
                         if (state.initialized || shared.fatal.is_cancelled()) && state.flows.is_empty()
                             && state.ssh_count.load(Ordering::SeqCst) == 0 && !state.gateway_recovering
                             && now.duration_since(state.no_clients_since) >= SERVICE_IDLE { shared.stop.cancel(); }
-                        should_renew = !shared.fatal.is_cancelled() && state.public["state"] == "ready"
-                            && state.credentials_expires.is_some_and(|expires| common::unix_time() >= expires - 300.0)
+                        should_renew = !shared.fatal.is_cancelled() && state.route_available
+                            && (state.credentials_expires.is_some_and(|expires| common::unix_time() >= expires - 300.0)
+                                || state.warm.as_ref().is_some_and(|warm| !warm.usable() || warm.expires <= common::unix_time() + 300.0))
                             && renewal.as_ref().is_none_or(JoinHandle::is_finished);
                     }
                     for flow in removed { let _ = flow.task.await; }
@@ -1493,10 +1648,21 @@ async fn serve(
                     if should_renew {
                         let renew_shared = shared.clone();
                         renewal = Some(tokio::spawn(async move {
-                            tokio::select! {
+                            let generation = renew_shared.state.lock().unwrap().generation.clone();
+                            let result = tokio::select! {
                                 biased;
-                                _ = renew_shared.stop.cancelled() => {},
-                                result = renew_shared.turn_config(true) => if let Err(error) = result { renew_shared.fail(error); },
+                                _ = renew_shared.stop.cancelled() => Ok(()),
+                                _ = renew_shared.fatal.cancelled() => Ok(()),
+                                _ = generation.cancelled() => Ok(()),
+                                result = async {
+                                    renew_shared.turn_config(true).await?;
+                                    rotate_warm(&renew_shared, &mut allocate).await
+                                } => result,
+                            };
+                            if let Err(error) = result {
+                                if retryable_credentials(&error) {
+                                    renew_shared.state.lock().unwrap().recovery_error = Some(error.message);
+                                } else { renew_shared.fail(error); }
                             }
                         }));
                     }
@@ -1650,6 +1816,427 @@ pub async fn run(args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credential_value(expires: f64) -> Value {
+        json!({"expires_unix": expires, "entries": [{
+            "urls": "turns:unused.invalid:443?transport=tcp",
+            "username": "test-user", "credential": "test-password"
+        }]})
+    }
+
+    async fn seed_credentials(shared: &Shared, expires: f64) {
+        shared.credentials.lock().await.accept_issued(
+            shared.mode, common::unix_time(), Ok(credential_value(expires)),
+        ).unwrap();
+        shared.state.lock().unwrap().credentials_expires = Some(expires);
+    }
+
+    fn downlink(key: &[u8; 32], flow: u64, sequence: u64, payload: &[u8]) -> Vec<u8> {
+        let frame = crate::protocol::encode(
+            key, crate::protocol::SERVER_TO_CLIENT, flow, sequence, payload,
+        ).unwrap();
+        let mut channel = vec![0x40, 0];
+        channel.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        channel.extend_from_slice(&frame);
+        channel.resize((channel.len() + 3) & !3, 0);
+        channel
+    }
+
+    fn assert_uplink(channel: &[u8], key: &[u8; 32], flow: u64, sequence: u64, payload: &[u8]) {
+        let length = u16::from_be_bytes([channel[2], channel[3]]) as usize;
+        assert_eq!(crate::protocol::decode(
+            key, crate::protocol::CLIENT_TO_SERVER, &channel[4..4 + length],
+        ).unwrap(), (flow, sequence, payload));
+    }
+
+    #[tokio::test]
+    async fn rotation_prepares_without_stalling_duplex_and_preserves_codec_and_udp_identity() {
+        let mut old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+        let mut next = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        seed_credentials(&shared, next.endpoint.expires).await;
+        let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let source = socket.local_addr().unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let key = [7; 32];
+        let codec = Codec::new(key);
+        let flow = codec.flow;
+        let (started, mut preparing) = mpsc::channel(1);
+        let release = Arc::new(Notify::new());
+        let opening_gate = release.clone();
+        let replacement = next.endpoint.clone();
+        let work = flow_loop_with(shared.clone(), record.clone(), socket,
+            client.local_addr().unwrap(), "127.0.0.1:4321".parse().unwrap(), codec,
+            move |config, peer, _| {
+                assert_eq!(config.mode, Mode::Tls);
+                assert_eq!(peer, "127.0.0.1:4321".parse::<SocketAddr>().unwrap());
+                let started = started.clone();
+                let gate = opening_gate.clone();
+                let endpoint = replacement.clone();
+                async move {
+                    started.send(()).await.unwrap();
+                    gate.notified().await;
+                    Ok(endpoint)
+                }
+            });
+        let worker = tokio::spawn(supervise_flow(
+            shared.clone(), record.clone(), CancellationToken::new(), work,
+        ));
+        timeout(Duration::from_secs(2), preparing.recv()).await.unwrap().unwrap();
+        let mut buffer = [0; 128];
+        for (sequence, payload) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
+            assert!(record.enqueue(payload));
+            let channel = timeout(Duration::from_secs(2), old.entered.recv()).await.unwrap().unwrap();
+            assert_uplink(&channel, &key, flow, sequence, payload);
+            if sequence == 2 { release.notify_one(); }
+            // Even a ready replacement must not interrupt an ordered send or
+            // prevent downlink progress while that old send remains gated.
+            old.incoming.send(Ok(downlink(&key, flow, sequence, payload))).await.unwrap();
+            let (length, address) = timeout(Duration::from_secs(2), client.recv_from(&mut buffer)).await.unwrap().unwrap();
+            assert_eq!(&buffer[..length], payload);
+            assert_eq!(address, source);
+            old.release.send(()).await.unwrap();
+            timeout(Duration::from_secs(2), old.written.recv()).await.unwrap().unwrap();
+        }
+        timeout(Duration::from_secs(2), old.incoming.closed()).await.unwrap();
+        assert!(Arc::ptr_eq(record.data.lock().unwrap().endpoint.as_ref().unwrap(), &next.endpoint));
+        assert!(record.enqueue(b"third"));
+        let channel = timeout(Duration::from_secs(2), next.entered.recv()).await.unwrap().unwrap();
+        assert_uplink(&channel, &key, flow, 3, b"third");
+        next.incoming.send(Ok(downlink(&key, flow, 1, b"replayed"))).await.unwrap();
+        next.incoming.send(Ok(downlink(&key, flow, 3, b"fresh"))).await.unwrap();
+        let (length, address) = timeout(Duration::from_secs(2), client.recv_from(&mut buffer)).await.unwrap().unwrap();
+        assert_eq!(&buffer[..length], b"fresh", "replay state must survive allocation replacement");
+        assert_eq!(address, source);
+        next.release.send(()).await.unwrap();
+        timeout(Duration::from_secs(2), next.written.recv()).await.unwrap().unwrap();
+        shared.stop.cancel();
+        timeout(Duration::from_secs(2), worker).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), next.incoming.closed()).await.unwrap();
+        assert!(!shared.fatal.is_cancelled());
+        assert!(record.data.lock().unwrap().endpoint.is_none());
+        assert!(old.endpoint.expires < next.endpoint.expires);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_replacement_failure_keeps_old_traffic_and_retries_at_bounded_rate() {
+        let mut old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+        let mut next = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        seed_credentials(&shared, next.endpoint.expires).await;
+        let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let replacement = next.endpoint.clone();
+        let (started, mut attempts_rx) = mpsc::channel(2);
+        let codec = Codec::new([7; 32]);
+        let flow = codec.flow;
+        let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
+            "127.0.0.1:4321".parse().unwrap(), codec, move |_, _, _| {
+                let call = attempts.fetch_add(1, Ordering::SeqCst);
+                started.try_send(()).unwrap();
+                std::future::ready(if call == 0 {
+                    Err(TransportError::Network)
+                } else {
+                    Ok(replacement.clone())
+                })
+            });
+        let worker = tokio::spawn(supervise_flow(
+            shared.clone(), record.clone(), CancellationToken::new(), work,
+        ));
+        attempts_rx.recv().await.unwrap();
+        assert!(record.enqueue(b"old remains usable"));
+        let channel = old.entered.recv().await.unwrap();
+        assert_uplink(&channel, &[7; 32], flow, 1, b"old remains usable");
+        old.release.send(()).await.unwrap();
+        old.written.recv().await.unwrap();
+        assert!(old.endpoint.usable());
+        assert!(!shared.fatal.is_cancelled());
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        attempts_rx.recv().await.unwrap();
+        old.incoming.closed().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(record.enqueue(b"replacement continues"));
+        let channel = next.entered.recv().await.unwrap();
+        assert_uplink(&channel, &[7; 32], flow, 2, b"replacement continues");
+        next.release.send(()).await.unwrap();
+        next.written.recv().await.unwrap();
+        shared.stop.cancel();
+        worker.await.unwrap();
+        next.incoming.closed().await;
+        assert!(!shared.fatal.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_credentials_wait_through_issuance_cooldown_then_resume_original_flow() {
+        let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() - 1.0);
+        let mut next = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        {
+            let mut cache = shared.credentials.lock().await;
+            cache.cached = Some(credential_value(old.endpoint.expires));
+            cache.expires = old.endpoint.expires;
+            let error = cache.accept_issued(Mode::Tls, common::unix_time(),
+                Err(Error::new("credential-unavailable", "Credential service temporarily unavailable."))).err().unwrap();
+            assert!(retryable_credentials(&error));
+        }
+        let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+        assert!(record.enqueue(b"retained through outage"));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let replacement = next.endpoint.clone();
+        let codec = Codec::new([7; 32]);
+        let flow = codec.flow;
+        let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
+            "127.0.0.1:4321".parse().unwrap(), codec, move |config, _, _| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(config.expires, replacement.expires);
+                std::future::ready(Ok(replacement.clone()))
+            });
+        let worker = tokio::spawn(supervise_flow(
+            shared.clone(), record.clone(), CancellationToken::new(), work,
+        ));
+        old.incoming.closed().await;
+        for _ in 0..32 {
+            if shared.state.lock().unwrap().recovery_error.is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert!(shared.state.lock().unwrap().recovery_error.is_some());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(record.data.lock().unwrap().queue.len(), 1);
+        assert!(!shared.fatal.is_cancelled());
+        seed_credentials(&shared, next.endpoint.expires).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let channel = next.entered.recv().await.unwrap();
+        assert_uplink(&channel, &[7; 32], flow, 1, b"retained through outage");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        next.release.send(()).await.unwrap();
+        next.written.recv().await.unwrap();
+        shared.stop.cancel();
+        worker.await.unwrap();
+        next.incoming.closed().await;
+        assert!(!shared.fatal.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn replacement_security_refusals_are_terminal_without_retrying() {
+        for error in [TransportError::Authentication, TransportError::TlsAuthentication, TransportError::Protocol] {
+            let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+            let shared = Arc::new(recovery_shared());
+            seed_credentials(&shared, common::unix_time() + 3600.0).await;
+            let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let address = socket.local_addr().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
+                "127.0.0.1:4321".parse().unwrap(), Codec::new([7; 32]), move |_, _, _| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(error))
+                });
+            timeout(Duration::from_secs(2), supervise_flow(
+                shared.clone(), record.clone(), CancellationToken::new(), work,
+            )).await.unwrap();
+            assert!(shared.fatal.is_cancelled());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            old.incoming.closed().await;
+            assert!(record.data.lock().unwrap().endpoint.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_and_generation_cancel_inflight_replacement_and_close_both_owners() {
+        for stop in [true, false] {
+            let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+            let next = transport::gated_endpoint(Duration::from_secs(120));
+            let shared = Arc::new(recovery_shared());
+            seed_credentials(&shared, next.endpoint.expires).await;
+            let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+            let generation = shared.state.lock().unwrap().generation.clone();
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let address = socket.local_addr().unwrap();
+            let (started, mut opening) = mpsc::channel(1);
+            let incoming = next.incoming;
+            let mut unpublished = Some(next.endpoint);
+            let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
+                "127.0.0.1:4321".parse().unwrap(), Codec::new([7; 32]), move |_, _, _| {
+                    let endpoint = unpublished.take().expect("only one replacement may be pending");
+                    let started = started.clone();
+                    async move {
+                        started.send(()).await.unwrap();
+                        std::future::pending::<()>().await;
+                        Ok(endpoint)
+                    }
+                });
+            let worker = tokio::spawn(supervise_flow(
+                shared.clone(), record.clone(), generation.child_token(), work,
+            ));
+            timeout(Duration::from_secs(2), opening.recv()).await.unwrap().unwrap();
+            assert!(old.endpoint.usable());
+            if stop { shared.stop.cancel(); } else { generation.cancel(); }
+            timeout(Duration::from_secs(2), worker).await.unwrap().unwrap();
+            timeout(Duration::from_secs(2), old.incoming.closed()).await.unwrap();
+            timeout(Duration::from_secs(2), incoming.closed()).await.unwrap();
+            assert!(!shared.fatal.is_cancelled());
+            assert!(record.data.lock().unwrap().endpoint.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_rotation_publishes_only_if_still_owned_and_keeps_published_owner_alive() {
+        for handed_off in [false, true] {
+            let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+            let mut next = transport::gated_endpoint(Duration::from_secs(120));
+            let shared = Arc::new(recovery_shared());
+            seed_credentials(&shared, next.endpoint.expires).await;
+            {
+                let mut state = shared.state.lock().unwrap();
+                state.warm = Some(old.endpoint.clone());
+                state.peer = Some("127.0.0.1:4321".parse().unwrap());
+            }
+            let snapshot = shared.snapshot();
+            assert_eq!(snapshot["active_credentials_expires_at"], old.endpoint.expires);
+            assert_eq!(snapshot["cached_credentials_expires_at"], next.endpoint.expires);
+            assert_eq!(snapshot["credentials_expires_at"], old.endpoint.expires);
+            let (started, mut opening) = mpsc::channel(1);
+            let gate = Arc::new(Notify::new());
+            let release = gate.clone();
+            let replacement = next.endpoint.clone();
+            let rotation_shared = shared.clone();
+            let rotating = tokio::spawn(async move {
+                let mut open = move |_, _, _| {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    let endpoint = replacement.clone();
+                    async move {
+                        started.send(()).await.unwrap();
+                        gate.notified().await;
+                        Ok(endpoint)
+                    }
+                };
+                rotate_warm(&rotation_shared, &mut open).await
+            });
+            timeout(Duration::from_secs(2), opening.recv()).await.unwrap().unwrap();
+            assert!(old.endpoint.usable());
+            let claimed = if handed_off { shared.state.lock().unwrap().warm.take() } else { None };
+            release.notify_one();
+            timeout(Duration::from_secs(2), rotating).await.unwrap().unwrap().unwrap();
+            if handed_off {
+                assert!(shared.state.lock().unwrap().warm.is_none());
+                assert!(claimed.as_ref().unwrap().usable());
+                timeout(Duration::from_secs(2), next.incoming.closed()).await.unwrap();
+                old.endpoint.close().await;
+            } else {
+                assert!(Arc::ptr_eq(shared.state.lock().unwrap().warm.as_ref().unwrap(), &next.endpoint));
+                timeout(Duration::from_secs(2), old.incoming.closed()).await.unwrap();
+                let endpoint = next.endpoint.clone();
+                let sending = tokio::spawn(async move { endpoint.send(b"published warm owner").await });
+                timeout(Duration::from_secs(2), next.entered.recv()).await.unwrap().unwrap();
+                next.release.send(()).await.unwrap();
+                timeout(Duration::from_secs(2), sending).await.unwrap().unwrap().unwrap();
+                retire_route(&shared).await;
+                timeout(Duration::from_secs(2), next.incoming.closed()).await.unwrap();
+            }
+            assert!(!shared.fatal.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_generation_cancels_warm_preparation_without_publishing_it() {
+        let old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+        let next = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        seed_credentials(&shared, next.endpoint.expires).await;
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.warm = Some(old.endpoint.clone());
+            state.peer = Some("127.0.0.1:4321".parse().unwrap());
+        }
+        let (started, mut opening) = mpsc::channel(1);
+        let incoming = next.incoming;
+        let mut unpublished = Some(next.endpoint);
+        let rotation_shared = shared.clone();
+        let rotating = tokio::spawn(async move {
+            let mut open = move |_, _, _| {
+                let endpoint = unpublished.take().unwrap();
+                let started = started.clone();
+                async move {
+                    started.send(()).await.unwrap();
+                    std::future::pending::<()>().await;
+                    Ok(endpoint)
+                }
+            };
+            rotate_warm(&rotation_shared, &mut open).await
+        });
+        timeout(Duration::from_secs(2), opening.recv()).await.unwrap().unwrap();
+        retire_route(&shared).await;
+        timeout(Duration::from_secs(2), rotating).await.unwrap().unwrap().unwrap();
+        timeout(Duration::from_secs(2), incoming.closed()).await.unwrap();
+        timeout(Duration::from_secs(2), old.incoming.closed()).await.unwrap();
+        assert!(shared.state.lock().unwrap().warm.is_none());
+        assert!(!shared.state.lock().unwrap().route_available);
+        assert!(!shared.fatal.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn credential_failure_during_send_replays_same_frame_on_replacement() {
+        let mut old = transport::gated_endpoint_expiring(Duration::from_secs(120), common::unix_time() + 120.0);
+        let mut next = transport::gated_endpoint(Duration::from_secs(120));
+        let shared = Arc::new(recovery_shared());
+        seed_credentials(&shared, next.endpoint.expires).await;
+        let record = Arc::new(FlowRecord::new(Some(old.endpoint.clone())));
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let (started, mut opening) = mpsc::channel(1);
+        let gate = Arc::new(Notify::new());
+        let release = gate.clone();
+        let replacement = next.endpoint.clone();
+        let codec = Codec::new([7; 32]);
+        let flow = codec.flow;
+        let work = flow_loop_with(shared.clone(), record.clone(), socket, address,
+            "127.0.0.1:4321".parse().unwrap(), codec, move |_, _, _| {
+                let endpoint = replacement.clone();
+                let gate = gate.clone();
+                let started = started.clone();
+                async move {
+                    started.send(()).await.unwrap();
+                    gate.notified().await;
+                    Ok(endpoint)
+                }
+            });
+        let worker = tokio::spawn(supervise_flow(
+            shared.clone(), record.clone(), CancellationToken::new(), work,
+        ));
+        timeout(Duration::from_secs(2), opening.recv()).await.unwrap().unwrap();
+        assert!(record.enqueue(b"uncertain write"));
+        assert!(record.enqueue(b"following packet"));
+        let original = timeout(Duration::from_secs(2), old.entered.recv()).await.unwrap().unwrap();
+        assert_uplink(&original, &[7; 32], flow, 1, b"uncertain write");
+        old.fail(TransportError::CredentialsExpired);
+        timeout(Duration::from_secs(2), old.incoming.closed()).await.unwrap();
+        release.notify_one();
+        let retried = timeout(Duration::from_secs(2), next.entered.recv()).await.unwrap().unwrap();
+        assert_eq!(retried, original, "retry must retain the encoded flow and uplink sequence");
+        next.release.send(()).await.unwrap();
+        timeout(Duration::from_secs(2), next.written.recv()).await.unwrap().unwrap();
+        let following = timeout(Duration::from_secs(2), next.entered.recv()).await.unwrap().unwrap();
+        assert_uplink(&following, &[7; 32], flow, 2, b"following packet");
+        next.release.send(()).await.unwrap();
+        timeout(Duration::from_secs(2), next.written.recv()).await.unwrap().unwrap();
+        shared.stop.cancel();
+        timeout(Duration::from_secs(2), worker).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), next.incoming.closed()).await.unwrap();
+        assert!(!shared.fatal.is_cancelled());
+    }
 
     async fn cached_credential_rotation(warm_handoff: bool) {
         let old = transport::gated_endpoint_expiring(

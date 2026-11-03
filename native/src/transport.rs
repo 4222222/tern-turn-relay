@@ -212,7 +212,7 @@ impl TransportError {
             ),
             Self::CredentialsExpired => (
                 "turn_credentials_expired",
-                "Active TURN credentials are expiring; disconnect and reconnect to recover.",
+                "Active TURN credentials reached their safety guard; waiting for a verified replacement allocation.",
             ),
             Self::Closed => (
                 "turn_closed",
@@ -249,7 +249,8 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return Err(TransportError::Closed);
         }
-        if common::unix_time() >= state.expires - 15.0 {
+        let credential_seconds = state.expires - 15.0 - common::unix_time();
+        if credential_seconds <= 0.0 {
             return Err(TransportError::CredentialsExpired);
         }
         let deadline = state.allocation.ok_or(TransportError::Protocol)?;
@@ -259,7 +260,9 @@ impl Shared {
         if deadline <= Instant::now() {
             return Err(TransportError::Expired);
         }
-        Ok(deadline)
+        // A write begun before the guard must also finish before it. The
+        // allocation lease alone can outlive the credential that authorized it.
+        Ok(deadline.min(Instant::now() + Duration::from_secs_f64(credential_seconds)))
     }
     fn fail(&self, error: TransportError) {
         self.state.lock().unwrap().error.get_or_insert(error);
@@ -480,6 +483,11 @@ pub struct Endpoint {
 }
 impl Endpoint {
     pub async fn open(config: TurnConfig, peer: SocketAddr) -> Result<Self> {
+        let remaining = config.expires - 15.0 - common::unix_time();
+        if !remaining.is_finite() || remaining <= 0.0 {
+            return Err(TransportError::CredentialsExpired);
+        }
+        let ready_deadline = Instant::now() + OP_TIMEOUT.min(Duration::from_secs_f64(remaining));
         let shared = Arc::new(Shared {
             state: StdMutex::new(State {
                 allocation: None,
@@ -515,7 +523,7 @@ impl Endpoint {
             owner: Mutex::new(Some(owner)),
             expires,
         };
-        match timeout(OP_TIMEOUT, ready_rx).await {
+        match timeout_at(ready_deadline, ready_rx).await {
             Ok(Ok(Ok(()))) => Ok(endpoint),
             result => {
                 let error = match result {
@@ -598,6 +606,9 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         self.shared.cancel.cancel();
+        if let Some(owner) = self.owner.get_mut().take() {
+            owner.abort();
+        }
     }
 }
 
@@ -910,6 +921,11 @@ impl Owner {
     }
 
     async fn control(&mut self, method: Method, until: Instant) -> Result<(Message, Instant)> {
+        let remaining = self.config.expires - 15.0 - common::unix_time();
+        if !remaining.is_finite() || remaining <= 0.0 {
+            return Err(TransportError::CredentialsExpired);
+        }
+        let until = until.min(Instant::now() + Duration::from_secs_f64(remaining));
         for _ in 0..3 {
             let request = self.request(method, false)?;
             let authenticated = self.integrity.is_some();
@@ -1174,7 +1190,7 @@ async fn owner(
     };
     // A cancelled partial TLS write is never followed by another frame. Closing
     // both halves retires the allocation; UDP can safely send a best-effort delete.
-    if owner.config.mode == Mode::Udp {
+    if owner.config.mode == Mode::Udp && common::unix_time() < owner.config.expires - 15.0 {
         if let Ok(delete) = owner.request(METHOD_REFRESH, true) {
             if let Some(writer) = owner.writer.as_mut() {
                 let _ = timeout(Duration::from_secs(1), writer.send(&delete.raw)).await;
@@ -1726,6 +1742,34 @@ mod tests {
         pub(crate) entered: mpsc::Receiver<Vec<u8>>,
         pub(crate) release: mpsc::Sender<()>,
         pub(crate) written: mpsc::Receiver<Vec<u8>>,
+    }
+    impl GatedEndpoint {
+        pub(crate) fn fail(&self, error: TransportError) {
+            self.endpoint.shared.fail(error);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_guard_bounds_an_already_pending_transport_write() {
+        let mut fixture = gated_endpoint_expiring(
+            Duration::from_secs(120), common::unix_time() + 16.0,
+        );
+        let endpoint = fixture.endpoint.clone();
+        let sending = tokio::spawn(async move { endpoint.send(b"must not outlive credentials").await });
+        fixture.entered.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(sending.await.unwrap().is_err());
+        assert!(fixture.written.try_recv().is_err());
+        fixture.endpoint.close().await;
+        fixture.incoming.closed().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_unpublished_endpoint_cancels_its_owner_and_reader() {
+        let fixture = gated_endpoint(Duration::from_secs(120));
+        let incoming = fixture.incoming.clone();
+        drop(fixture);
+        timeout(Duration::from_secs(1), incoming.closed()).await.unwrap();
     }
 
     pub(crate) fn gated_endpoint(lease: Duration) -> GatedEndpoint {

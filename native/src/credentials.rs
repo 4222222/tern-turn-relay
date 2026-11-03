@@ -30,6 +30,66 @@ pub(crate) fn retryable(error: &Error) -> bool {
         "credential-network" | "credential-rate-limited" | "credential-unavailable"
     )
 }
+
+enum TransportEvidence {
+    Transient,
+    Terminal,
+    Unknown,
+}
+
+fn transport_evidence(error: &(dyn std::error::Error + 'static)) -> TransportEvidence {
+    // A TLS failure can be wrapped in an io::Error and still be a connect error.
+    // Inspect typed causes only; error text may contain the secret request URL.
+    if error.is::<rustls::Error>() {
+        return TransportEvidence::Terminal;
+    }
+    let io = error.downcast_ref::<std::io::Error>();
+    let own = match io.map(std::io::Error::kind) {
+        Some(
+            std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable,
+        ) => TransportEvidence::Transient,
+        Some(
+            std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied,
+        ) => TransportEvidence::Terminal,
+        _ => TransportEvidence::Unknown,
+    };
+    // io::Error::source may skip the wrapped error itself; inspect get_ref first.
+    let source = match io.and_then(std::io::Error::get_ref) {
+        Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+        None => error.source(),
+    };
+    let nested = source.map_or(TransportEvidence::Unknown, transport_evidence);
+    match (own, nested) {
+        (TransportEvidence::Terminal, _) | (_, TransportEvidence::Terminal) => TransportEvidence::Terminal,
+        (TransportEvidence::Transient, _) | (_, TransportEvidence::Transient) => TransportEvidence::Transient,
+        _ => TransportEvidence::Unknown,
+    }
+}
+
+fn request_error(error: reqwest::Error) -> Error {
+    let retry = match transport_evidence(&error) {
+        TransportEvidence::Terminal => false,
+        TransportEvidence::Transient => true,
+        TransportEvidence::Unknown => error.is_timeout(),
+    };
+    if retry && !error.is_builder() && !error.is_redirect() && !error.is_decode() {
+        Error::with_exit(
+            "credential-network",
+            "Cloudflare TURN credential issuance encountered a transient network failure.",
+            5,
+        )
+    } else {
+        remote_error()
+    }
+}
 fn cancelled() -> Error {
     Error::with_exit("cancelled", "Local credential change cancelled.", 6)
 }
@@ -180,18 +240,44 @@ async fn issue_response(
     issued: f64,
     ttl: u64,
 ) -> Result<Value> {
-    let response = response.map_err(|_| remote_error())?;
-    if !response.status().is_success() || response.content_length().is_some_and(|n| n > 131072) {
+    let response = response.map_err(request_error)?;
+    if response.content_length().is_some_and(|n| n > 131072) {
         return Err(remote_error());
     }
+    let transient = if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Some(Error::with_exit(
+            "credential-rate-limited",
+            "Cloudflare TURN credential issuance is temporarily rate limited.",
+            5,
+        ))
+    } else if response.status().is_server_error() {
+        Some(Error::with_exit(
+            "credential-unavailable",
+            "Cloudflare TURN credential issuance is temporarily unavailable.",
+            5,
+        ))
+    } else if response.status().is_success() {
+        None
+    } else {
+        return Err(remote_error());
+    };
     let mut stream = response.bytes_stream();
     let mut raw = Vec::new();
+    let mut received = 0usize;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| remote_error())?;
-        if raw.len() + chunk.len() > 131072 {
+        let chunk = chunk.map_err(request_error)?;
+        if chunk.len() > 131072 - received {
             return Err(remote_error());
         }
-        raw.extend_from_slice(&chunk);
+        received += chunk.len();
+        if transient.is_none() {
+            raw.extend_from_slice(&chunk);
+        }
+    }
+    // Even error responses must satisfy the streaming bound, not just a claimed
+    // Content-Length. Discard their bodies without retaining potentially secret data.
+    if let Some(error) = transient {
+        return Err(error);
     }
     let mut document = common::parse_json(&raw).map_err(|_| remote_error())?;
     let entries = match document.get_mut("iceServers").map(Value::take) {
@@ -624,6 +710,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_issuance_connection_can_retry() {
+        // Retain a bound, non-listening socket so another test cannot claim it.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let address = socket.local_addr().unwrap();
+        let result = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/private-key-fixture"))
+            .send()
+            .await;
+        assert!(result.as_ref().unwrap_err().is_connect());
+        assert!(!result.as_ref().unwrap_err().is_timeout());
+        let error = issue_response(result, 1000.0, 86400).await.unwrap_err();
+        assert!(retryable(&error));
+        assert!(!error.to_string().contains("private-key-fixture"));
+    }
+
+    #[tokio::test]
+    async fn malformed_http_issuance_remains_terminal() {
+        let result = issuance_fixture(Some("not-an-http-response\r\n\r\n".into()), false).await;
+        assert!(result.is_err());
+        assert!(!retryable(&issue_response(result, 1000.0, 86400).await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn chunked_transient_issuance_requires_a_bounded_response() {
+        for status in [429, 503] {
+            for size in [16, 131073] {
+                let reply = format!(
+                    "HTTP/1.1 {status} Fixture\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{size:x}\r\n{}\r\n0\r\n\r\n",
+                    "x".repeat(size)
+                );
+                let response = issuance_fixture(Some(reply), false).await;
+                assert!(response.as_ref().unwrap().content_length().is_none());
+                let error = issue_response(response, 1000.0, 86400).await.unwrap_err();
+                assert_eq!(retryable(&error), size == 16, "status {status}, size {size}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn issuance_security_and_protocol_failures_remain_terminal() {
         for status in [301, 302, 307, 308, 400, 401, 403] {
             let error = http_issuance(status, "private-response-fixture").await.unwrap_err();
@@ -633,7 +763,9 @@ mod tests {
         for body in ["not-json", "{}", "{\"iceServers\":[]}"] {
             assert!(!retryable(&http_issuance(200, body).await.unwrap_err()));
         }
-        assert!(!retryable(&http_issuance(200, &"x".repeat(131073)).await.unwrap_err()));
+        for status in [200, 429, 503] {
+            assert!(!retryable(&http_issuance(status, &"x".repeat(131073)).await.unwrap_err()));
+        }
 
         // A connect error can be a TLS failure, not a transient network outage.
         let result = issuance_fixture(

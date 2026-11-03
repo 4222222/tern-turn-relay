@@ -52,6 +52,10 @@ local function count(value)
     return type(value) == "number" and value >= 0 and value < math.huge and value % 1 == 0
 end
 
+local function expiry(value)
+    return type(value) == "number" and value >= 0 and value < math.huge
+end
+
 local function decode(raw)
     if type(raw) ~= "string" or #raw > MAX_JSON then
         return nil, "Helper response exceeds the 16 KiB limit."
@@ -79,9 +83,9 @@ local function decode(raw)
         or (value.route_policy ~= nil and value.route_policy ~= "exclusive")
         or (value.error ~= nil and not text(value.error, 4096))
         or (value.service_id ~= nil and not text(value.service_id, 256))
-        or (value.credentials_expires_at ~= nil and (type(value.credentials_expires_at) ~= "number"
-            or value.credentials_expires_at < 0 or value.credentials_expires_at ~= value.credentials_expires_at
-            or value.credentials_expires_at == math.huge)) then
+        or (value.credentials_expires_at ~= nil and not expiry(value.credentials_expires_at))
+        or (value.active_credentials_expires_at ~= nil and not expiry(value.active_credentials_expires_at))
+        or (value.cached_credentials_expires_at ~= nil and not expiry(value.cached_credentials_expires_at)) then
         return nil, "Invalid helper status JSON; no native Host action was taken."
     end
     if value.target ~= nil then
@@ -854,7 +858,9 @@ local function showDetails(cx)
     row("原服务指纹", cache.target and cache.target.fingerprint)
     row("共享 daemon", cache.daemon_socket)
     row("后台实例", cache.service_id)
-    row("凭证到期（Unix 秒）", cache.credentials_expires_at)
+    row("最早凭据到期（Unix 秒）", cache.credentials_expires_at)
+    row("现有连接凭据到期（Unix 秒）", cache.active_credentials_expires_at)
+    row("缓存凭据到期（Unix 秒）", cache.cached_credentials_expires_at)
     table.insert(rows, "\n## 最近错误\n\n" .. detailValue(lastError or cache.error or "无"))
     local markdown = table.concat(rows, "\n")
     local ok, message = pcall(function()
