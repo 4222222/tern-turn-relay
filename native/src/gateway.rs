@@ -789,7 +789,7 @@ async fn reap(child: &mut Child) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     fn config() -> Value {
         json!({"ssh_destination":"server","target":{"host":"1.1.1.1","fingerprint":format!("SHA256:{}",STANDARD.encode([1u8;32]).trim_end_matches('='))},"gateway":{"state_dir":"/home/test/gateway","daemon_socket":"/run/user/1000/daemon.sock","fingerprint":format!("SHA256:{}",STANDARD.encode([2u8;32]).trim_end_matches('='))}})
@@ -920,6 +920,10 @@ mod tests {
         }
     }
 
+    pub(crate) fn architecture_probe_failure(stderr: &str) -> Error {
+        architecture_response(&ssh_output(255, b"", stderr.as_bytes())).unwrap_err()
+    }
+
     #[test]
     fn preparation_output_classifies_network_and_refuses_untrusted_failures() {
         for (code, stderr, expected) in [
@@ -928,6 +932,18 @@ mod tests {
             (255, "Connection reset by 192.0.2.1 port 22\n", "connectivity_uncertain"),
             (255, "Connection to 192.0.2.1 port 22 timed out\n", "connectivity_uncertain"),
             (255, "client_loop: send disconnect: Broken pipe\n", "connectivity_uncertain"),
+            (255, "Connection closed by 192.0.2.1 port 22\n", "connectivity_uncertain"),
+            (255, "kex_exchange_identification: Connection closed by remote host\r\nConnection closed by 192.0.2.1 port 22\r\n", "connectivity_uncertain"),
+            (255, "Connection closed by  port 22\n", "unknown"),
+            (255, "Connection closed by host name port 22\n", "unknown"),
+            (255, "Connection closed by 192.0.2.1 port 0\n", "unknown"),
+            (255, "Connection closed by 192.0.2.1 port 65536\n", "unknown"),
+            (255, "kex_exchange_identification: Connection closed by remote host unexpectedly\n", "unknown"),
+            (255, "Host key verification failed.\nConnection closed by 192.0.2.1 port 22\n", "security_error"),
+            (255, "Permission denied (publickey).\nConnection closed by 192.0.2.1 port 22\n", "authorization_denied"),
+            (255, "unexpected failure\nConnection closed by 192.0.2.1 port 22\n", "unknown"),
+            (41, "Connection closed by 192.0.2.1 port 22\n", "security_error"),
+            (1, "Connection closed by 192.0.2.1 port 22\n", "unknown"),
             (41, "ssh: connect to host example port 22: Connection timed out\n", "security_error"),
             (255, "user@example: Permission denied (publickey).\n", "authorization_denied"),
             (255, "Host key verification failed.\n", "security_error"),

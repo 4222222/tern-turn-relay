@@ -2407,6 +2407,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn gateway_recovery_retries_closed_architecture_probe_until_network_returns() {
+        for diagnostic in [
+            "Connection closed by 192.0.2.1 port 22\n",
+            "kex_exchange_identification: Connection closed by remote host\nConnection closed by 192.0.2.1 port 22\n",
+        ] {
+            let shared = recovery_shared();
+            let calls = AtomicUsize::new(0);
+            let mut attempts = 0;
+            let retry = recover_gateway(
+                &shared,
+                &mut attempts,
+                true,
+                crate::gateway::tests::architecture_probe_failure(diagnostic),
+                || {
+                    let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    std::future::ready(if call == 7 {
+                        Ok(())
+                    } else {
+                        Err(crate::gateway::tests::architecture_probe_failure(diagnostic))
+                    })
+                },
+            );
+            tokio::pin!(retry);
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            assert!(shared.snapshot()["gateway_recovering"].as_bool().unwrap());
+            for (index, delay) in [2, 5, 15, 30, 30, 30, 30].into_iter().enumerate() {
+                tokio::time::advance(Duration::from_secs(delay)).await;
+                if index < 6 {
+                    assert!(futures_util::poll!(retry.as_mut()).is_pending());
+                    assert!(shared.snapshot()["gateway_recovering"].as_bool().unwrap());
+                } else {
+                    assert!(matches!(futures_util::poll!(retry.as_mut()), std::task::Poll::Ready(Ok(Some(())))));
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+                assert!(!shared.fatal.is_cancelled());
+            }
+            assert_eq!(shared.snapshot()["gateway_failure_reason"], "connectivity_uncertain");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn gateway_recovery_stop_or_fatal_cancels_wait_without_reopening() {
         for fatal in [false, true] {
             let shared = recovery_shared();
