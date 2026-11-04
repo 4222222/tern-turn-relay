@@ -340,12 +340,13 @@ fn network_diagnostic(line: &str) -> bool {
         matches!(reason, "Connection timed out" | "Operation timed out"
             | "Connection reset by peer" | "Connection refused"
             | "No route to host" | "Network is unreachable" | "Broken pipe")
-    }) || line == "Connection timed out during banner exchange" {
+    }) || line == "Connection timed out during banner exchange"
+        || line == "kex_exchange_identification: Connection closed by remote host" {
         return true;
     }
-    let peer = line.strip_prefix("Connection reset by ").or_else(|| {
-        line.strip_prefix("Connection to ")?.strip_suffix(" timed out")
-    });
+    let peer = line.strip_prefix("Connection reset by ")
+        .or_else(|| line.strip_prefix("Connection closed by "))
+        .or_else(|| line.strip_prefix("Connection to ")?.strip_suffix(" timed out"));
     peer.and_then(|peer| peer.rsplit_once(" port "))
         .is_some_and(|(host, port)| {
             !host.is_empty()
