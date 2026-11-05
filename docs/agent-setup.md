@@ -4,7 +4,7 @@
 
 ## 入口与秘密边界
 
-新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.6/tern-turn-relay`；Windows 为 `native-runtime/0.5.6/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
+新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.7/tern-turn-relay`；Windows 为 `native-runtime/0.5.7/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
 
 只在用户明确准备运行环境时，从已安装插件执行：
 
@@ -62,6 +62,13 @@ Windows 信任现有 Tern 插件环境：不要求收紧宿主或普通数据目
 - 共享 Stop 撤销恢复意图；Restore 仅恢复明确选择的原 Host，不等同于停止后台。
 - update/uninstall 走 onboarding，stdin `{"confirm":true}`，要求后台已停止。固定源更新；保留用户改动的文件和 SSH 规则。
 - 卸载不删除 Key、不撤销云端 Key、不关闭原 daemon。清理遗留运行环境前验证进程、安装、链接与回退引用。
+
+### 显式 daemon 重绑
+
+仅在用户明确授权接受已重启的 daemon 时使用。先 `relay stop` 撤销恢复意图，再调用 `onboarding rebind-review --data-dir DATA --package-dir PACKAGE`，stdin 为 `{}`。完整展示返回的 `review`：原服务与网关指纹、旧新进程身份、socket、文件身份和旧绑定备份路径。
+
+获授权后调用 `onboarding rebind-apply`，stdin 为 `{"review":完整原样对象,"confirm":true}`。不得自行拼改审核对象。后端重新验证配置摘要、原服务、当前 daemon 和身份文件，并要求旧 daemon 已退出；审核变化、活动网关、不安全权限或未知身份均拒绝。旧绑定安全备份后才原子替换；成功不会自动连接，需显式 start 并验证实际 Host。保留原证书、凭据与 SSH 配置，不删除旧 pin 绕过失败。
+
 - 交付记录版本、CI/真实场景证据、安装路径、仍在运行的进程及保留资源，不公开私有配置或会话密钥。
 
 ## Windows 发布验收
