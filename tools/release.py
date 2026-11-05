@@ -145,6 +145,11 @@ def smoke(binary):
         assert not (root/'plugin-data/tern-turn-relay/config.json').exists()
         code,value=invoke(['onboarding','apply',*profile],{'review':{}})
         assert code!=0 and not (root/'plugin-data/tern-turn-relay/config.json').exists()
+        code,value=invoke(['onboarding','rebind-apply',*profile],{'review':{},'confirm':False})
+        assert code!=0 and value.get('code')=='confirmation-required'
+        assert not (root/'plugin-data/tern-turn-relay/config.json').exists()
+        code,value=invoke(['onboarding','rebind-review',*profile],{'confirm':True})
+        assert code!=0 and value.get('code')=='invalid-request'
     print(json.dumps({'native_cli_smoke':'passed','invalid_review_left_unconfigured':True,'private_argument_redacted':True}))
 
 def collect(binary,destination,asset,target):

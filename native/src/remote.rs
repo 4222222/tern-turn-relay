@@ -35,6 +35,16 @@ pub async fn run(args: &[String]) -> Result<Value> {
                     let directory = directory.ok_or_else(|| failure("protocol_error"))?;
                     linux::provision(&directory)
                 }
+                "rebind-review" | "rebind-apply" => {
+                    let directory = directory.ok_or_else(|| failure("protocol_error"))?;
+                    let request = common::read_json_stdin(65536)
+                        .map_err(|_| failure("protocol_error"))?;
+                    if operation == "rebind-review" {
+                        linux::rebind_review(&directory, &request)
+                    } else {
+                        linux::rebind_apply(&directory, &request)
+                    }
+                }
                 _ => Err(failure("protocol_error")),
             }
         })
@@ -942,6 +952,317 @@ pub(crate) mod linux {
         validate_request(&request, false)?;
         Ok(prepare(directory, &request, None)?.descriptor)
     }
+
+    fn exact_fields(value: &Value, fields: &[&str]) -> Result<()> {
+        let object = value.as_object().ok_or_else(|| failure("protocol_error"))?;
+        if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
+            return Err(failure("protocol_error"));
+        }
+        Ok(())
+    }
+    fn validate_rebind_request(request: &Value) -> Result<()> {
+        exact_fields(request, &["daemon_socket", "bind_host", "original_state_dir", "original_fingerprint", "gateway_fingerprint"])?;
+        let mut prepared = request.clone();
+        prepared.as_object_mut().unwrap().remove("original_state_dir");
+        validate_request(&prepared, false)?;
+        for field in ["daemon_socket", "original_state_dir"] {
+            path(request[field].as_str().ok_or_else(|| failure("protocol_error"))?)?;
+        }
+        if request["original_fingerprint"] == request["gateway_fingerprint"] {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(())
+    }
+    fn validate_rebind_record(record: &Value, socket: &str) -> Result<()> {
+        exact_fields(record, &["version", "pid", "start_time", "boot_id", "daemon_socket", "socket_device", "socket_inode", "executable_path", "daemon_argv"])
+            .map_err(|_| failure("identity_mismatch"))?;
+        let start = record["start_time"].as_str().unwrap_or("");
+        let boot = record["boot_id"].as_str().unwrap_or("");
+        if record["version"].as_u64() != Some(2)
+            || !record["pid"].as_u64().is_some_and(|v| (2..=i32::MAX as u64).contains(&v))
+            || !start.parse::<u64>().is_ok_and(|v| v > 0 && v.to_string() == start)
+            || boot.len() != 36
+            || !boot.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() && !b.is_ascii_uppercase() })
+            || record["daemon_socket"] != socket
+            || record["socket_device"].as_u64().is_none()
+            || record["socket_inode"].as_u64().unwrap_or(0) == 0
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        path(socket)?;
+        let executable = record["executable_path"].as_str().ok_or_else(|| failure("identity_mismatch"))?;
+        executable_path(executable, 1)?;
+        let args = record["daemon_argv"].as_array().ok_or_else(|| failure("identity_mismatch"))?;
+        if args.is_empty() || args.len() > 256
+            || args.iter().any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 8192 || s.bytes().any(|b| b == 0 || b.is_ascii_control())))
+            || (args[0] != "tern" && args[0] != executable)
+            || args.iter().filter(|v| v.as_str() == Some("daemon")).count() != 1
+            || args.iter().filter(|v| v.as_str() == Some("--socket")).count() != 1
+            || !args.windows(2).any(|v| v[0] == "--socket" && v[1] == socket)
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(())
+    }
+    fn compatible_rebind_argv(old: &Value, new: &Value) -> Result<()> {
+        let old = old["daemon_argv"].as_array().ok_or_else(|| failure("identity_mismatch"))?;
+        let new = new["daemon_argv"].as_array().ok_or_else(|| failure("identity_mismatch"))?;
+        if old == new {
+            return Ok(());
+        }
+        // A completed handoff is a one-shot startup argument, not a different
+        // workspace. Permit only its removal; every other argument stays exact.
+        // Keep both unmodified argv arrays in the review for apply-time checks.
+        let handoff = old.iter().position(|v| v.as_str() == Some("--handoff"))
+            .ok_or_else(|| failure("identity_mismatch"))?;
+        if old.iter().filter(|v| v.as_str() == Some("--handoff")).count() != 1
+            || new.iter().any(|v| v.as_str() == Some("--handoff"))
+            || handoff + 1 >= old.len()
+            || old.len() != new.len() + 2
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        path(old[handoff + 1].as_str().ok_or_else(|| failure("identity_mismatch"))?)?;
+        if !old[..handoff].iter().chain(old[handoff + 2..].iter()).eq(new.iter()) {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(())
+    }
+    fn rebind_directory(directory: &str) -> Result<PathBuf> {
+        let directory = path(directory)?;
+        common::private_dir(&directory, false).map_err(|_| failure("security_error"))?;
+        ancestors(&directory)?;
+        Ok(directory)
+    }
+    fn rebind_lock(directory: &Path) -> Result<File> {
+        // Opening the existing lock read-only keeps review strictly non-mutating.
+        // flock uses the same inode and exclusion as prepare's common::lock.
+        let file = regular(&directory.join("control.lock"), true)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(failure(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                "state_lock_busy"
+            } else {
+                "security_error"
+            }));
+        }
+        Ok(file)
+    }
+    fn rebind_pin(directory: &Path) -> Result<Value> {
+        common::read_json(&directory.join("daemon-identity.json"), true)
+            .map_err(|_| failure("security_error"))
+    }
+    fn rebind_backup(directory: &Path, old: &Value) -> Result<PathBuf> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(old).map_err(|_| failure("protocol_error"))?;
+        Ok(directory.join(format!("daemon-identity.backup-{}.json", hex::encode(Sha256::digest(bytes)))))
+    }
+    fn old_daemon_absent(old: &Value, new: &Value) -> Result<()> {
+        if old["boot_id"] != new["boot_id"] {
+            return Ok(());
+        }
+        let pid = old["pid"].as_u64().ok_or_else(|| failure("identity_mismatch"))?;
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        match fs::symlink_metadata(&proc) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(failure("identity_mismatch")),
+            Ok(_) => {}
+        }
+        let raw = bounded(&proc.join("stat"), 8192)?;
+        let text = std::str::from_utf8(&raw).map_err(|_| failure("identity_mismatch"))?;
+        let fields: Vec<_> = text.rsplit_once(')').ok_or_else(|| failure("identity_mismatch"))?.1.split_whitespace().collect();
+        if fields.len() < 20 || fields[19].parse::<u64>().is_err() {
+            return Err(failure("identity_mismatch"));
+        }
+        if fields[19] == old["start_time"].as_str().unwrap_or("") && !["Z", "X"].contains(&fields[0]) {
+            // Even if it lost its socket, never replace another live old daemon.
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(())
+    }
+    fn identity_files(state: &Path, private: bool) -> Result<(Value, Vec<[u8; 32]>)> {
+        use sha2::{Digest, Sha256};
+        if private {
+            common::private_dir(state, false).map_err(|_| failure("security_error"))?;
+        } else {
+            // Original Tern state may expose its public certificate, but its
+            // directory must still be owned by this account and not writable
+            // by others. Never chmod or otherwise modify original state.
+            let info = fs::symlink_metadata(state).map_err(|_| failure("security_error"))?;
+            if !info.is_dir() || info.uid() != uid() || info.mode() & 0o022 != 0 {
+                return Err(failure("security_error"));
+            }
+        }
+        ancestors(state)?;
+        let mut files = Vec::with_capacity(2);
+        let mut digests = Vec::with_capacity(2);
+        for name in ["host_key", "host_cert.der"] {
+            let mut file = regular(&state.join(name), private || name == "host_key")?;
+            let info = file.metadata().map_err(|_| failure("security_error"))?;
+            if info.len() == 0 || info.len() > 65536 {
+                return Err(failure("identity_mismatch"));
+            }
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 4096];
+            let mut total = 0;
+            loop {
+                let count = match file.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        crate::gateway::wipe(&mut buffer);
+                        return Err(failure("security_error"));
+                    }
+                };
+                if count == 0 { break; }
+                total += count;
+                if total > 65536 {
+                    crate::gateway::wipe(&mut buffer);
+                    return Err(failure("security_error"));
+                }
+                digest.update(&buffer[..count]);
+                crate::gateway::wipe(&mut buffer);
+            }
+            let after = file.metadata().map_err(|_| failure("security_error"))?;
+            let metadata = |m: &Metadata| json!({"device":m.dev(),"inode":m.ino(),"size":m.len(),"mtime":m.mtime(),"mtime_ns":m.mtime_nsec(),"ctime":m.ctime(),"ctime_ns":m.ctime_nsec()});
+            if total as u64 != info.len() || metadata(&after) != metadata(&info) {
+                return Err(failure("identity_mismatch"));
+            }
+            files.push(metadata(&info));
+            digests.push(digest.finalize().into());
+        }
+        Ok((json!(files), digests))
+    }
+    fn existing_fingerprint(pin: &DaemonPin, state: &Path, private: bool) -> Result<(String, Value)> {
+        // Never invoke host-key for absent, empty, linked, or unsafe files.
+        // The existing native command remains the authority for key/cert format.
+        let before = identity_files(state, private)?;
+        let response = pin.capture(&["remote".into(), "host-key".into(), "--state-dir".into(), state.to_str().ok_or_else(|| failure("security_error"))?.into()], None, 65536)?;
+        let fingerprint = response["fingerprint"].as_str().ok_or_else(|| failure("protocol_error"))?;
+        common::fingerprint(fingerprint).map_err(|_| failure("protocol_error"))?;
+        if identity_files(state, private)? != before {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok((fingerprint.to_owned(), before.0))
+    }
+    fn rebind_snapshot(directory: &Path, request: &Value, old: &Value) -> Result<(Value, DaemonPin)> {
+        validate_rebind_request(request)?;
+        let socket = request["daemon_socket"].as_str().unwrap();
+        validate_rebind_record(old, socket)?;
+        let pin = DaemonPin::new(socket)?;
+        let new = pin.record();
+        validate_rebind_record(&new, socket)?;
+        if old == &new || old["executable_path"] != new["executable_path"] {
+            return Err(failure("identity_mismatch"));
+        }
+        compatible_rebind_argv(old, &new)?;
+        old_daemon_absent(old, &new)?;
+        let original = path(request["original_state_dir"].as_str().unwrap())?;
+        if original.starts_with(directory) || directory.starts_with(&original) {
+            return Err(failure("security_error"));
+        }
+        let native = directory.join("native");
+        native_tree(&native)?;
+        // Validate both existing identities before either native command runs.
+        identity_files(&native, true)?;
+        identity_files(&original, false)?;
+        let (gateway_fingerprint, gateway_files) = existing_fingerprint(&pin, &native, true)?;
+        let (original_fingerprint, original_files) = existing_fingerprint(&pin, &original, false)?;
+        if gateway_fingerprint != request["gateway_fingerprint"]
+            || original_fingerprint != request["original_fingerprint"]
+            || identity_files(&native, true)?.0 != gateway_files
+            || identity_files(&original, false)?.0 != original_files
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        pin.check(true)?;
+        let review = json!({"version":1,"state_dir":directory,"request":request,"old_identity":old,"new_identity":new,"gateway_fingerprint":gateway_fingerprint,"identity_files":{"gateway":gateway_files,"original":original_files},"backup_path":rebind_backup(directory, old)?});
+        Ok((review, pin))
+    }
+    pub(crate) fn rebind_review(directory: &str, request: &Value) -> Result<Value> {
+        validate_rebind_request(request)?;
+        let directory = rebind_directory(directory)?;
+        let _lock = rebind_lock(&directory)?;
+        let old = rebind_pin(&directory)?;
+        let (review, _) = rebind_snapshot(&directory, request, &old)?;
+        Ok(json!({"ok":true,"review":review}))
+    }
+    fn preserve_rebind_backup(backup: &Path, old: &Value) -> Result<()> {
+        use std::io::Write;
+        let parent = backup.parent().ok_or_else(|| failure("security_error"))?;
+        common::private_dir(parent, false).map_err(|_| failure("security_error"))?;
+        ancestors(parent)?;
+        match OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(backup)
+        {
+            Ok(mut file) => {
+                // Never overwrite an earlier backup, including an incomplete one.
+                serde_json::to_writer(&mut file, old).map_err(|_| failure("security_error"))?;
+                file.write_all(b"\n").map_err(|_| failure("security_error"))?;
+                file.sync_all().map_err(|_| failure("security_error"))?;
+                File::open(parent).and_then(|directory| directory.sync_all())
+                    .map_err(|_| failure("security_error"))?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if common::read_json(backup, true).map_err(|_| failure("security_error"))? != *old {
+                    return Err(failure("identity_mismatch"));
+                }
+                regular(backup, true)?.sync_all().map_err(|_| failure("security_error"))?;
+                File::open(parent).and_then(|directory| directory.sync_all())
+                    .map_err(|_| failure("security_error"))?;
+                Ok(())
+            }
+            Err(_) => Err(failure("security_error")),
+        }
+    }
+    // Only a caller-confirmed, byte-for-byte-equivalent JSON value may change
+    // the pin (object key ordering is irrelevant). Version-2 pins only: legacy
+    // inode-only records cannot establish the reviewed executable/argv binding.
+    // A retry requires the original review, unchanged live/file identities, the
+    // new pin, and its matching private backup. Incomplete/conflicting backups
+    // fail closed and are never overwritten or automatically removed.
+    pub(crate) fn rebind_apply(directory: &str, input: &Value) -> Result<Value> {
+        exact_fields(input, &["review", "confirm"])?;
+        if input["confirm"] != true {
+            return Err(failure("protocol_error"));
+        }
+        let review = &input["review"];
+        exact_fields(review, &["version", "state_dir", "request", "old_identity", "new_identity", "gateway_fingerprint", "identity_files", "backup_path"])?;
+        if review["version"].as_u64() != Some(1) || review["state_dir"] != directory {
+            return Err(failure("identity_mismatch"));
+        }
+        let directory = rebind_directory(directory)?;
+        let _lock = rebind_lock(&directory)?;
+        let old = &review["old_identity"];
+        let (fresh, pin) = rebind_snapshot(&directory, &review["request"], old)?;
+        if fresh != *review {
+            return Err(failure("identity_mismatch"));
+        }
+        let saved = rebind_pin(&directory)?;
+        let backup = rebind_backup(&directory, old)?;
+        let already_applied = saved == review["new_identity"];
+        if already_applied {
+            if common::read_json(&backup, true).map_err(|_| failure("security_error"))? != *old {
+                return Err(failure("identity_mismatch"));
+            }
+        } else {
+            if saved != *old {
+                return Err(failure("identity_mismatch"));
+            }
+            preserve_rebind_backup(&backup, old)?;
+            // Re-review all public identities after durable backup and immediately
+            // before mutation. A failed retry leaves both original pin and backup.
+            if rebind_snapshot(&directory, &review["request"], old)?.0 != *review
+                || rebind_pin(&directory)? != *old
+            {
+                return Err(failure("identity_mismatch"));
+            }
+            pin.check(true)?;
+            common::atomic_json(&directory.join("daemon-identity.json"), &review["new_identity"])
+                .map_err(|_| failure("security_error"))?;
+        }
+        Ok(json!({"ok":true,"applied":true,"already_applied":already_applied,"backup_path":backup,"daemon_identity":review["new_identity"],"gateway_fingerprint":review["gateway_fingerprint"]}))
+    }
     struct Secret([u8; 32]);
     impl Drop for Secret {
         fn drop(&mut self) {
@@ -1274,11 +1595,220 @@ pub(crate) mod linux {
     mod tests {
         use super::*;
         fn current() -> Value {
-            json!({"version":2,"pid":42,"start_time":"1000","boot_id":"boot","daemon_socket":"/run/user/1000/daemon.sock","socket_device":2,"socket_inode":3,"executable_path":"/home/test/bin/tern","daemon_argv":["tern","daemon","--socket","/run/user/1000/daemon.sock"]})
+            json!({"version":2,"pid":42,"start_time":"1000","boot_id":"00000000-0000-4000-8000-000000000001","daemon_socket":"/run/user/1000/daemon.sock","socket_device":2,"socket_inode":3,"executable_path":"/home/test/bin/tern","daemon_argv":["tern","daemon","--socket","/run/user/1000/daemon.sock"]})
         }
         fn legacy() -> Value {
-            json!({"pid":42,"start_time":"1000","boot_id":"boot","daemon_socket":"/run/user/1000/daemon.sock","socket_device":2,"socket_inode":3,"exe_device":99,"exe_inode":10})
+            json!({"pid":42,"start_time":"1000","boot_id":"00000000-0000-4000-8000-000000000001","daemon_socket":"/run/user/1000/daemon.sock","socket_device":2,"socket_inode":3,"exe_device":99,"exe_inode":10})
         }
+        #[test]
+        fn rebind_requires_explicit_confirmation_and_strict_schema() {
+            let request = json!({"daemon_socket":"/run/user/1000/daemon.sock","bind_host":"8.8.8.8","original_state_dir":"/home/test/original","original_fingerprint":format!("SHA256:{}", "A".repeat(43)),"gateway_fingerprint":format!("SHA256:{}", "B".repeat(42) + "A")});
+            assert!(validate_rebind_request(&request).is_ok());
+            let mut extra = request.clone();
+            extra["unexpected"] = json!(true);
+            assert!(validate_rebind_request(&extra).is_err());
+            let mut same_fingerprint = request.clone();
+            same_fingerprint["gateway_fingerprint"] = request["original_fingerprint"].clone();
+            assert!(validate_rebind_request(&same_fingerprint).is_err());
+            let mut missing = request.clone();
+            missing.as_object_mut().unwrap().remove("gateway_fingerprint");
+            assert!(validate_rebind_request(&missing).is_err());
+            assert!(rebind_apply("/missing", &json!({"review":{},"confirm":false})).is_err());
+            assert!(rebind_apply("/missing", &json!({"review":{},"confirm":true,"extra":0})).is_err());
+            assert!(rebind_apply("/missing", &json!({"review":{}})).is_err());
+            assert!(validate_rebind_record(&current(), "/run/user/1000/daemon.sock").is_ok());
+            assert!(validate_rebind_record(&legacy(), "/run/user/1000/daemon.sock").is_err());
+            for (field, value) in [("version", json!(3)), ("pid", json!(0)), ("start_time", json!("bad")), ("boot_id", json!("bad")), ("socket_inode", json!(0)), ("extra", json!(0)), ("executable_path", json!("/other/../tern"))] {
+                let mut record = current();
+                record[field] = value;
+                assert!(validate_rebind_record(&record, "/run/user/1000/daemon.sock").is_err(), "{field}");
+            }
+            let mut replacement = current();
+            replacement["pid"] = json!(43);
+            assert!(migration_required(&current(), &replacement).is_err());
+        }
+        #[test]
+        fn rebind_allows_only_completed_handoff_argument_removal() {
+            let mut old = current();
+            old["daemon_argv"] = json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "/home/test/.local/state/tern/daemon.state.handoff"]);
+            let new = current();
+            assert!(compatible_rebind_argv(&old, &new).is_ok());
+            assert!(compatible_rebind_argv(&new, &new).is_ok());
+            assert!(compatible_rebind_argv(&new, &old).is_err());
+            for args in [
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "relative"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "/home/test/../daemon.state.handoff"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "/home/test/state", "--handoff", "/home/test/state"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--unsafe", "--handoff", "/home/test/state"]),
+            ] {
+                old["daemon_argv"] = args;
+                assert!(compatible_rebind_argv(&old, &new).is_err());
+            }
+        }
+        struct RebindFixture(PathBuf);
+        impl RebindFixture {
+            fn new() -> Self {
+                let path = account().unwrap().1.join(format!(".tern-rebind-test-{:032x}", rand::random::<u128>()));
+                common::private_dir(&path, true).unwrap();
+                Self(path)
+            }
+            fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+                use std::io::Write;
+                let path = self.0.join(name);
+                let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+                file.write_all(bytes).unwrap();
+                path
+            }
+        }
+        impl Drop for RebindFixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        #[test]
+        fn rebind_review_never_creates_missing_state_or_lock() {
+            let fixture = RebindFixture::new();
+            let request = json!({"daemon_socket":"/run/user/1000/daemon.sock","bind_host":"8.8.8.8","original_state_dir":"/home/test/original","original_fingerprint":format!("SHA256:{}", "A".repeat(43)),"gateway_fingerprint":format!("SHA256:{}", "B".repeat(42) + "A")});
+            assert!(rebind_review(fixture.0.join("absent").to_str().unwrap(), &request).is_err());
+            assert!(rebind_review(fixture.0.to_str().unwrap(), &request).is_err());
+            assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+            let lock = common::lock(&fixture.0.join("control.lock"), true).unwrap();
+            let error = rebind_review(fixture.0.to_str().unwrap(), &request).unwrap_err();
+            assert_eq!(error.code, "state_lock_busy");
+            drop(lock);
+            assert!(rebind_lock(&fixture.0).is_ok());
+        }
+        #[test]
+        fn rebind_saved_pin_rejects_public_linked_and_duplicate_records() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let fixture = RebindFixture::new();
+            let pin = fixture.0.join("daemon-identity.json");
+            common::atomic_json(&pin, &current()).unwrap();
+            assert_eq!(rebind_pin(&fixture.0).unwrap(), current());
+            fs::set_permissions(&pin, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(rebind_pin(&fixture.0).is_err());
+            fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+            let linked = fixture.0.join("linked.json");
+            fs::hard_link(&pin, &linked).unwrap();
+            assert!(rebind_pin(&fixture.0).is_err());
+            fs::remove_file(&linked).unwrap();
+            fs::write(&pin, b"{\"pid\":42,\"pid\":43}").unwrap();
+            assert!(rebind_pin(&fixture.0).is_err());
+            fs::rename(&pin, &linked).unwrap();
+            symlink(&linked, &pin).unwrap();
+            assert!(rebind_pin(&fixture.0).is_err());
+        }
+        #[test]
+        fn rebind_backup_is_private_immutable_and_retryable() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let fixture = RebindFixture::new();
+            let old = current();
+            let backup = rebind_backup(&fixture.0, &old).unwrap();
+            preserve_rebind_backup(&backup, &old).unwrap();
+            let before = fs::metadata(&backup).unwrap();
+            assert_eq!(before.mode() & 0o777, 0o600);
+            assert_eq!(common::read_json(&backup, true).unwrap(), old);
+            preserve_rebind_backup(&backup, &old).unwrap();
+            assert_eq!(fs::metadata(&backup).unwrap().ino(), before.ino());
+            let mut other = old.clone();
+            other["pid"] = json!(43);
+            assert!(preserve_rebind_backup(&backup, &other).is_err());
+            assert_eq!(common::read_json(&backup, true).unwrap(), old);
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(preserve_rebind_backup(&backup, &old).is_err());
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+            let link = fixture.0.join("backup-link.json");
+            symlink(&backup, &link).unwrap();
+            assert!(preserve_rebind_backup(&link, &old).is_err());
+            let hard_link = fixture.0.join("backup-hard-link.json");
+            fs::hard_link(&backup, &hard_link).unwrap();
+            assert!(preserve_rebind_backup(&backup, &old).is_err());
+            fs::remove_file(&hard_link).unwrap();
+            let partial = fixture.file("partial.json", b"{\"version\":");
+            assert!(preserve_rebind_backup(&partial, &old).is_err());
+            assert_eq!(fs::read(partial).unwrap(), b"{\"version\":");
+        }
+        #[test]
+        fn rebind_identity_files_fail_closed_without_generating_keys() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let fixture = RebindFixture::new();
+            assert!(identity_files(&fixture.0, true).is_err());
+            assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+            let key = fixture.file("host_key", b"existing private key");
+            assert!(identity_files(&fixture.0, true).is_err());
+            let cert = fixture.file("host_cert.der", b"existing certificate");
+            let before = identity_files(&fixture.0, true).unwrap();
+            assert_eq!(before.0.as_array().unwrap().len(), 2);
+            assert!(!before.0.to_string().contains("private key"));
+            fs::write(&key, b"modified private key").unwrap();
+            assert_ne!(identity_files(&fixture.0, true).unwrap(), before);
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(identity_files(&fixture.0, true).is_err());
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::remove_file(&cert).unwrap();
+            symlink(&key, &cert).unwrap();
+            assert!(identity_files(&fixture.0, true).is_err());
+        }
+        #[test]
+        fn rebind_original_identity_allows_public_certificate_not_public_key() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let fixture = RebindFixture::new();
+            let key = fixture.file("host_key", b"existing private key");
+            let cert = fixture.file("host_cert.der", b"existing public certificate");
+            fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&cert, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(identity_files(&fixture.0, false).is_ok());
+            assert_eq!(fs::metadata(&fixture.0).unwrap().mode() & 0o777, 0o755);
+            assert_eq!(fs::metadata(&key).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&cert).unwrap().mode() & 0o777, 0o644);
+            assert!(identity_files(&fixture.0, true).is_err());
+            fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(identity_files(&fixture.0, true).is_err());
+            fs::set_permissions(&cert, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(identity_files(&fixture.0, true).is_ok());
+            fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(identity_files(&fixture.0, false).is_err());
+            fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(identity_files(&fixture.0, false).is_err());
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&cert, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(identity_files(&fixture.0, false).is_err());
+            fs::set_permissions(&cert, fs::Permissions::from_mode(0o644)).unwrap();
+            let linked = fixture.0.join("cert-link");
+            fs::hard_link(&cert, &linked).unwrap();
+            assert!(identity_files(&fixture.0, false).is_err());
+            fs::remove_file(&linked).unwrap();
+            if uid() == 0 {
+                // The remote root test runner can exercise actual foreign owners.
+                for target in [&key, &cert, &fixture.0] {
+                    let target = CString::new(target.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::chown(target.as_ptr(), 1, !0) }, 0);
+                    assert!(identity_files(&fixture.0, false).is_err());
+                    assert_eq!(unsafe { libc::chown(target.as_ptr(), uid(), !0) }, 0);
+                }
+            }
+            fs::remove_file(&cert).unwrap();
+            symlink(&key, &cert).unwrap();
+            assert!(identity_files(&fixture.0, false).is_err());
+        }
+        #[test]
+        fn rebind_refuses_old_process_even_after_socket_disappears() {
+            let pid = std::process::id();
+            let mut old = current();
+            old["pid"] = json!(pid);
+            old["start_time"] = json!(process_stat(pid).unwrap().0);
+            let mut new = old.clone();
+            new["pid"] = json!(pid + 1);
+            assert!(old_daemon_absent(&old, &new).is_err());
+            old["start_time"] = json!("1");
+            assert!(old_daemon_absent(&old, &new).is_ok());
+            old["start_time"] = new["start_time"].clone();
+            old["boot_id"] = json!("previous-boot");
+            assert!(old_daemon_absent(&old, &new).is_ok());
+        }
+
         #[test]
         fn stable_binding_survives_inode_upgrade_but_not_workspace_change() {
             assert!(migration_required(&legacy(), &current()).unwrap());

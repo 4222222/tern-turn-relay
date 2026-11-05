@@ -114,6 +114,8 @@ fn main() {
                         "inspect",
                         "discover",
                         "apply",
+                        "rebind-review",
+                        "rebind-apply",
                         "configure-credentials",
                         "update",
                         "uninstall",

@@ -81,7 +81,7 @@ function M.new(api, host)
     local function backend(cx, action, input, callback)
         local argv = { "onboarding", action,
             "--data-dir", tern.plugin.data, "--package-dir", tern.plugin.dir }
-        run(cx, platform.bootstrap("--exec", argv), input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update" or action == "migrate" or action == "discover") and 240000 or 60000), callback)
+        run(cx, platform.bootstrap("--exec", argv), input, action == "configure-credentials" and 330000 or ((action == "apply" or action == "update" or action == "migrate" or action == "discover" or action == "rebind-review" or action == "rebind-apply") and 240000 or 60000), callback)
     end
     local function credentials(cx, snapshot)
         local replacing = snapshot.credential_present == true or snapshot.credential_configured == true
@@ -228,6 +228,50 @@ function M.new(api, host)
             end)
         end)
     end
+    local function reviewRebind(cx)
+        backend(cx, "rebind-review", {}, function(value, fresh)
+            local plan = value.review
+            local remote = type(plan) == "table" and plan.remote
+            if type(remote) ~= "table" or type(remote.old_identity) ~= "table" or type(remote.new_identity) ~= "table" then
+                fail(fresh, "助手未返回完整的 daemon 身份审核；未更改绑定。")
+                return
+            end
+            local rows = {
+                "# TURN daemon 重绑确认", "",
+                "仅用于你明确重启过远端 daemon 的情况。普通连接仍拒绝身份变化；不会停止或启动远端程序。", "",
+                "| 项目 | 已核验值 |", "| --- | --- |",
+                "| 原 daemon PID | " .. plain(remote.old_identity.pid) .. " |",
+                "| 新 daemon PID | " .. plain(remote.new_identity.pid) .. " |",
+                "| 原启动时间 | " .. plain(remote.old_identity.start_time) .. " |",
+                "| 新启动时间 | " .. plain(remote.new_identity.start_time) .. " |",
+                "| daemon socket | " .. plain(remote.new_identity.daemon_socket) .. " |",
+                "| 网关目录 | " .. plain(remote.state_dir) .. " |",
+                "| 网关指纹（保留） | " .. plain(remote.gateway_fingerprint) .. " |",
+                "| 旧绑定备份 | " .. plain(remote.backup_path) .. " |", "",
+                "确认时会重新核验全部身份；审核后有变化则拒绝。保留凭据、证书和 SSH 配置；成功后需手动连接。",
+            }
+            local pane = fresh.canvas:open({ title = "TURN daemon 重绑确认", about = ABOUT .. " daemon", md = table.concat(rows, "\n"), how = "tab" })
+            if not pane then fail(fresh, "无法显示 daemon 审核；未更改绑定。"); return end
+            self.rebindReviewed = plan
+            finish()
+            fresh:toast("info", "请阅读 daemon 重绑确认页", "再次打开 TURN Settings 后确认或取消；尚未修改身份绑定。")
+        end)
+    end
+    local function confirmRebind(cx)
+        local plan = self.rebindReviewed
+        pick(cx, "确认接受已核验的新 daemon？", {
+            { label = "确认重绑", value = "apply", detail = "备份旧绑定并核验后更新；不修改凭据，不自动连接" },
+            { label = "取消，不修改绑定", value = "cancel" },
+        }, function(answer, current)
+            self.rebindReviewed = nil
+            if answer.value ~= "apply" then finish(); return end
+            backend(current, "rebind-apply", { review = plan, confirm = true }, function(_value, completed)
+                finish()
+                api.configured()
+                completed:toast("success", "daemon 重绑完成", "旧绑定已备份；请选择原来的 TURN TLS 或 UDP 连接。")
+            end)
+        end)
+    end
     menu = function(snapshot, cx)
         local target = snapshot.current_target
         local configured = snapshot.configured == true
@@ -243,6 +287,9 @@ function M.new(api, host)
         if configured then
             if not snapshot.migration_required then table.insert(items, 1, { label = "连接 TURN TLS", value = "connect", detail = "从本机或对应服务器 Host 连接；不切换无关 Host，不回退直连" }) end
             table.insert(items, { label = "查看连接详情", value = "status" })
+            if not snapshot.migration_required then
+                table.insert(items, { label = "恢复：审核重启后的 daemon", value = "rebind", detail = "先 Stop；核验新旧身份，确认后备份并重绑，不自动连接" })
+            end
         end
         table.insert(items, { label = "高级：自定义本机端口", value = "port", detail = "仅在默认 18377 被占用时使用；更改将显示在配置确认页" })
         table.insert(items, { label = "插件管理：更新 / 卸载", value = "manage", detail = "原生安装管理，保留配置与凭据" })
@@ -251,6 +298,7 @@ function M.new(api, host)
             if answer.value == "server" then chooseServer(snapshot, fresh)
             elseif answer.value == "credentials" then credentials(fresh, snapshot)
             elseif answer.value == "manage" then manage(snapshot, fresh)
+            elseif answer.value == "rebind" then reviewRebind(fresh)
             elseif answer.value == "migrate" then
                 pick(fresh, "确认迁移现有配置到 Rust 后端？", {
                     { label = "确认迁移", value = "confirm", detail = "连接必须已停止；保留现有凭据、身份与工作区，旧运行环境不自动删除" },
@@ -293,6 +341,7 @@ function M.new(api, host)
             cx:toast("info", "Windows 局部保护", "信任当前 Tern 插件环境，不修改宿主目录权限；凭据使用用户级加密。能改写插件代码的本机程序仍可获取凭据。")
         end
         if self.reviewed then confirmReview(cx); return end
+        if self.rebindReviewed then confirmRebind(cx); return end
         -- Only an explicit setup action can acquire a runtime; plugin loading never downloads.
         cx:toast("info", "正在准备 TURN 设置", "首次使用将下载并校验插件私有 Rust 程序；无需 Python 或本机编译。")
         run(cx, platform.bootstrap("--prepare"), {}, 320000,

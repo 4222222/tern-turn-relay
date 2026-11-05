@@ -582,6 +582,55 @@ pub async fn provision(config: &Value) -> Result<Value> {
     .map_err(|_| failure("connectivity_uncertain"))?
 }
 
+/// Explicit stopped-backend recovery; ordinary provision/open never rebind a daemon.
+pub(crate) async fn rebind(config: &Value, original_state_dir: &str, review: Option<&Value>) -> Result<Value> {
+    timeout(Duration::from_secs(180), async {
+        let helper = prepare(config, true).await?;
+        let (alias, host, state, socket) = settings(config, true)?;
+        common::safe_absolute(original_state_dir)?;
+        let mut identity_request = initial_request(config, host, socket);
+        identity_request["original_state_dir"] = json!(original_state_dir);
+        if let Some(value) = review {
+            if value["state_dir"] != state || value["request"] != identity_request {
+                return Err(failure("identity_mismatch"));
+            }
+        }
+        let operation = if review.is_some() { "rebind-apply" } else { "rebind-review" };
+        let command = format!(
+            "{} remote {} --state-dir {}",
+            common::shell_quote(&helper), operation, common::shell_quote(state)
+        );
+        let request = match review {
+            Some(value) => json!({"review":value,"confirm":true}),
+            None => identity_request.clone(),
+        };
+        let mut input = serde_json::to_vec(&request).map_err(|_| failure("protocol_error"))?;
+        input.push(b'\n');
+        let output = common::run(
+            &common::ssh_executable()?, &common::ssh_args(alias, &command),
+            Some(&input), Duration::from_secs(60),
+        ).await.map_err(|_| failure("connectivity_uncertain"))?;
+        let mut reader = BufReader::new(output.stdout.as_slice());
+        let response = receive(&mut reader).await?;
+        if !output.status.success() || response["ok"] != true {
+            return Err(failure("security_error"));
+        }
+        if review.is_none() {
+            if response["review"]["state_dir"] != state
+                || response["review"]["request"] != identity_request
+                || response["review"]["gateway_fingerprint"] != config["gateway"]["fingerprint"]
+            {
+                return Err(failure("identity_mismatch"));
+            }
+        } else if response["applied"] != true
+            || response["gateway_fingerprint"] != config["gateway"]["fingerprint"]
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(response)
+    }).await.map_err(|_| failure("connectivity_uncertain"))?
+}
+
 pub struct Gateway {
     pub peer: SocketAddr,
     pub key: [u8; 32],

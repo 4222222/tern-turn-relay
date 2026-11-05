@@ -267,7 +267,10 @@ async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
         .and_then(|p| p["gateway"]["state_dir"].as_str())
         .map(|s| vec![format!("{s}/native")])
         .unwrap_or_default();
-    let remote = crate::discovery::discover(alias, selected, &excluded).await?;
+    let saved_socket = previous.as_ref()
+        .filter(|old| old["ssh_destination"] == alias)
+        .and_then(|old| old["gateway"]["daemon_socket"].as_str());
+    let remote = crate::discovery::discover(alias, selected, &excluded, saved_socket).await?;
     if remote.get("candidates").is_some() {
         return inventory(&remote);
     }
@@ -328,6 +331,53 @@ async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
     Ok(json!({"code":"review","review":review,"candidates":[],
         "summary":format!("{} · {}:{} · existing daemon {}", alias, text(&remote,"host")?, remote["target_port"], remote_path(&remote,"daemon_socket")?)}))
 }
+
+async fn rebind(paths: &Paths, request: &Value, apply: bool) -> Result<Value> {
+    if apply {
+        fields(request, &["review", "confirm"], &["review", "confirm"])?;
+        if !boolean(request, "confirm")? {
+            return Err(Error::with_exit("confirmation-required", "Explicit daemon rebinding confirmation is required.", 6));
+        }
+    } else {
+        fields(request, &[], &[])?;
+    }
+    let _locks = install::lifecycle(paths)?;
+    require_native(paths)?;
+    let config = install::current(paths)?.ok_or_else(request_error)?;
+    if install::snapshot(&paths.runtime().join("intent.json"), 65536)?.is_some() {
+        return Err(Error::with_exit("stopped-required", "Use explicit Stop before reviewing a replacement daemon.", 6));
+    }
+    let digest = install::digest(&paths.config())?;
+    if apply {
+        fields(&request["review"], &["schema", "config_sha256", "remote"], &["schema", "config_sha256", "remote"])?;
+        if request["review"]["schema"] != 1 || request["review"]["config_sha256"] != json!(digest) {
+            return Err(Error::with_exit("review-changed", "Configuration changed; review the daemon replacement again.", 6));
+        }
+    }
+    let alias = text(&config, "ssh_destination")?;
+    let socket = remote_path(&config["gateway"], "daemon_socket")?;
+    let excluded = vec![format!("{}/native", remote_path(&config["gateway"], "state_dir")?)];
+    let remote = crate::discovery::discover(alias, None, &excluded, Some(socket)).await?;
+    if remote.get("candidates").is_some()
+        || remote["host"] != config["target"]["host"]
+        || remote["user"] != config["target"]["user"]
+        || remote["target_port"] != config["target"]["port"]
+        || remote["fingerprint"] != config["target"]["fingerprint"]
+        || remote["daemon_socket"] != socket
+    {
+        return Err(discovery_error());
+    }
+    let original = remote_path(&remote, "original_state_dir")?;
+    let result = crate::gateway::rebind(&config, original,
+        if apply { Some(&request["review"]["remote"]) } else { None }).await?;
+    if apply {
+        Ok(result)
+    } else {
+        Ok(json!({"code":"rebind-review", "review":{"schema":1,"config_sha256":digest,"remote":result["review"]},
+            "target":config["target"],"changes":["Back up the reviewed old daemon identity and bind this gateway to the verified replacement daemon.",
+            "Preserve gateway certificates, credentials, SSH configuration and running programs; do not connect automatically."]}))
+    }
+}
 async fn execute(action: &str, paths: &Paths, request: &Value) -> Result<Value> {
     match action {
         "inspect" => {
@@ -335,6 +385,8 @@ async fn execute(action: &str, paths: &Paths, request: &Value) -> Result<Value> 
             inspect(paths)
         }
         "discover" | "review" => discover(paths, request).await,
+        "rebind-review" => rebind(paths, request, false).await,
+        "rebind-apply" => rebind(paths, request, true).await,
         "apply" => {
             fields(request, &["review", "authorize_replace"], &["review"])?;
             let replace = boolean(request, "authorize_replace")?;
@@ -480,6 +532,21 @@ mod tests {
         }
         assert!(confirm(&json!({"confirm":true})).is_ok());
         assert!(boolean(&json!({"replace":null}), "replace").is_err());
+    }
+    #[tokio::test]
+    async fn daemon_rebind_rejects_missing_or_nonboolean_consent_before_io() {
+        for request in [
+            json!({"review":{}}),
+            json!({"review":{},"confirm":false}),
+            json!({"review":{},"confirm":"true"}),
+            json!({"review":{},"confirm":1}),
+            json!({"review":{},"confirm":true,"ignore_identity":true}),
+        ] {
+            let error = execute("rebind-apply", &paths(), &request).await.unwrap_err();
+            assert!(matches!(error.code, "invalid-request" | "confirmation-required"));
+        }
+        let error = execute("rebind-review", &paths(), &json!({"confirm":true})).await.unwrap_err();
+        assert_eq!(error.code, "invalid-request");
     }
     #[test]
     fn inventory_exposes_only_verified_public_fields() {

@@ -153,6 +153,7 @@ pub async fn discover(
     alias: &str,
     selected: Option<&str>,
     excluded_state_dirs: &[String],
+    daemon_socket: Option<&str>,
 ) -> Result<Value> {
     if selected.is_some_and(|id| !candidate_id(id)) || excluded_state_dirs.len() > 64 {
         return Err(failure("protocol_error"));
@@ -160,9 +161,12 @@ pub async fn discover(
     for path in excluded_state_dirs {
         common::safe_absolute(path).map_err(|_| failure("security_error"))?;
     }
+    if let Some(socket) = daemon_socket {
+        common::safe_absolute(socket).map_err(|_| failure("security_error"))?;
+    }
     let endpoint = resolve(alias).await?;
     let helper = crate::gateway::deploy(alias, &endpoint).await?;
-    let request = json!({"target_host":endpoint["host"],"candidate_id":selected,"excluded_state_dirs":excluded_state_dirs,"inventory":true});
+    let request = json!({"target_host":endpoint["host"],"candidate_id":selected,"excluded_state_dirs":excluded_state_dirs,"inventory":true,"daemon_socket":daemon_socket});
     let input = serde_json::to_vec(&request).map_err(|_| failure("protocol_error"))?;
     let command = format!("{} remote discover", common::shell_quote(&helper));
     let output = common::run(
@@ -397,8 +401,58 @@ pub(crate) mod linux {
         daemon: usize,
         listener: Listener,
     }
+    fn related(service: &Service, daemon: &Daemon, requested_socket: Option<&str>) -> bool {
+        if requested_socket.is_some_and(|socket| socket != daemon.socket) {
+            return false;
+        }
+        if let Some(socket) = &service.daemon {
+            // A saved socket must never override the service's explicit environment.
+            return *socket == daemon.socket;
+        }
+        // No upstream default-path contract is available here. Only an explicitly
+        // supplied, saved socket may associate an independent --user daemon.
+        // Unknown/non-user modes retain the original parent/start-time rule.
+        (requested_socket.is_some()
+            && service.argv.iter().take_while(|arg| arg.as_str() != "--").any(|arg| arg == "--user"))
+            || (daemon.ppid == service.pid
+                && daemon.start.parse::<u64>().unwrap_or(0)
+                    >= service.start.parse::<u64>().unwrap_or(u64::MAX))
+    }
+    fn matching_daemons<'a>(
+        service: &'a Service,
+        daemons: &'a [Daemon],
+        requested_socket: Option<&'a str>,
+        mut verified: impl FnMut(&Daemon) -> bool + 'a,
+    ) -> impl Iterator<Item = (usize, &'a Daemon)> + 'a {
+        daemons.iter().enumerate().filter(move |(_, daemon)| {
+            related(service, daemon, requested_socket) && verified(daemon)
+        })
+    }
+    fn verified_daemon(daemon: &Daemon) -> bool {
+        // This includes socket ownership, SO_PEERCRED UID, executable and argv
+        // checks; a path match alone is never sufficient evidence.
+        DaemonPin::new(&daemon.socket).is_ok_and(|pin| {
+            pin.pid == daemon.pid && pin.identity["start_time"] == daemon.start
+        })
+    }
+    fn choose_candidate<'a>(
+        candidates: &'a [Candidate],
+        selected: Option<&str>,
+    ) -> Result<&'a Candidate> {
+        let mut matching = candidates
+            .iter()
+            .filter(|candidate| selected.is_none_or(|id| candidate.identifier == id));
+        let chosen = matching.next().ok_or_else(|| failure("identity_mismatch"))?;
+        if matching.next().is_some() {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(chosen)
+    }
     fn service_daemon(pid: u32) -> Result<Option<String>> {
         let raw = secure::bounded(&PathBuf::from(format!("/proc/{pid}/environ")), 1024 * 1024)?;
+        daemon_environment(&raw)
+    }
+    fn daemon_environment(raw: &[u8]) -> Result<Option<String>> {
         let mut daemon = None;
         let mut pane = None;
         for entry in raw.split(|b| *b == 0) {
@@ -579,28 +633,12 @@ pub(crate) mod linux {
             if original_files(&service.state).is_err() {
                 continue;
             }
-            for (di, daemon) in daemons.iter().enumerate() {
-                let related = if let Some(wanted) = &service.daemon {
-                    daemon.socket == *wanted
-                } else {
-                    daemon.ppid == service.pid
-                        && daemon.start.parse::<u64>().unwrap_or(0)
-                            >= service.start.parse::<u64>().unwrap_or(u64::MAX)
-                };
-                if !related
-                    || request
-                        .get("daemon_socket")
-                        .filter(|v| !v.is_null())
-                        .is_some_and(|v| v != &daemon.socket)
-                {
-                    continue;
-                }
-                let Ok(pin) = DaemonPin::new(&daemon.socket) else {
-                    continue;
-                };
-                if pin.pid != daemon.pid || pin.identity["start_time"] != daemon.start {
-                    continue;
-                }
+            for (di, daemon) in matching_daemons(
+                service,
+                &daemons,
+                request["daemon_socket"].as_str(),
+                verified_daemon,
+            ) {
                 for listener in
                     native_listeners(service.listen.as_deref(), &service.listeners, host)
                 {
@@ -642,14 +680,7 @@ pub(crate) mod linux {
                 json!({"ok":true,"home":home,"uid":secure::uid(),"user":user,"candidates":values}),
             );
         }
-        let selected: Vec<_> = candidates
-            .iter()
-            .filter(|c| selected.is_none_or(|id| c.identifier == id))
-            .collect();
-        if selected.len() != 1 {
-            return Err(failure("identity_mismatch"));
-        }
-        let chosen = selected[0];
+        let chosen = choose_candidate(&candidates, selected)?;
         let service = &services[chosen.service];
         let daemon = &daemons[chosen.daemon];
         let pin = DaemonPin::new(&daemon.socket)?;
@@ -683,7 +714,16 @@ pub(crate) mod linux {
         {
             return Err(failure("identity_mismatch"));
         }
-        if service.daemon.is_none() && secure::process_stat(daemon.pid)?.1 != service.pid {
+        let current_daemon = Daemon {
+            pid: daemon.pid,
+            start: pin.identity["start_time"]
+                .as_str()
+                .ok_or_else(|| failure("identity_mismatch"))?
+                .to_owned(),
+            ppid: secure::process_stat(daemon.pid)?.1,
+            socket: daemon.socket.clone(),
+        };
+        if !related(service, &current_daemon, request["daemon_socket"].as_str()) {
             return Err(failure("identity_mismatch"));
         }
         if fs::metadata(format!("/proc/{}", service.pid))
@@ -703,6 +743,129 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        fn service() -> Service {
+            Service {
+                pid: 100,
+                start: "1000".into(),
+                state: "/home/test/original".into(),
+                listen: None,
+                daemon: None,
+                argv: vec!["tern".into(), "remote".into(), "serve".into(), "--user".into()],
+                binary: "/home/test/bin/tern".into(),
+                listeners: vec![Listener {
+                    port: 8376,
+                    address: "0.0.0.0".into(),
+                    inode: "42".into(),
+                }],
+            }
+        }
+        fn daemon(pid: u32, ppid: u32, socket: &str) -> Daemon {
+            Daemon {
+                pid,
+                ppid,
+                start: "2000".into(),
+                socket: socket.into(),
+            }
+        }
+        fn candidates(
+            service: &Service,
+            daemons: &[Daemon],
+            requested_socket: Option<&str>,
+            verified: impl FnMut(&Daemon) -> bool,
+        ) -> Vec<Candidate> {
+            // Exercise the same association + mandatory verification iterator
+            // and uniqueness selector used by discovery, not just path parsing.
+            matching_daemons(service, daemons, requested_socket, verified)
+                .map(|(index, daemon)| Candidate {
+                    identifier: format!("{:024x}", daemon.pid),
+                    service: 0,
+                    daemon: index,
+                    listener: service.listeners[0].clone(),
+                })
+                .collect()
+        }
+        #[test]
+        fn independent_user_daemon_requires_exact_saved_socket_and_verification() {
+            let service = service();
+            let daemons = [
+                daemon(201, 1, "/home/test/test.sock"),
+                daemon(202, 1, "/run/user/1000/tern/daemon.sock"),
+                daemon(203, 1, "/run/user/1001/tern/daemon.sock"),
+            ];
+            let mut verified = Vec::new();
+            let found = candidates(
+                &service,
+                &daemons,
+                Some("/run/user/1000/tern/daemon.sock"),
+                |daemon| {
+                    verified.push(daemon.pid);
+                    true
+                },
+            );
+            assert_eq!(verified, [202]);
+            assert_eq!(choose_candidate(&found, None).unwrap().daemon, 1);
+            assert!(candidates(&service, &daemons, None, |_| true).is_empty());
+            assert!(candidates(&service, &daemons, Some("/missing.sock"), |_| true).is_empty());
+            // A failed DaemonPin check (including another UID's SO_PEERCRED)
+            // cannot be bypassed even when the saved path matches exactly.
+            let refused = candidates(
+                &service,
+                &daemons,
+                Some("/run/user/1000/tern/daemon.sock"),
+                |_| false,
+            );
+            assert!(choose_candidate(&refused, None).is_err());
+        }
+        #[test]
+        fn explicit_daemon_environment_wins_over_saved_socket_and_parent() {
+            let mut service = service();
+            service.daemon = daemon_environment(
+                b"TERN_PANE_SOCKET=/pane.sock\0TERN_DAEMON_SOCKET=/explicit.sock\0",
+            ).unwrap();
+            assert_eq!(service.daemon.as_deref(), Some("/explicit.sock"));
+            let daemons = [
+                daemon(201, service.pid, "/saved.sock"),
+                daemon(202, 1, "/explicit.sock"),
+                daemon(203, 1, "/pane.sock"),
+            ];
+            let found = candidates(&service, &daemons, None, |_| true);
+            assert_eq!(choose_candidate(&found, None).unwrap().daemon, 1);
+            assert!(candidates(&service, &daemons, Some("/saved.sock"), |_| true).is_empty());
+            let found = candidates(&service, &daemons, Some("/explicit.sock"), |_| true);
+            assert_eq!(choose_candidate(&found, None).unwrap().daemon, 1);
+            service.daemon = daemon_environment(b"TERN_PANE_SOCKET=/pane.sock\0").unwrap();
+            let found = candidates(&service, &daemons, None, |_| true);
+            assert_eq!(choose_candidate(&found, None).unwrap().daemon, 2);
+        }
+        #[test]
+        fn unknown_mode_retains_parent_and_start_time_requirements() {
+            let mut service = service();
+            service.argv.pop();
+            let mut daemons = [daemon(201, 1, "/saved.sock")];
+            assert!(candidates(&service, &daemons, Some("/saved.sock"), |_| true).is_empty());
+            daemons[0].ppid = service.pid;
+            let found = candidates(&service, &daemons, Some("/saved.sock"), |_| true);
+            assert_eq!(choose_candidate(&found, None).unwrap().daemon, 0);
+            daemons[0].start = "999".into();
+            assert!(candidates(&service, &daemons, Some("/saved.sock"), |_| true).is_empty());
+            service.argv.extend(["--".into(), "--user".into()]);
+            daemons[0].ppid = 1;
+            assert!(candidates(&service, &daemons, Some("/saved.sock"), |_| true).is_empty());
+        }
+        #[test]
+        fn ambiguous_daemons_are_not_reduced_to_first_match() {
+            let service = service();
+            let daemons = [
+                daemon(201, service.pid, "/first.sock"),
+                daemon(202, service.pid, "/second.sock"),
+            ];
+            let found = candidates(&service, &daemons, None, |_| true);
+            assert_eq!(found.len(), 2);
+            assert!(choose_candidate(&found, None).is_err());
+            assert_eq!(choose_candidate(&found, Some(&found[1].identifier)).unwrap().daemon, 1);
+            let unknown = [daemon(201, 1, "/first.sock"), daemon(202, 1, "/second.sock")];
+            assert!(candidates(&service, &unknown, None, |_| true).is_empty());
+        }
         #[test]
         fn native_listener_never_guesses_iroh_or_missing_default() {
             let listeners = vec![Listener {
