@@ -8,6 +8,7 @@ local POLL_MS = 3000
 local CONNECT_MS = 45000
 local STARTUP_MS = 30000
 local HELPER_GRACE_MS = 2000
+local STATUS_TIMEOUT_MS = 15000
 local generation = 0
 local busy = nil
 local pending = nil
@@ -227,7 +228,7 @@ local function helper(command, mode, token, _cx, callback)
     local argv = { "relay", command,
         "--config", configPath, "--state-dir", stateDir }
     if mode then table.insert(argv, "--mode"); table.insert(argv, mode) end
-    local timeout = (command == "start" or command == "resume") and 120000 or (command == "stop" and 20000 or 15000)
+    local timeout = (command == "start" or command == "resume") and 120000 or (command == "stop" and 20000 or STATUS_TIMEOUT_MS)
     local request = { token = token, deadline = tern.now() + timeout + HELPER_GRACE_MS }
     local function consume(result, fresh, timedOut)
         if request.done then return end
@@ -272,13 +273,21 @@ end
 -- One live status request per generation, shared by polling, traffic and commands.
 -- Saved status.json is never read into the live cache or used as a Host gate.
 local function queryStatus(token, cx, callback, subscriber)
-    if statusInFlight and statusInFlight.token == token then
-        if subscriber and statusInFlight.subscribers[subscriber] then return end
-        if subscriber then statusInFlight.subscribers[subscriber] = true end
-        table.insert(statusInFlight.callbacks, callback)
+    local previous = statusInFlight and statusInFlight.token == token and statusInFlight or nil
+    if previous and tern.now() < previous.deadline then
+        if subscriber and previous.subscribers[subscriber] then return end
+        if subscriber then previous.subscribers[subscriber] = true end
+        table.insert(previous.callbacks, callback)
         return
     end
-    local request = { token = token, callbacks = { callback }, subscribers = {} }
+    -- The helper receipt can be consumed before the host aborts its continuation.
+    -- This independent lease must expire even when that continuation never returns.
+    -- Preserve subscribers, but replace request identity so late results lose authority.
+    local request = { token = token, deadline = tern.now() + STATUS_TIMEOUT_MS + HELPER_GRACE_MS,
+        callbacks = previous and previous.callbacks or {}, subscribers = previous and previous.subscribers or {} }
+    if not subscriber or not request.subscribers[subscriber] then
+        table.insert(request.callbacks, callback)
+    end
     if subscriber then request.subscribers[subscriber] = true end
     statusInFlight = request
     helper("status", nil, token, cx, function(value, err, _fresh)
@@ -468,7 +477,7 @@ schedule = function()
                 inspectNative(current)
                 refresh()
                 schedule()
-            end)
+            end, "poll")
         end)
     end)
 end
