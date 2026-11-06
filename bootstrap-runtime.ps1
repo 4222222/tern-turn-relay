@@ -153,7 +153,7 @@ public static class RelayBootstrapNative {
     if ($info.Length -lt 1 -or $info.Length -gt 65536) { throw 'manifest-size' }
     $manifestBytes = [IO.File]::ReadAllBytes($manifest)
     $release = [Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json
-    $version = '0.5.7'
+    $version = '0.5.8'
     $asset = 'tern-turn-relay-windows-x86_64.exe'
     if ($release.schema -isnot [int] -or $release.schema -ne 1 -or $release.version -isnot [string] -or $release.version -cne $version) { throw 'manifest-version' }
     $entry = $release.assets.$asset
