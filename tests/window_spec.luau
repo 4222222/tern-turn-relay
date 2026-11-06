@@ -36,6 +36,10 @@ local function fixture(os, configured, installed)
             end,
         },
         json = { encode = function(value) return value end, decode = function(raw)
+            if f.abortDecode then
+                f.abortDecode = false
+                coroutine.yield('host-budget-abort')
+            end
             if raw == 'config' then return f.config end
             if raw == 'stale-status' then return f:value('ready') end
             return f.response
@@ -61,7 +65,15 @@ local function fixture(os, configured, installed)
         for _, timer in ipairs(self.timers) do
             if timer.active and timer.due <= self.time then
                 timer.active = false
-                timer.callback(self:context())
+                if self.abortTimerHook then
+                    self.abortTimerHook = false
+                    local thread = coroutine.create(timer.callback)
+                    local ok, reason = coroutine.resume(thread, self:context())
+                    assert(ok and reason == 'host-budget-abort' and coroutine.status(thread) == 'suspended')
+                    coroutine.close(thread)
+                else
+                    timer.callback(self:context())
+                end
                 return true
             end
         end
@@ -292,6 +304,25 @@ function cases.stop_generation_discards_previous_status()
     f.response = f:value('ready'); late({ stdout = '{}', status = 0 }, {})
     f:flush()
     assert(f.status()[1].text:find('已停止') and f.mutations == 0)
+end
+
+function cases.aborted_status_delivery_expires_without_reload_or_user_command()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377',
+        state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+    local recovering = f:value('ready')
+    recovering.gateway_recovering = true
+    f:complete(recovering)
+    assert(f.status()[1].text:find('恢复中'))
+    f.time = 3000; f:flush()
+    f.abortDecode = true
+    f.abortTimerHook = true
+    f:complete(f:value('ready'))
+    for _ = 1, 8 do f.time += 3000; f:flush() end
+    assert(#f.calls >= 3, '宿主中断结果交付后必须自动过期悬挂查询，不能永远冻结恢复状态')
+    f:complete(f:value('ready'))
+    assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+    assert(f.mutations == 0, '恢复观察不能修改 Host 或重启后台')
 end
 
 return { run = function()
