@@ -1,6 +1,5 @@
-
 Target: aarch64-apple-darwin
-Third-party notices for Tern TURN Relay 0.5.7
+Third-party notices for Tern TURN Relay 0.5.8
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
@@ -26624,7 +26623,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 Target: x86_64-apple-darwin
-Third-party notices for Tern TURN Relay 0.5.7
+Third-party notices for Tern TURN Relay 0.5.8
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
@@ -53485,7 +53484,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 Target: aarch64-unknown-linux-musl
-Third-party notices for Tern TURN Relay 0.5.7
+Third-party notices for Tern TURN Relay 0.5.8
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
@@ -80109,7 +80108,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 Target: x86_64-unknown-linux-musl
-Third-party notices for Tern TURN Relay 0.5.7
+Third-party notices for Tern TURN Relay 0.5.8
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
@@ -106970,7 +106969,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 Target: x86_64-pc-windows-msvc
-Third-party notices for Tern TURN Relay 0.5.7
+Third-party notices for Tern TURN Relay 0.5.8
 Dependency licenses remain owned by their respective authors.
 Project source: https://github.com/jiwangyihao/tern-turn-relay
 
