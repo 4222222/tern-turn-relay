@@ -570,6 +570,22 @@ pub(crate) mod linux {
             "socket_device",
             "socket_inode",
         ];
+        if saved.get("version").is_some() {
+            let socket = current["daemon_socket"].as_str()
+                .ok_or_else(|| failure("identity_mismatch"))?;
+            validate_rebind_record(saved, socket)?;
+            validate_rebind_record(current, socket)?;
+            if stable.iter().any(|field| saved[*field] != current[*field])
+                || saved["executable_path"] != current["executable_path"]
+            {
+                return Err(failure("identity_mismatch"));
+            }
+            // An in-place exec keeps the authenticated process and socket alive.
+            // Reversing the existing strict removal check permits only one new
+            // canonical --handoff pair; all other arguments must remain exact.
+            compatible_rebind_argv(current, saved)?;
+            return Ok(true);
+        }
         let expected: BTreeSet<_> = stable
             .iter()
             .copied()
