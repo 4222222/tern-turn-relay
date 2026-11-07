@@ -1860,6 +1860,38 @@ pub(crate) mod linux {
         }
 
         #[test]
+        fn same_process_handoff_upgrade_preserves_binding_boundaries() {
+            let saved = current();
+            let mut upgraded = saved.clone();
+            upgraded["daemon_argv"] = json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock",
+                "--handoff", "/home/test/.local/state/tern/daemon.state.handoff"]);
+            assert!(migration_required(&saved, &upgraded).unwrap());
+            assert!(!migration_required(&upgraded, &upgraded).unwrap());
+            for (field, value) in [
+                ("pid", json!(43)), ("start_time", json!("1001")),
+                ("boot_id", json!("00000000-0000-4000-8000-000000000002")),
+                ("socket_device", json!(3)), ("socket_inode", json!(4)),
+                ("daemon_socket", json!("/run/user/1000/other.sock")),
+                ("executable_path", json!("/other/tern")), ("unexpected", json!(true)),
+            ] {
+                let mut changed = upgraded.clone();
+                changed[field] = value;
+                assert!(migration_required(&saved, &changed).is_err(), "{field}");
+            }
+            for args in [
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "relative"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "/home/test/../state"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--unsafe", "--handoff", "/home/test/state"]),
+                json!(["tern", "daemon", "--socket", "/run/user/1000/daemon.sock", "--handoff", "/home/test/state", "--handoff", "/home/test/state"]),
+            ] {
+                let mut changed = upgraded.clone();
+                changed["daemon_argv"] = args;
+                assert!(migration_required(&saved, &changed).is_err());
+            }
+        }
+
+        #[test]
         fn stable_binding_survives_inode_upgrade_but_not_workspace_change() {
             assert!(migration_required(&legacy(), &current()).unwrap());
             assert!(!migration_required(&current(), &current()).unwrap());
