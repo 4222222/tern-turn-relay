@@ -4,7 +4,7 @@
 
 ## 入口与秘密边界
 
-新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.9/tern-turn-relay`；Windows 为 `native-runtime/0.5.9/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
+新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.10/tern-turn-relay`；Windows 为 `native-runtime/0.5.10/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
 
 只在用户明确准备运行环境时，从已安装插件执行：
 
