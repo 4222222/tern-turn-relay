@@ -2,5 +2,5 @@ schema = 1
 id = "tern-turn-relay"
 name = "Tern TURN Relay"
 version = "0.5.10"
-description = "Windows/macOS 原生 Rust TURN TLS/UDP 入口，保留已核验 Tern 身份与原 session daemon"
+description = "Windows/macOS/Linux 原生 Rust TURN TLS/UDP 入口，保留已核验 Tern 身份与原 session daemon"
 window = "window.luau"

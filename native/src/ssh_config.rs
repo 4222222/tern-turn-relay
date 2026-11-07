@@ -190,7 +190,7 @@ fn config_stamp(file: &std::fs::File) -> Result<SourceStamp> {
     {
         use std::os::unix::fs::MetadataExt;
         let m = file.metadata().map_err(|_| trust_error())?;
-        if !m.is_file() || m.nlink() != 1 || m.len() > 65536 || m.mode() & 0o022 != 0
+        if !m.is_file() || m.nlink() != 1 || m.len() > 65536 || common::foreign_writable(m.mode(), m.gid())
             || (m.uid() != 0 && m.uid() != unsafe { libc::getuid() }) { return Err(trust_error()); }
         Ok((m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.uid(), m.gid(), m.mode()))
     }
@@ -213,7 +213,7 @@ fn config_source(path: &Path) -> Result<ConfigSource> {
         for parent in canonical.ancestors().skip(1) {
             let m = std::fs::symlink_metadata(parent).map_err(|_| trust_error())?;
             if !m.is_dir() || (m.uid() != 0 && m.uid() != unsafe { libc::getuid() })
-                || (m.mode() & 0o022 != 0 && !(m.uid() == 0 && m.mode() & 0o1000 != 0)) {
+                || (common::foreign_writable(m.mode(), m.gid()) && !(m.uid() == 0 && m.mode() & 0o1000 != 0)) {
                 return Err(trust_error());
             }
         }

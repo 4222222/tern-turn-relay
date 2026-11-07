@@ -333,7 +333,7 @@ function M.new(api, host)
     end
     function self.open(cx)
         if self.active then cx:toast("info", "TURN 设置已打开", "请完成当前选择或按 Esc 取消。"); return end
-        if not platform.supported then cx:toast("error", "当前向导支持 macOS 与 Windows 10/11 x64"); return end
+        if not platform.supported then cx:toast("error", "当前向导支持 macOS、Linux x86_64/arm64 与 Windows 10/11 x64"); return end
         if not api.available() then cx:toast("info", "连接操作仍在进行", "请等待结果后再打开设置。"); return end
         self.active = true
         epoch += 1

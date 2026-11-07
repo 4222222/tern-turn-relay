@@ -295,7 +295,7 @@ pub async fn issue(path: &Path, ttl: u64) -> Result<Value> {
     issue_key(&load(path)?, ttl).await
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const DIALOG: &str = r#"try
     set keyID to text returned of (display dialog "Cloudflare TURN key ID" default answer "" with hidden answer buttons {"Cancel", "Continue"} default button "Continue" cancel button "Cancel" with title "Tern TURN setup")
     set apiToken to text returned of (display dialog "Cloudflare TURN-key API token (not an account token). Continue validates it with Cloudflare and saves it privately on this Mac." default answer "" with hidden answer buttons {"Cancel", "Validate and Save"} default button "Validate and Save" cancel button "Cancel" with title "Tern TURN setup")
@@ -305,6 +305,7 @@ on error number -128
     return "__CANCELLED__"
 end try"#;
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn parse_native(raw: &[u8]) -> Result<Value> {
     if raw.len() > 16384 {
         return Err(invalid());
@@ -401,30 +402,85 @@ async fn native_key() -> Result<Value> {
     parse_native(&crate::windows_credentials::native_input().await?)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 async fn native_key() -> Result<Value> {
-    if cfg!(target_os = "macos") {
-        let output = common::run(
-            "/usr/bin/osascript",
-            &["-e".into(), DIALOG.into()],
-            None,
-            Duration::from_secs(300),
-        )
-        .await
-        .map_err(|_| {
-            Error::with_exit(
-                "credential-error",
-                "Native hidden credential input failed or timed out.",
-                4,
-            )
-        })?;
-        if !output.status.success() {
-            return Err(invalid());
-        }
-        parse_native(&output.stdout)
-    } else {
-        terminal_key()
+    let output = common::run(
+        "/usr/bin/osascript",
+        &["-e".into(), DIALOG.into()],
+        None,
+        Duration::from_secs(300),
+    )
+    .await
+    .map_err(|_| native_failed())?;
+    if !output.status.success() {
+        return Err(invalid());
     }
+    parse_native(&output.stdout)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn native_failed() -> Error {
+    Error::with_exit(
+        "credential-error",
+        "Native hidden credential input failed or timed out.",
+        4,
+    )
+}
+/// Desktop hidden-entry dialogs at fixed system paths; PATH is never searched.
+#[cfg(target_os = "linux")]
+const LINUX_DIALOGS: &[&str] = &["/usr/bin/zenity", "/usr/bin/kdialog"];
+#[cfg(target_os = "linux")]
+async fn hidden_dialog(program: &str, prompt: &str, limit: usize) -> Result<String> {
+    let args: Vec<String> = if program.ends_with("/zenity") {
+        ["--entry", "--hide-text", "--title", "Tern TURN setup", "--text", prompt]
+            .map(str::to_owned)
+            .to_vec()
+    } else {
+        ["--title", "Tern TURN setup", "--password", prompt].map(str::to_owned).to_vec()
+    };
+    let output = common::run(program, &args, None, Duration::from_secs(150))
+        .await
+        .map_err(|_| native_failed())?;
+    // Both dialogs exit 1 when the user cancels or closes the window.
+    if output.status.code() == Some(1) {
+        return Err(cancelled());
+    }
+    if !output.status.success() {
+        return Err(native_failed());
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| invalid())?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.len() > limit || text.contains('\n') {
+        return Err(invalid());
+    }
+    Ok(text.to_owned())
+}
+#[cfg(target_os = "linux")]
+async fn native_key() -> Result<Value> {
+    let graphical = ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    let dialog = LINUX_DIALOGS.iter().copied().find(|path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    });
+    let Some(program) = dialog.filter(|_| graphical) else {
+        return terminal_key().map_err(|_| Error::with_exit(
+            "credential-error",
+            "Hidden credential input needs a desktop session with zenity or kdialog in /usr/bin, or a terminal.",
+            4,
+        ));
+    };
+    let id = hidden_dialog(program, "Cloudflare TURN key ID", 128).await?;
+    let token = hidden_dialog(
+        program,
+        "Cloudflare TURN-key API token (not an account token). Continuing validates it with Cloudflare and saves it privately on this computer.",
+        8192,
+    )
+    .await?;
+    validate(json!({"provider":"cloudflare","turn_key_id":id,"api_token":token}))
+}
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+async fn native_key() -> Result<Value> {
+    terminal_key()
 }
 fn confirm(authorized: bool, prompt: &[u8]) -> Result<()> {
     if std::io::stdin().is_terminal() {

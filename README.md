@@ -1,6 +1,6 @@
 # Tern TURN Relay
 
-为 Windows / macOS Tern 提供 **Rust 原生 Cloudflare TURN 专用连接入口**。复用 Linux 服务器已有的 session daemon，不修改 Tern 二进制、原服务、系统路由或远端工作区；连接失败不自动退回直连。采用 [MPL-2.0](LICENSE)，依赖许可见 [第三方声明](THIRD_PARTY_NOTICES.txt)。不是 Tern 或 Cloudflare 官方产品。
+为 Windows / macOS / Linux Tern 提供 **Rust 原生 Cloudflare TURN 专用连接入口**。复用 Linux 服务器已有的 session daemon，不修改 Tern 二进制、原服务、系统路由或远端工作区；连接失败不自动退回直连。采用 [MPL-2.0](LICENSE)，依赖许可见 [第三方声明](THIRD_PARTY_NOTICES.txt)。不是 Tern 或 Cloudflare 官方产品。
 
 ## 支持范围
 
@@ -8,9 +8,12 @@
 |---|---|---|
 | 本机客户端 | Windows 10/11 x64，Tern 0.9.8 | `tern-turn-relay-windows-x86_64.exe` |
 | 本机客户端 | macOS Apple Silicon / Intel，Tern 0.9.8 | `tern-turn-relay-darwin-arm64` / `tern-turn-relay-darwin-x86_64` |
+| 本机客户端 | Linux x86_64 / arm64 桌面，Tern 0.9.12 | `tern-turn-relay-linux-x86_64` / `tern-turn-relay-linux-arm64` |
 | 远端 helper | Linux arm64 / x86_64，已有 Tern 用户服务与 session daemon | `tern-turn-relay-linux-arm64` / `tern-turn-relay-linux-x86_64` |
 
-- 不声明支持 Windows ARM64、x86 或 ARM64 上的 x64 仿真。Linux 资产用于远端 helper，不代表提供 Linux Tern 窗口设置向导。
+- 不声明支持 Windows ARM64、x86 或 ARM64 上的 x64 仿真。Linux 本机客户端与远端 helper 使用同一份静态 Linux 程序。
+- Linux 本机需要 `/usr/bin` 下的 `stat`、`sha256sum`、`awk`、`curl`、`cmp`、`mktemp` 与 `/usr/bin/ssh`（OpenSSH Client），以及 `/usr/bin/zenity` 或 `/usr/bin/kdialog` 提供桌面隐藏输入；没有桌面对话框时只能在终端中输入。Tern 的路径来自 XDG：配置在 `$XDG_CONFIG_HOME/tern`（默认 `~/.config/tern`），默认 profile 的插件数据在 `$XDG_STATE_HOME/tern/plugin-data`（默认 `~/.local/state/tern/plugin-data`）。
+- Linux 的用户私有组（umask 002）下 Tern 会创建组可写目录。与 Debian OpenSSH 的 `secure_permissions` 规则一致，仅当该组是当前用户的主组、`/etc/passwd` 中以它为主组的账户只有当前用户、`/etc/group` 中没有其他成员时才视为安全；其他组可写或任何人可写仍拒绝。帐户来自 LDAP 等非文件数据库时按严格规则处理，需执行 `chmod go-w` 移除相关目录的组写权限。
 - Windows 需要系统自带的 Windows PowerShell 5.1 和 **原生 OpenSSH Client**（Windows 可选功能）；不需要 WSL、Git Bash、Python、Cargo 或本机编译。PowerShell 仅短暂校验/准备运行时，持续转发由 Rust 完成。构建工具中的 Python 仅用于维护者打包和 CI。
 - Windows 私有数据和受管理文件必须位于启用文件事务（TxF）的本地 NTFS 卷；ReFS、FAT、网络卷、EFS 加密文件或 TxF 不可用时拒绝写入。微软已弃用 TxF，未来系统可能移除；升级系统前需重新确认兼容性，不能把该依赖视为长期平台保证。
 - 需要已核验 SSH 主机密钥的 OpenSSH 别名，可非交互公钥登录；HostName 为公网 IPv4。先使用系统 OpenSSH 成功登录并核验主机指纹。ProxyJump、ProxyCommand、IPv6 和域名目标不在支持范围内。
@@ -102,6 +105,7 @@ TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体�
 | 系统 | 路径 |
 |---|---|
 | macOS | `~/Library/Application Support/Tern/plugin-data/tern-turn-relay/` |
+| Linux | 默认数据目录为 `~/.local/state/tern/plugin-data/tern-turn-relay/`（遵循 `XDG_STATE_HOME`）；插件代码位于 `~/.config/tern/plugins/tern-turn-relay/`。`TERN_CONFIG_DIR` 自定义 profile 的数据位于该 profile 的 `plugin-data/` |
 | Windows | 默认数据目录为 `%LOCALAPPDATA%\Tern\plugin-data\tern-turn-relay\`；插件代码位于 `%APPDATA%\Tern\plugins\tern-turn-relay\`，两者不是同一个目录。自定义 profile 以 Tern 实际传入并经核验的路径为准 |
 
 - `credentials/cloudflare.json`：Unix 使用目录 0700、文件 0600 的私有明文文件；Windows 保存用户级 DPAPI 密文，同时保留私有文件 DACL。Windows 密文不能直接复制给另一用户使用；旧明文文件不会静默加载，需在 Settings 显式重新配置，取消时保留原文件。输入文件仍须满足私有文件要求。

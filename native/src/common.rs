@@ -155,13 +155,77 @@ pub fn fingerprint(value: &str) -> Result<()> {
 fn cname(value: &OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|_| path_error())
 }
+/// True when anyone besides the owner can modify the object through its mode.
+/// On Linux, group write is harmless when the group is the current user's
+/// private group: its only member is that user. This is Debian OpenSSH's
+/// `secure_permissions` rule and matches the umask 002 that user-private-group
+/// distributions apply by default. Other systems keep the strict 022 rule.
+#[cfg(unix)]
+pub fn foreign_writable(mode: u32, gid: u32) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group(gid))
+}
+#[cfg(target_os = "linux")]
+static PRIVATE_GROUP: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+    let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
+    let read = |path: &str| -> Option<String> {
+        let mut text = String::new();
+        File::open(path).ok()?.take(4 << 20).read_to_string(&mut text).ok()?;
+        Some(text)
+    };
+    let passwd = read("/etc/passwd")?;
+    let group = read("/etc/group")?;
+    user_private_group(&passwd, &group, uid, primary).then_some(primary)
+});
+#[cfg(target_os = "linux")]
+fn private_group(gid: u32) -> bool {
+    *PRIVATE_GROUP == Some(gid)
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn private_group(_gid: u32) -> bool {
+    false
+}
+/// The account files' view of a user private group: every passwd entry whose
+/// primary group is `gid` is `uid`, at least one exists, the group is defined
+/// once, and its supplementary members are empty or exactly that user.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_private_group(passwd: &str, group: &str, uid: u32, gid: u32) -> bool {
+    let mut name = None;
+    for line in passwd.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let fields: Vec<&str> = line.split(':').collect();
+        let (Some(entry_uid), Some(entry_gid)) = (fields.get(2).and_then(|v| v.parse::<u32>().ok()), fields.get(3).and_then(|v| v.parse::<u32>().ok())) else {
+            return false;
+        };
+        if entry_gid == gid {
+            if entry_uid != uid || name.is_some_and(|known| known != fields[0]) {
+                return false;
+            }
+            name = Some(fields[0]);
+        }
+    }
+    let Some(name) = name else { return false };
+    let mut defined = false;
+    for line in group.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() != 4 {
+            return false;
+        }
+        if fields[2].parse::<u32>().ok() != Some(gid) {
+            continue;
+        }
+        if defined || !(fields[3].is_empty() || fields[3] == name) {
+            return false;
+        }
+        defined = true;
+    }
+    defined
+}
 #[cfg(unix)]
 fn check_directory(file: &File, leaf_private: bool) -> Result<()> {
     let info = file.metadata().map_err(|_| path_error())?;
     let uid = unsafe { libc::geteuid() };
     if !info.is_dir()
         || (info.uid() != 0 && info.uid() != uid)
-        || (info.mode() & 0o022 != 0
+        || (foreign_writable(info.mode(), info.gid())
             && !(info.uid() == 0 && info.mode() & (libc::S_ISVTX as u32) != 0))
         || (leaf_private && (info.uid() != uid || info.mode() & 0o777 != 0o700))
     {
@@ -238,7 +302,7 @@ fn check_file(file: &File, private: bool, limit: u64) -> Result<()> {
     if !info.is_file()
         || info.uid() != unsafe { libc::geteuid() }
         || info.nlink() != 1
-        || info.mode() & 0o022 != 0
+        || foreign_writable(info.mode(), info.gid())
         || (private && info.mode() & 0o777 != 0o600)
         || info.len() > limit
     {
@@ -861,6 +925,26 @@ mod tests {
     #[test]
     fn shell_quotes_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+    #[test]
+    fn group_write_is_trusted_only_for_a_sole_member_private_group() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n";
+        let group = "root:x:0:\nalice:x:1000:\nbob:x:1001:\nstaff:x:50:alice,bob\nsolo:x:60:alice\n";
+        assert!(user_private_group(passwd, group, 1000, 1000));
+        // Another account's private group, or a shared group, still lets others write.
+        assert!(!user_private_group(passwd, group, 1000, 1001));
+        assert!(!user_private_group(passwd, group, 1000, 50));
+        // No account has it as its primary group (typical setgid groups).
+        assert!(!user_private_group(passwd, group, 1000, 60));
+        // A second account sharing the primary group, or a listed second member.
+        let shared = format!("{passwd}carol:x:1002:1000::/home/carol:/bin/sh\n");
+        assert!(!user_private_group(&shared, group, 1000, 1000));
+        assert!(!user_private_group(passwd, "alice:x:1000:carol\n", 1000, 1000));
+        assert!(user_private_group(passwd, "alice:x:1000:alice\n", 1000, 1000));
+        // Duplicate or malformed group definitions fail closed.
+        assert!(!user_private_group(passwd, "alice:x:1000:\nalias:x:1000:\n", 1000, 1000));
+        assert!(!user_private_group(passwd, "alice:x:1000\n", 1000, 1000));
+        assert!(!user_private_group(passwd, "", 1000, 1000));
     }
     #[test]
     fn duplicate_security_decisions_are_rejected() {

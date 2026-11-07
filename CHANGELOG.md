@@ -1,5 +1,13 @@
 # 更新记录
 
+## 未发布
+
+- 新增 Linux x86_64 / arm64 本机客户端：复用静态 Linux 发行程序，Settings 向导、凭据配置、连接、Stop 与 Status 与 macOS 共用同一 `/bin/sh` 准备器和 Rust 后端。
+- Linux 准备器使用 GNU `stat`、`sha256sum` 与只接受发行工具固定 JSON 格式的 `awk` 解析，保留所有权、链接数、大小、SHA-256 和原子发布校验。
+- 按 XDG 定位 Linux Tern profile（`$XDG_CONFIG_HOME/tern`）与默认插件数据（`$XDG_STATE_HOME/tern/plugin-data`）；Tern CLI 取自启动插件动作的 Tern 进程，不搜索 PATH，并沿用 Tern 自己的 daemon socket。
+- Linux 使用 `/usr/bin/zenity` 或 `/usr/bin/kdialog` 隐藏输入 Cloudflare Key；取消不覆盖原凭据，无桌面时退回终端隐藏输入。
+- Linux 用户私有组（umask 002）下的组写权限按 Debian OpenSSH `secure_permissions` 规则判断：仅当前用户独占的主组可写视为安全，其他组可写与任何人可写继续拒绝；macOS 与 Windows 规则不变。
+
 ## 0.5.10
 
 - 修复 Tern 就地升级新增 `--handoff` 参数后，同一 daemon 被误判为身份变化而无法启动网关的问题。

@@ -18,7 +18,7 @@ end
 
 function M.new(runtime, plugin, getenv)
     local windows = runtime.os == "windows"
-    local supported = runtime.os == "macos" or windows
+    local supported = runtime.os == "macos" or runtime.os == "linux" or windows
     local systemRoot = windows and getenv and windowsPath(getenv("SystemRoot"), false) or nil
     if windows and not systemRoot then supported = false end
     local data, package = plugin.data, plugin.dir

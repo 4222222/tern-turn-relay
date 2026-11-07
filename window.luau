@@ -163,7 +163,7 @@ end
 
 local function supported(cx)
     if not platform.supported then
-        report(cx, "当前客户端支持 macOS 与 Windows 10/11 x64；请从 Settings 显式准备私有运行时。")
+        report(cx, "当前客户端支持 macOS、Linux x86_64/arm64 与 Windows 10/11 x64；请从 Settings 显式准备私有运行时。")
         return false
     end
     return true

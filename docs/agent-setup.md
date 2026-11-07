@@ -4,7 +4,9 @@
 
 ## 入口与秘密边界
 
-新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.10/tern-turn-relay`；Windows 为 `native-runtime/0.5.10/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 远端资产用于 Windows 本机。
+新版唯一运行入口是经固定 SHA-256 校验的 Rust 原生程序，没有 Python 兼容脚本。默认程序位于插件数据目录 `native-runtime/0.5.10/tern-turn-relay`；Windows 为 `native-runtime/0.5.10/tern-turn-relay.exe`。不要执行 PATH 中的同名 helper，也不要将 Linux 资产用于 Windows 本机。Linux 本机与远端 helper 使用同一份静态 Linux 资产。
+
+Linux 本机：默认 profile 为 `$XDG_CONFIG_HOME/tern`（默认 `~/.config/tern`），插件数据为 `$XDG_STATE_HOME/tern/plugin-data/tern-turn-relay`（默认 `~/.local/state/tern/plugin-data/tern-turn-relay`）；`TERN_CONFIG_DIR` profile 的数据位于该 profile 的 `plugin-data/`。需要调用 Tern CLI 的步骤（apply、update、uninstall）从 `/proc` 读取启动本程序的 Tern 进程路径，不搜索 PATH；不是由 Tern 插件启动时（例如在 shell 中运行自动化），必须显式传 `--tern` 绝对路径，否则失败关闭。
 
 只在用户明确准备运行环境时，从已安装插件执行：
 

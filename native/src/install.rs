@@ -78,7 +78,7 @@ fn directory_permissions_trusted(
         }
         _ => false,
     };
-    (owner == uid || owner == 0) && (mode & 0o022 == 0 || sticky || platform_admin)
+    (owner == uid || owner == 0) && (!common::foreign_writable(mode, group) || sticky || platform_admin)
 }
 #[cfg(unix)]
 fn trusted_directory_with_policy(file: &File, leaf: bool, policy: AncestorPolicy) -> Result<()> {
@@ -197,7 +197,7 @@ pub(crate) fn owned_path(path: &Path, directory: bool) -> Result<()> {
         let m = file.metadata().map_err(|_| io_error())?;
         if !m.is_file()
             || m.uid() != unsafe { libc::getuid() }
-            || m.mode() & 0o022 != 0
+            || common::foreign_writable(m.mode(), m.gid())
             || m.nlink() != 1
         {
             return Err(io_error());
@@ -244,7 +244,7 @@ fn snapshot_at(directory: &File, name: &CString, limit: usize) -> Result<Option<
     if !m.is_file()
         || m.uid() != unsafe { libc::getuid() }
         || m.nlink() != 1
-        || m.mode() & 0o022 != 0
+        || common::foreign_writable(m.mode(), m.gid())
         || m.len() > limit as u64
     {
         return Err(io_error());
@@ -522,16 +522,32 @@ impl Paths {
             "config_file":self.config(),"credential_file":self.credential(),"ssh_config":self.ssh,"ssh_alias_config":self.aliases})
     }
 }
+/// XDG base directory: the variable when it is an absolute path (the spec
+/// ignores relative values), else the home-relative fallback.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xdg_dir(variable: &str, fallback: &str) -> Result<PathBuf> {
+    match std::env::var(variable) {
+        Ok(value) if value.starts_with('/') => {
+            common::safe_absolute(&value)?;
+            Ok(PathBuf::from(value))
+        }
+        _ => Ok(home()?.join(fallback)),
+    }
+}
 pub(crate) fn context(opts: &Options) -> Result<Paths> {
     #[cfg(target_os = "macos")]
     let default = home()?.join("Library/Application Support/Tern");
     #[cfg(all(unix, not(target_os = "macos")))]
-    let default = home()?.join(".config/tern");
+    let default = xdg_dir("XDG_CONFIG_HOME", ".config")?.join("tern");
     #[cfg(windows)]
     let default = crate::windows_security::profile()?;
     #[cfg(windows)]
     let default_data = crate::windows_security::state_dir()?.join("plugin-data").join(PLUGIN);
-    #[cfg(unix)]
+    // Tern on Linux keeps the default profile's state under the XDG state
+    // directory; a TERN_CONFIG_DIR profile keeps it inside the profile.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let default_data = xdg_dir("XDG_STATE_HOME", ".local/state")?.join("tern/plugin-data").join(PLUGIN);
+    #[cfg(target_os = "macos")]
     let default_data = default.join("plugin-data").join(PLUGIN);
     let package_arg = opts.get("--package-dir").map(PathBuf::from);
     let supplied_data = opts.get("--data-dir").map(PathBuf::from);
@@ -696,12 +712,31 @@ pub(crate) fn runtime_ready() -> bool {
         .unwrap_or(false)
 }
 
+/// The Tern build the plugin runs under. Bootstrap `exec`s this program, so its
+/// parent is the Tern process that ran the plugin action. PATH is never searched;
+/// a replaced build (`tern (deleted)`) or a non-Tern parent fails closed.
+#[cfg(target_os = "linux")]
+fn default_tern() -> Result<PathBuf> {
+    let parent = unsafe { libc::getppid() };
+    let path = std::fs::read_link(format!("/proc/{parent}/exe")).map_err(|_| io_error())?;
+    if path.file_name().and_then(|name| name.to_str()) != Some("tern") {
+        return Err(Error::new(
+            "tern-unavailable",
+            "Cannot identify the running Tern executable; pass --tern with its absolute path.",
+        ));
+    }
+    Ok(path)
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn default_tern() -> Result<PathBuf> {
+    Ok(PathBuf::from("/Applications/Tern.app/Contents/MacOS/tern"))
+}
 #[cfg(unix)]
 async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
-    let binary = paths
-        .tern
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/Applications/Tern.app/Contents/MacOS/tern"));
+    let binary = match &paths.tern {
+        Some(path) => path.clone(),
+        None => default_tern()?,
+    };
     let policy = AncestorPolicy::Executable { admin_gid: executable_admin_gid()? };
     let directory = parent_with_policy(&binary, false, policy)?.ok_or_else(io_error)?;
     let name = cstring(binary.file_name().ok_or_else(io_error)?)?;
@@ -719,11 +754,12 @@ async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
     let metadata = executable.metadata().map_err(|_| io_error())?;
     if !metadata.is_file()
         || ![0, unsafe { libc::getuid() }].contains(&metadata.uid())
-        || metadata.mode() & 0o022 != 0
+        || common::foreign_writable(metadata.mode(), metadata.gid())
         || metadata.mode() & 0o111 == 0
     {
         return Err(io_error());
     }
+    #[cfg(target_os = "macos")]
     let mut command = vec![
         format!(
             "TERN_CONFIG_DIR={}",
@@ -739,6 +775,20 @@ async fn tern(paths: &Paths, args: &[&str]) -> Result<std::process::Output> {
         ),
         binary.to_str().ok_or_else(io_error)?.to_owned(),
     ];
+    // Linux Tern resolves its daemon socket under XDG_RUNTIME_DIR for every
+    // profile, so the inherited socket is kept. Only a custom profile is named;
+    // the default profile is Tern's own XDG resolution.
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let profile = paths.profile.to_str().ok_or_else(io_error)?;
+        let mut command = if paths.profile == xdg_dir("XDG_CONFIG_HOME", ".config")?.join("tern") {
+            vec!["-u".to_owned(), "TERN_CONFIG_DIR".to_owned()]
+        } else {
+            vec![format!("TERN_CONFIG_DIR={profile}")]
+        };
+        command.push(binary.to_str().ok_or_else(io_error)?.to_owned());
+        command
+    };
     command.extend(args.iter().map(|s| (*s).to_owned()));
     common::run("/usr/bin/env", &command, None, Duration::from_secs(180)).await
 }
