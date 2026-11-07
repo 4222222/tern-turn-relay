@@ -30,7 +30,7 @@ try {
     [void][IO.Directory]::CreateDirectory($package); Secure $package $true
     Copy-Item -LiteralPath (Join-Path $source 'bootstrap-runtime.ps1') -Destination $package
     Secure (Join-Path $package 'bootstrap-runtime.ps1') $false
-    $version = '0.5.8'
+    $version = '0.5.9'
     $asset = 'tern-turn-relay-windows-x86_64.exe'
     $entry = @{ size = (Get-Item -LiteralPath $binaryPath).Length; sha256 = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant() }
     $manifest = @{ schema = 1; version = $version; assets = @{ $asset = $entry } } | ConvertTo-Json -Depth 5

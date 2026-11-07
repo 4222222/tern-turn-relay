@@ -463,9 +463,17 @@ pub(crate) mod linux {
         pub(crate) fn capture(
             &self,
             args: &[String],
-            mut control: Option<&mut Control>,
+            control: Option<&mut Control>,
             maximum: usize,
         ) -> Result<Value> {
+            parse_json(&self.capture_output(args, control, maximum)?)
+        }
+        fn capture_output(
+            &self,
+            args: &[String],
+            mut control: Option<&mut Control>,
+            maximum: usize,
+        ) -> Result<Vec<u8>> {
             self.check(true)?;
             if let Some(c) = control.as_deref_mut() {
                 c.startup()?;
@@ -521,7 +529,7 @@ pub(crate) mod linux {
                         }
                     }
                     self.check(true)?;
-                    return parse_json(&bytes);
+                    return Ok(bytes);
                 }
                 if Instant::now() >= deadline {
                     return Err(failure("connectivity_uncertain"));
@@ -1406,6 +1414,31 @@ pub(crate) mod linux {
         flow.active = Instant::now();
         Ok(())
     }
+    fn frontend_relay_args(version: &[u8]) -> Result<&'static [&'static str]> {
+        let text = std::str::from_utf8(version).map_err(|_| failure("protocol_error"))?;
+        let mut words = text.split_whitespace();
+        if words.next() != Some("tern") {
+            return Err(failure("protocol_error"));
+        }
+        let mut parts = words.next().ok_or_else(|| failure("protocol_error"))?.split('.');
+        let mut numbers = [0u64; 3];
+        for number in &mut numbers {
+            let part = parts.next().ok_or_else(|| failure("protocol_error"))?;
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(failure("protocol_error"));
+            }
+            *number = part.parse().map_err(|_| failure("protocol_error"))?;
+        }
+        if parts.next().is_some() {
+            return Err(failure("protocol_error"));
+        }
+        if numbers >= [0, 9, 12] {
+            Ok(&["--relay", "none"])
+        } else {
+            Ok(&["--no-iroh", "--relay", "none", "--pkarr", "none"])
+        }
+    }
+
     pub(crate) fn serve(directory: &str) -> Result<()> {
         initialize()?;
         nonblocking(libc::STDOUT_FILENO)?;
@@ -1436,6 +1469,10 @@ pub(crate) mod linux {
         let prepared = prepare(directory, &request, Some(&mut control))?;
         control.startup()?;
         prepared.pin.check(true)?;
+        let version = prepared.pin.capture_output(
+            &["--version".into()], Some(&mut control), 256,
+        )?;
+        let relay_args = frontend_relay_args(&version)?;
         let public = UdpSocket::bind((host, 0)).map_err(|_| failure("connectivity_uncertain"))?;
         public
             .set_nonblocking(true)
@@ -1464,7 +1501,7 @@ pub(crate) mod linux {
             .arg(&prepared.native)
             .arg("--authorized-keys")
             .arg(&prepared.authorized)
-            .args(["--no-iroh", "--relay", "none", "--pkarr", "none"])
+            .args(relay_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1594,6 +1631,19 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn frontend_version_selects_supported_relay_isolation() {
+            assert_eq!(frontend_relay_args(b"tern 0.9.8 (f21d9a3)\n").unwrap(),
+                &["--no-iroh", "--relay", "none", "--pkarr", "none"]);
+            assert_eq!(frontend_relay_args(b"tern 0.9.12 (e498b49)\n").unwrap(),
+                &["--relay", "none"]);
+            assert_eq!(frontend_relay_args(b"tern 0.10.0 (build)\n").unwrap(),
+                &["--relay", "none"]);
+            for version in [b"".as_slice(), b"other 0.9.12", b"tern 0.9", b"tern 0.9.12.1",
+                b"tern 0.9.12-dev", b"tern 0.-9.12", b"tern 0.9.18446744073709551616", b"tern \xff"] {
+                assert!(frontend_relay_args(version).is_err());
+            }
+        }
         fn current() -> Value {
             json!({"version":2,"pid":42,"start_time":"1000","boot_id":"00000000-0000-4000-8000-000000000001","daemon_socket":"/run/user/1000/daemon.sock","socket_device":2,"socket_inode":3,"executable_path":"/home/test/bin/tern","daemon_argv":["tern","daemon","--socket","/run/user/1000/daemon.sock"]})
         }

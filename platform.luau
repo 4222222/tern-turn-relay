@@ -1,5 +1,5 @@
 -- 平台边界不执行进程；所有参数均以 argv 元素传递。
-local M = { version = "0.5.8" }
+local M = { version = "0.5.9" }
 
 local function windowsPath(path, reported)
     if type(path) ~= "string" then return nil end
