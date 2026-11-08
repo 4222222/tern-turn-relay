@@ -1,5 +1,9 @@
 # 更新记录
 
+## 未发布
+
+- 远端为 `tern remote serve --user` 且 session daemon 独立启动时，首次发现不再无路可走：设置向导在没有可自动关联的服务时，可以指定远端 daemon socket 后重新发现；自动化可在 discover 请求中带 `daemon_socket`。远端 helper 仍完整核验 socket 属主、对端凭据、进程启动时间与参数，review 保留该字段，apply 重新发现时使用同一 socket。
+
 ## 0.5.10
 
 - 修复 Tern 就地升级新增 `--handoff` 参数后，同一 daemon 被误判为身份变化而无法启动网关的问题。

@@ -233,7 +233,7 @@ fn configuration(
 async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
     fields(
         request,
-        &["ssh_destination", "candidate_id", "listen_port"],
+        &["ssh_destination", "candidate_id", "listen_port", "daemon_socket"],
         &["ssh_destination"],
     )?;
     let alias = request["ssh_destination"]
@@ -248,6 +248,17 @@ async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
                 .filter(|id| candidate(id))
                 .ok_or_else(request_error)?,
         ),
+    };
+    // An explicitly named remote daemon socket, for a `--user` service whose
+    // independently started daemon cannot be associated by parentage. The remote
+    // helper still pins the socket owner, peer credentials, start time and argv.
+    let requested_socket = match request.get("daemon_socket") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let socket = value.as_str().ok_or_else(request_error)?;
+            common::safe_absolute(socket).map_err(|_| request_error())?;
+            Some(socket)
+        }
     };
     let previous = install::current(paths)?;
     let listen_port = request
@@ -267,9 +278,11 @@ async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
         .and_then(|p| p["gateway"]["state_dir"].as_str())
         .map(|s| vec![format!("{s}/native")])
         .unwrap_or_default();
-    let saved_socket = previous.as_ref()
-        .filter(|old| old["ssh_destination"] == alias)
-        .and_then(|old| old["gateway"]["daemon_socket"].as_str());
+    let saved_socket = requested_socket.or_else(|| {
+        previous.as_ref()
+            .filter(|old| old["ssh_destination"] == alias)
+            .and_then(|old| old["gateway"]["daemon_socket"].as_str())
+    });
     let remote = crate::discovery::discover(alias, selected, &excluded, saved_socket).await?;
     if remote.get("candidates").is_some() {
         return inventory(&remote);
@@ -322,12 +335,17 @@ async fn discover(paths: &Paths, request: &Value) -> Result<Value> {
     if kind == "linked" {
         changes.push(json!("Migrate the owned legacy registration to an allowlisted native plugin copy; retain the old durable package for recovery."));
     }
-    let review = json!({"schema":1,"ssh_destination":alias,"candidate_id":id,"listen_port":listen_port,
+    let mut review = json!({"schema":1,"ssh_destination":alias,"candidate_id":id,"listen_port":listen_port,
         "configuration":config,"original_state_dir":remote_path(&remote,"original_state_dir")?,"paths":public_paths,
         "previous_config_sha256":install::digest(&paths.config())?,"installation_sha256":install::digest(&paths.manifest())?,
         "ssh_config_sha256":install::digest(&paths.ssh)?,"registration":kind,"migrate_native":kind == "linked",
         "package_sha256":install::package_digest(&paths.package)?,
         "registered_package":registered.as_ref().map(|r| &r.source),"changes":changes});
+    // Apply rediscovers from the review; keep the explicit socket so it resolves
+    // the same daemon. Reviews without one keep their original shape.
+    if let Some(socket) = requested_socket {
+        review["daemon_socket"] = json!(socket);
+    }
     Ok(json!({"code":"review","review":review,"candidates":[],
         "summary":format!("{} · {}:{} · existing daemon {}", alias, text(&remote,"host")?, remote["target_port"], remote_path(&remote,"daemon_socket")?)}))
 }
@@ -400,7 +418,7 @@ async fn execute(action: &str, paths: &Paths, request: &Value) -> Result<Value> 
                     6,
                 ));
             }
-            let fresh = discover(paths, &json!({"ssh_destination":review.get("ssh_destination"),"candidate_id":review.get("candidate_id"),"listen_port":review.get("listen_port")})).await?;
+            let fresh = discover(paths, &json!({"ssh_destination":review.get("ssh_destination"),"candidate_id":review.get("candidate_id"),"listen_port":review.get("listen_port"),"daemon_socket":review.get("daemon_socket")})).await?;
             if fresh["code"] != "review" || fresh["review"] != request["review"] {
                 return Err(Error::with_exit(
                     "review-changed",

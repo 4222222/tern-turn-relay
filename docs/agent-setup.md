@@ -48,7 +48,7 @@ Windows 信任现有 Tern 插件环境：不要求收紧宿主或普通数据目
 1. 安装原生插件并显式准备本机运行程序。
 2. 用户通过 Cloudflare 控制台创建自己的 TURN Key。只接受 TURN-key API token，不接受账户管理 Token，不代过 MFA 或服务条款。
 3. 导入并验证凭据；已配置时优先复用。
-4. 调用 `BINARY onboarding discover ...`，stdin `{"ssh_destination":"my-server"}`。必要时带整数 listen_port；返回 choose 时用返回的 candidate_id 再次 discover。
+4. 调用 `BINARY onboarding discover ...`，stdin `{"ssh_destination":"my-server"}`。必要时带整数 listen_port；返回 choose 时用返回的 candidate_id 再次 discover。远端是 `tern remote serve --user` 且 daemon 独立启动（不是服务子进程）时无法按进程关系关联，choose 的候选为空；经用户确认后带 `"daemon_socket":"/run/user/<uid>/tern/daemon.sock"` 这类绝对路径再次 discover。远端 helper 仍核验 socket 属主、SO_PEERCRED、进程启动时间与参数，review 会保留该字段供 apply 重新发现。
 5. discovery 将经过校验的架构匹配 Rust helper 放入远端私有缓存，用它只读核验服务。它不部署/启动另一个 session daemon；不要声称完全不写远端磁盘。
 6. 完整展示 review：目标、工作区、独立网关目录、入口端口、配置与 SSH 文件、旧配置摘要及更改清单。
 7. 获批后调用 apply，stdin `{"review":完整原样对象,"authorize_replace":已获替换授权}`。保留 JSON null；不自行拼改审核对象。后端重新发现并比较，变化时重新审核，不能重复提交旧 review。
