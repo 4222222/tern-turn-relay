@@ -24,7 +24,6 @@ clean=$(printf '%s' "$data" | /usr/bin/tr -d '\000-\037\177')
 uid=$(/usr/bin/id -u)
 # meta PATH prints "uid gid mode links bytes" with an octal mode. Platform
 # tools at fixed paths only, never PATH lookups.
-private_gid=
 case "$(/usr/bin/uname -s)" in
     Darwin)
         platform=darwin
@@ -38,40 +37,86 @@ case "$(/usr/bin/uname -s)" in
         case "$(/usr/bin/uname -m)" in aarch64|arm64) arch=arm64 ;; x86_64) arch=x86_64 ;; *) fail 'Unsupported Linux architecture' ;; esac
         meta() { /usr/bin/stat -c '%u %g %a %h %s' "$1"; }
         sha256() { /usr/bin/sha256sum "$1"; }
-        # The manifest is tools/release.py's two-space json.dumps output; any other
-        # shape, a missing key or a repeated key fails closed.
+        # Parse the complete release.py manifest before exposing any field. Only
+        # its string/integer/object vocabulary is accepted, with exact key sets.
         field() {
-            /usr/bin/awk -v want="$1" '
-                /^[{}]$/ { next }
-                /^ *"[^"\\]*": \{$/ { key = $0; sub(/^ *"/, "", key); sub(/": \{$/, "", key); path[++depth] = key; next }
-                /^ *\},?$/ { if (depth > 0) depth--; next }
-                /^ *"[^"\\]*": ("[^"\\]*"|[0-9]+),?$/ {
-                    key = $0; sub(/^ *"/, "", key); value = key; sub(/".*$/, "", key)
-                    sub(/^[^"]*": /, "", value); sub(/,$/, "", value); gsub(/"/, "", value)
-                    name = ""; for (i = 1; i <= depth; i++) name = name path[i] "."
-                    if (name key == want) { found++; result = value }
-                    next
+            LC_ALL=C /usr/bin/awk -v want="$1" '
+                function reject() { exit 1 }
+                function space() {
+                    while (substr(text, pos, 1) ~ /^[ \t\r\n]$/) pos++
                 }
-                { bad = 1 }
-                END { if (bad || found != 1) exit 1; print result }' "$manifest"
+                function take(token) {
+                    space()
+                    if (substr(text, pos, 1) != token) reject()
+                    pos++
+                }
+                function string(    value) {
+                    space()
+                    # Generated names, versions and hashes never need escapes.
+                    if (!match(substr(text, pos), /^"[A-Za-z0-9_.-]*"/)) reject()
+                    value = substr(text, pos + 1, RLENGTH - 2)
+                    pos += RLENGTH
+                    return value
+                }
+                function integer(    value) {
+                    space()
+                    if (!match(substr(text, pos), /^[0-9]+/)) reject()
+                    value = substr(text, pos, RLENGTH)
+                    pos += RLENGTH
+                    if (length(value) > 8 || (length(value) > 1 && substr(value, 1, 1) == "0")) reject()
+                    return value
+                }
+                function object(path, kind,    key, name, value, count, token) {
+                    take("{")
+                    do {
+                        key = string()
+                        name = path == "" ? key : path "." key
+                        if (seen[name]++) reject()
+                        take(":")
+                        if (kind == "root" && key == "assets") object(name, "assets")
+                        else if (kind == "assets" && (key in assets)) object(name, "entry")
+                        else {
+                            if (kind == "root" && key == "schema") {
+                                value = integer()
+                                if (value != "1") reject()
+                            } else if (kind == "root" && key == "version") {
+                                value = string()
+                                if (value !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) reject()
+                            } else if (kind == "entry" && key == "sha256") {
+                                value = string()
+                                if (length(value) != 64 || value ~ /[^0-9a-f]/) reject()
+                            } else if (kind == "entry" && key == "size") {
+                                value = integer()
+                                if (value + 0 < 1 || value + 0 > 67108864) reject()
+                            } else reject()
+                            if (name == want) { found++; result = value }
+                        }
+                        count++
+                        space()
+                        token = substr(text, pos++, 1)
+                        if (token != "," && token != "}") reject()
+                    } while (token == ",")
+                    if (count != (kind == "root" ? 3 : kind == "assets" ? 5 : 2)) reject()
+                }
+                {
+                    bytes += length($0) + 1
+                    if (bytes > 65536) { bad = 1; exit 1 }
+                    text = text $0 "\n"
+                }
+                END {
+                    if (bad) reject()
+                    assets["tern-turn-relay-darwin-arm64"] = 1
+                    assets["tern-turn-relay-darwin-x86_64"] = 1
+                    assets["tern-turn-relay-linux-arm64"] = 1
+                    assets["tern-turn-relay-linux-x86_64"] = 1
+                    assets["tern-turn-relay-windows-x86_64.exe"] = 1
+                    pos = 1
+                    object("", "root")
+                    space()
+                    if (pos <= length(text) || found != 1) reject()
+                    print result
+                }' "$manifest"
         }
-        # Debian OpenSSH secure_permissions rule, matching the native runtime: group
-        # write is harmless only when every account with this primary group is the
-        # current user and the group lists no other member. User-private-group
-        # systems create Tern directories with umask 002.
-        private_gid=$(/usr/bin/awk -F: -v uid="$uid" -v gid="$(/usr/bin/id -g)" '
-            FNR == NR {
-                if ($0 == "" || $0 ~ /^#/) next
-                if ($3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/) { bad = 1; next }
-                if ($4 == gid) { if ($3 != uid || (name != "" && name != $1)) bad = 1; name = $1 }
-                next
-            }
-            {
-                if ($0 == "" || $0 ~ /^#/) next
-                if (NF != 4) { bad = 1; next }
-                if ($3 ~ /^[0-9]+$/ && $3 == gid) { if (defined || ($4 != "" && $4 != name)) bad = 1; defined = 1 }
-            }
-            END { if (!bad && name != "" && defined) print gid }' /etc/passwd /etc/group) || private_gid=
         ;;
     *) fail 'Native window setup supports macOS and Linux only' ;;
 esac
@@ -85,12 +130,95 @@ read_meta() {
     case "$1$2$3$4$5" in *[!0-9]*) return 1 ;; esac
     m_uid=$1 m_gid=$2 m_perm=$(printf '%o' $((0$3 & 07777))) m_links=$4 m_size=$5
 }
+# Recheck local account authority whenever group write needs an exception. dd
+# bounds each read before awk allocates a record; no account/NSS snapshot survives
+# this call. Unknown NSS sources and incomplete or duplicate records fail closed.
+private_group() (
+    [ "$platform" = linux ] || exit 1
+    primary_gid=$(/usr/bin/id -g) || exit 1
+    [ "$1" = "$primary_gid" ] || exit 1
+    for account in /etc/nsswitch.conf /etc/passwd /etc/group; do
+        [ ! -L "$account" ] && [ -f "$account" ] && read_meta "$account" || exit 1
+        [ "$m_uid:$m_links" = 0:1 ] && [ $((0$m_perm & 0022)) -eq 0 ] || exit 1
+    done
+    LC_ALL=C /usr/bin/awk -v uid="$uid" -v gid="$primary_gid" '
+        function valid_id(value) {
+            return value ~ /^[0-9]+$/ && length(value) <= 10 && value + 0 <= 4294967294
+        }
+        function valid_name(value) {
+            return value != "" && value !~ /^[+-]/ && value !~ /[[:space:]:,]/
+        }
+        function record(line, kind,    fields, count, key, value, rest, group_name) {
+            if (kind == "nss") {
+                sub(/#.*/, "", line)
+                gsub(/^[ \t]+|[ \t]+$/, "", line)
+                if (line == "") return
+                rest = line
+                gsub(/\t/, "", rest)
+                if (rest ~ /[[:cntrl:]\\]/) exit 1
+                count = split(line, fields, ":")
+                key = fields[1]
+                sub(/[ \t]+$/, "", key)
+                if (key != "passwd" && key != "group") return
+                value = fields[2]
+                gsub(/^[ \t]+|[ \t]+$/, "", value)
+                if (count != 2 || nss[key]++ || value != "files") exit 1
+                return
+            }
+            if (line ~ /[[:cntrl:]]/) exit 1
+            if (line == "" || line ~ /^#/) return
+            count = split(line, fields, ":")
+            if (count != (kind == "passwd" ? 7 : 4) || !valid_name(fields[1]) || !valid_id(fields[3])) exit 1
+            if (kind == "passwd") {
+                if (!valid_id(fields[4]) || users[fields[1]]++ || uids[fields[3] + 0]++) exit 1
+                if (fields[3] + 0 == uid + 0) {
+                    if (fields[4] + 0 != gid + 0) exit 1
+                    name = fields[1]
+                }
+                if (fields[4] + 0 == gid + 0 && fields[3] + 0 != uid + 0) exit 1
+            } else {
+                if (groups[fields[1]]++ || gids[fields[3] + 0]++) exit 1
+                group_name = fields[1]
+                rest = fields[4]
+                if (rest != "") {
+                    count = split(rest, fields, ",")
+                    for (key = 1; key <= count; key++) {
+                        if (!valid_name(fields[key])) exit 1
+                        if (members[group_name SUBSEP fields[key]]++) exit 1
+                    }
+                }
+                split(line, fields, ":")
+                if (fields[3] + 0 == gid + 0) {
+                    if (rest != "" && rest != name) exit 1
+                    defined = 1
+                }
+            }
+        }
+        function load(path, limit, kind,    command, line, status, bytes) {
+            command = "/usr/bin/dd if=" path " bs=" (limit + 1) " count=1 iflag=fullblock,nofollow,nonblock status=none"
+            while ((status = (command | getline line)) > 0) {
+                bytes += length(line) + 1
+                if (bytes > limit) exit 1
+                record(line, kind)
+            }
+            if (status < 0 || close(command) != 0) exit 1
+        }
+        BEGIN {
+            if (!valid_id(uid) || !valid_id(gid)) exit 1
+            load("/etc/nsswitch.conf", 65536, "nss")
+            if (nss["passwd"] != 1 || nss["group"] != 1) exit 1
+            load("/etc/passwd", 4194304, "passwd")
+            if (name == "") exit 1
+            load("/etc/group", 4194304, "group")
+            if (!defined) exit 1
+        }'
+)
 # foreign_writable PERMISSIONS GID: another account can modify the object.
 foreign_writable() {
     bits=$((0$1))
     [ $((bits & 0002)) -eq 0 ] || return 0
     [ $((bits & 0020)) -ne 0 ] || return 1
-    [ -n "$private_gid" ] && [ "$2" = "$private_gid" ] && return 1
+    private_group "$2" && return 1
     return 0
 }
 check=$data

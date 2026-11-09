@@ -12,8 +12,8 @@
 | 远端 helper | Linux arm64 / x86_64，已有 Tern 用户服务与 session daemon | `tern-turn-relay-linux-arm64` / `tern-turn-relay-linux-x86_64` |
 
 - 不声明支持 Windows ARM64、x86 或 ARM64 上的 x64 仿真。Linux 本机客户端与远端 helper 使用同一份静态 Linux 程序。
-- Linux 本机需要 `/usr/bin` 下的 `stat`、`sha256sum`、`awk`、`curl`、`cmp`、`mktemp` 与 `/usr/bin/ssh`（OpenSSH Client），以及 `/usr/bin/zenity` 或 `/usr/bin/kdialog` 提供桌面隐藏输入；没有桌面对话框时只能在终端中输入。Tern 的路径来自 XDG：配置在 `$XDG_CONFIG_HOME/tern`（默认 `~/.config/tern`），默认 profile 的插件数据在 `$XDG_STATE_HOME/tern/plugin-data`（默认 `~/.local/state/tern/plugin-data`）。
-- Linux 的用户私有组（umask 002）下 Tern 会创建组可写目录。与 Debian OpenSSH 的 `secure_permissions` 规则一致，仅当该组是当前用户的主组、`/etc/passwd` 中以它为主组的账户只有当前用户、`/etc/group` 中没有其他成员时才视为安全；其他组可写或任何人可写仍拒绝。帐户来自 LDAP 等非文件数据库时按严格规则处理，需执行 `chmod go-w` 移除相关目录的组写权限。
+- Linux 本机需要 `/usr/bin` 下的 GNU coreutils（包括 `stat`、`sha256sum`、`dd`）、`awk`、`curl`、`cmp`、`mktemp` 与 `/usr/bin/ssh`（OpenSSH Client），以及 `/usr/bin/zenity` 或 `/usr/bin/kdialog` 提供桌面隐藏输入；没有桌面对话框时只能在终端中输入。Tern 的路径来自 XDG：配置在 `$XDG_CONFIG_HOME/tern`（默认 `~/.config/tern`），默认 profile 的插件数据在 `$XDG_STATE_HOME/tern/plugin-data`（默认 `~/.local/state/tern/plugin-data`）。
+- Linux 的用户私有组（umask 002）下 Tern 会创建组可写目录。仅在 `/etc/nsswitch.conf` 中 `passwd`、`group` 各唯一且来源仅为 `files`，并核验当前用户独占主组、没有其他补充成员时，才允许该组的组写权限。每次权限判断重新读取，不永久缓存成员关系；NSS 文件上限 64 KiB，账户文件各 4 MiB，缺失、重复、不完整或超限记录均拒绝。LDAP/SSSD 等混合来源按严格规则处理，需移除相关目录的组写权限；其他组可写或任何人可写始终拒绝。
 - Windows 需要系统自带的 Windows PowerShell 5.1 和 **原生 OpenSSH Client**（Windows 可选功能）；不需要 WSL、Git Bash、Python、Cargo 或本机编译。PowerShell 仅短暂校验/准备运行时，持续转发由 Rust 完成。构建工具中的 Python 仅用于维护者打包和 CI。
 - Windows 私有数据和受管理文件必须位于启用文件事务（TxF）的本地 NTFS 卷；ReFS、FAT、网络卷、EFS 加密文件或 TxF 不可用时拒绝写入。微软已弃用 TxF，未来系统可能移除；升级系统前需重新确认兼容性，不能把该依赖视为长期平台保证。
 - 需要已核验 SSH 主机密钥的 OpenSSH 别名，可非交互公钥登录；HostName 为公网 IPv4。先使用系统 OpenSSH 成功登录并核验主机指纹。ProxyJump、ProxyCommand、IPv6 和域名目标不在支持范围内。

@@ -156,66 +156,141 @@ fn cname(value: &OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|_| path_error())
 }
 /// True when anyone besides the owner can modify the object through its mode.
-/// On Linux, group write is harmless when the group is the current user's
-/// private group: its only member is that user. This is Debian OpenSSH's
-/// `secure_permissions` rule and matches the umask 002 that user-private-group
-/// distributions apply by default. Other systems keep the strict 022 rule.
+/// Linux permits group write only for the current user's sole-member primary
+/// group, freshly verified against complete local account files and files-only
+/// NSS configuration. Other systems keep the strict 022 rule.
 #[cfg(unix)]
 pub fn foreign_writable(mode: u32, gid: u32) -> bool {
     mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group(gid))
 }
 #[cfg(target_os = "linux")]
-static PRIVATE_GROUP: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
-    let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
-    let read = |path: &str| -> Option<String> {
-        let mut text = String::new();
-        File::open(path).ok()?.take(4 << 20).read_to_string(&mut text).ok()?;
-        Some(text)
-    };
-    let passwd = read("/etc/passwd")?;
-    let group = read("/etc/group")?;
-    user_private_group(&passwd, &group, uid, primary).then_some(primary)
-});
-#[cfg(target_os = "linux")]
 fn private_group(gid: u32) -> bool {
-    *PRIVATE_GROUP == Some(gid)
+    let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
+    if gid != primary {
+        return false;
+    }
+    // Do not use the ordinary permission checker here: it calls private_group.
+    let read = |path: &str, limit: u64| -> Option<String> {
+        let name = cname(OsStr::new(path)).ok()?;
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let info = file.metadata().ok()?;
+        if !info.is_file() || info.uid() != 0 || info.mode() & 0o022 != 0
+            || info.nlink() != 1 || info.len() > limit
+        {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(limit + 1).read_to_string(&mut text).ok()?;
+        (text.len() as u64 <= limit).then_some(text)
+    };
+    let Some(nsswitch) = read("/etc/nsswitch.conf", 65536) else { return false };
+    if !files_only_accounts(&nsswitch) {
+        return false;
+    }
+    let Some(passwd) = read("/etc/passwd", 4 << 20) else { return false };
+    let Some(group) = read("/etc/group", 4 << 20) else { return false };
+    user_private_group(&passwd, &group, uid, primary)
 }
 #[cfg(all(unix, not(target_os = "linux")))]
 fn private_group(_gid: u32) -> bool {
     false
 }
-/// The account files' view of a user private group: every passwd entry whose
-/// primary group is `gid` is `uid`, at least one exists, the group is defined
-/// once, and its supplementary members are empty or exactly that user.
+#[cfg(target_os = "linux")]
+fn files_only_accounts(nsswitch: &str) -> bool {
+    let (mut passwd, mut group) = (false, false);
+    for line in nsswitch.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        if !line.is_ascii() || line.contains('\\') || line.bytes().any(|b| b.is_ascii_control() && b != b'\t' && b != b'\r') {
+            return false;
+        }
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((database, sources)) = line.split_once(':') else { return false };
+        let seen = match database.trim_ascii() {
+            "passwd" => &mut passwd,
+            "group" => &mut group,
+            _ => continue,
+        };
+        let mut sources = sources.split_ascii_whitespace();
+        if *seen || sources.next() != Some("files") || sources.next().is_some() {
+            return false;
+        }
+        *seen = true;
+    }
+    passwd && group
+}
+/// Complete, unambiguous account records must identify exactly one account
+/// with primary group `gid`, owned by `uid`, and no other group members.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn user_private_group(passwd: &str, group: &str, uid: u32, gid: u32) -> bool {
+    let valid_name = |name: &str| {
+        !name.is_empty() && !name.starts_with(['+', '-'])
+            && !name.chars().any(|c| c.is_whitespace() || c == ',' || c == ':')
+    };
+    let id = |value: &str| -> Option<u32> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<u32>().ok().filter(|value| *value != u32::MAX)
+    };
+    let mut names = HashSet::new();
+    let mut ids = HashSet::new();
     let mut name = None;
     for line in passwd.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
-        let fields: Vec<&str> = line.split(':').collect();
-        let (Some(entry_uid), Some(entry_gid)) = (fields.get(2).and_then(|v| v.parse::<u32>().ok()), fields.get(3).and_then(|v| v.parse::<u32>().ok())) else {
+        let mut fields = line.split(':');
+        let record: [Option<&str>; 7] = std::array::from_fn(|_| fields.next());
+        let [Some(entry_name), Some(_), Some(entry_uid), Some(entry_gid), Some(_), Some(_), Some(_)] = record else {
             return false;
         };
+        let (Some(entry_uid), Some(entry_gid)) = (id(entry_uid), id(entry_gid)) else { return false };
+        if fields.next().is_some() || line.bytes().any(|b| b.is_ascii_control())
+            || !valid_name(entry_name) || !names.insert(entry_name) || !ids.insert(entry_uid)
+        {
+            return false;
+        }
         if entry_gid == gid {
-            if entry_uid != uid || name.is_some_and(|known| known != fields[0]) {
+            if entry_uid != uid || name.is_some() {
                 return false;
             }
-            name = Some(fields[0]);
+            name = Some(entry_name);
         }
     }
     let Some(name) = name else { return false };
+    names.clear();
+    ids.clear();
+    let mut members = HashSet::new();
     let mut defined = false;
     for line in group.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() != 4 {
+        let mut fields = line.split(':');
+        let record: [Option<&str>; 4] = std::array::from_fn(|_| fields.next());
+        let [Some(entry_name), Some(_), Some(entry_gid), Some(entry_members)] = record else { return false };
+        let Some(entry_gid) = id(entry_gid) else { return false };
+        if fields.next().is_some() || line.bytes().any(|b| b.is_ascii_control())
+            || !valid_name(entry_name) || !names.insert(entry_name) || !ids.insert(entry_gid)
+        {
             return false;
         }
-        if fields[2].parse::<u32>().ok() != Some(gid) {
-            continue;
-        }
-        if defined || !(fields[3].is_empty() || fields[3] == name) {
+        members.clear();
+        if !entry_members.is_empty() && entry_members.split(',').any(|member| !valid_name(member) || !members.insert(member)) {
             return false;
         }
-        defined = true;
+        if entry_gid == gid {
+            if !(entry_members.is_empty() || entry_members == name) {
+                return false;
+            }
+            defined = true;
+        }
     }
     defined
 }
