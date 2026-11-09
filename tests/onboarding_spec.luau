@@ -31,6 +31,9 @@ local function fixture(os)
         return { toast = function() end, pick = function(_, spec)
             f.lastPick = spec
             return { next = function(_, callback) f.pickCallback = callback end }
+        end, prompt = function(_, spec)
+            f.lastPrompt = spec
+            return { next = function(_, callback) f.promptCallback = callback end }
         end, canvas = { open = function(_, spec) f.reviewDocument = spec.md; return 101 end } }
     end
     function f:tick()
@@ -140,6 +143,38 @@ function cases.daemon_rebind_requires_review_and_explicit_confirmation()
             assert(input.confirm == true and input.review == plan)
             f:complete({ ok = false, code = 'review-changed', error = 'Identity changed' }, 6)
             assert(#f.errors == 1 and not f.wizard.active and #f.calls == callsBeforeConsent + 1)
+        end
+    end
+end
+
+function cases.unassociated_user_service_rediscovers_only_with_a_named_socket()
+    for _, answer in ipairs({ 'cancel', 'relative', 'socket' }) do
+        local f = fixture('macos')
+        f.wizard.open(f:context())
+        f:complete({ ok = true, runtime_ready = true, version = '0.5.10', binary = '/Users/用户/data/native-runtime/0.5.10/tern-turn-relay' })
+        f:complete({ ok = true, configured = false, running = false, credential_configured = true, ssh_aliases = { { label = 'wawa-dev', value = 'wawa-dev' } } })
+        f:choose('server')
+        f:choose('wawa-dev')
+        assert(f.calls[#f.calls].options.stdin.daemon_socket == nil)
+        local calls = #f.calls
+        f:complete({ ok = true, code = 'choose', candidates = {} })
+        assert(#f.calls == calls and #f.errors == 0)
+        if answer == 'cancel' then
+            f:choose('cancel')
+            assert(#f.calls == calls and not f.wizard.active)
+        else
+            f:choose('socket')
+            f.promptCallback(answer == 'relative' and 'run/daemon.sock' or '/run/user/0/tern/daemon.sock', nil, { invalidOldContext = true })
+            assert(f:tick())
+            if answer == 'relative' then
+                assert(#f.calls == calls and #f.errors == 1 and not f.wizard.active)
+            else
+                local input = f.calls[#f.calls].options.stdin
+                assert(#f.calls == calls + 1 and input.ssh_destination == 'wawa-dev' and input.daemon_socket == '/run/user/0/tern/daemon.sock')
+                -- A named socket that still verifies nothing fails instead of looping.
+                f:complete({ ok = true, code = 'choose', candidates = {} })
+                assert(#f.calls == calls + 1 and #f.errors == 1 and not f.wizard.active)
+            end
         end
     end
 end

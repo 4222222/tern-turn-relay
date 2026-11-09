@@ -7,6 +7,7 @@
 - 按 XDG 定位 Linux Tern profile（`$XDG_CONFIG_HOME/tern`）与默认插件数据（`$XDG_STATE_HOME/tern/plugin-data`）；Tern CLI 取自启动插件动作的 Tern 进程，不搜索 PATH，并沿用 Tern 自己的 daemon socket。
 - Linux 使用 `/usr/bin/zenity` 或 `/usr/bin/kdialog` 隐藏输入 Cloudflare Key；取消不覆盖原凭据，无桌面时退回终端隐藏输入。
 - Linux 用户私有组（umask 002）的组写例外仅限已核验的 files-only NSS 与当前用户独占主组；每次权限判断重新读取有界账户信息，不永久缓存成员。混合 LDAP/SSSD、缺失或歧义配置、共享组及任何人可写均拒绝；macOS 与 Windows 规则不变。
+- 远端为 `tern remote serve --user` 且 session daemon 独立启动时，首次发现不再无路可走：设置向导在没有可自动关联的服务时，可以指定远端 daemon socket 后重新发现；自动化可在 discover 请求中带 `daemon_socket`。远端 helper 仍完整核验 socket 属主、对端凭据、进程启动时间与参数，review 保留该字段，apply 重新发现时使用同一 socket。
 
 ## 0.5.10
 

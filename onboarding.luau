@@ -160,21 +160,46 @@ function M.new(api, host)
                 end)
         end)
     end
-    discover = function(cx, alias, candidate, port)
+    discover = function(cx, alias, candidate, port, socket)
         cx:toast("info", "正在检查服务器", "仅通过已信任 SSH 读取原服务、daemon 与实际监听端口。")
         local input = { ssh_destination = alias }
         if candidate then input.candidate_id = candidate end
         if port then input.listen_port = port end
+        if socket then input.daemon_socket = socket end
         backend(cx, "discover", input, function(value, fresh)
             if value.code == "review" then review(value, fresh); return end
-            if value.code ~= "choose" or type(value.candidates) ~= "table" or #value.candidates == 0 then
+            if value.code ~= "choose" or type(value.candidates) ~= "table" then
                 fail(fresh, "没有找到可验证的已有 Tern 服务；请先确保原服务正常运行。"); return
+            end
+            if #value.candidates == 0 then
+                if socket then fail(fresh, "指定的 daemon socket 未通过核验；请确认它属于原服务使用的 daemon。"); return end
+                -- `tern remote serve --user` with an independently started daemon cannot be
+                -- paired by process parentage; the user names the socket and the remote
+                -- helper still pins its owner, peer credentials and process identity.
+                pick(fresh, "没有可自动关联的已有 Tern 服务", {
+                    { label = "指定远端 daemon socket", value = "socket", detail = "适用于独立启动 daemon 的 tern remote serve --user，例如 /run/user/<uid>/tern/daemon.sock；仍核验属主与进程身份" },
+                    { label = "取消", value = "cancel" },
+                }, function(answer, current)
+                    if answer.value ~= "socket" then finish(); return end
+                    local receipt = queue:wait(epoch, 600000, function(result, later, timedOut)
+                        if timedOut or not result or result.answer == nil then finish(); return end
+                        if result.error or type(result.answer) ~= "string" or result.answer:sub(1, 1) ~= "/" or #result.answer > 4096 then
+                            fail(later, "请输入远端 daemon socket 的绝对路径。"); return
+                        end
+                        discover(later, alias, nil, port, result.answer)
+                    end)
+                    current:prompt({ placeholder = "远端 daemon socket 绝对路径", action = "检查" }):next(function(answerText, err, _cx)
+                        receipt({ answer = answerText, error = err })
+                        queue:wake()
+                    end)
+                end)
+                return
             end
             local items = {}
             for _, item in ipairs(value.candidates) do
                 table.insert(items, { label = item.label, detail = item.detail, value = item.id })
             end
-            pick(fresh, "选择要复用的已有 Tern 工作区", items, function(answer, current) discover(current, alias, answer.value, port) end)
+            pick(fresh, "选择要复用的已有 Tern 工作区", items, function(answer, current) discover(current, alias, answer.value, port, socket) end)
         end)
     end
     chooseServer = function(snapshot, cx, port)
